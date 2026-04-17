@@ -23,6 +23,20 @@ from engine.ai_agent import TradingAIAgent
 from engine.model_trainer import ModelTrainer
 from engine.strategy_modules import StrategySelector, StrategySignal
 
+try:
+    from engine.learning.scorer import AdaptiveMLScorer
+    _ADAPTIVE_ML_AVAILABLE = True
+except Exception:
+    AdaptiveMLScorer = None  # type: ignore
+    _ADAPTIVE_ML_AVAILABLE = False
+
+try:
+    from engine.session_filter import SessionFilter
+    _SESSION_FILTER_AVAILABLE = True
+except Exception:
+    SessionFilter = None  # type: ignore
+    _SESSION_FILTER_AVAILABLE = False
+
 
 # ── Signal Type Classification (§3) ──────────────────────────────────────────
 
@@ -456,7 +470,8 @@ class MLScorer:
         if self._model is not None and self._feature_names is not None:
             try:
                 last = df.iloc[-1]
-                X = last[self._feature_names].values.reshape(1, -1)
+                row = [float(last[f]) if f in df.columns else 0.0 for f in self._feature_names]
+                X = np.array(row, dtype=float).reshape(1, -1)
                 if hasattr(self._model, "predict_proba"):
                     proba = self._model.predict_proba(X)
                     # Use probability of class 1 (up)
@@ -687,7 +702,20 @@ class SignalGenerator:
         self._ml_bootstrap_retry_seconds = float(signals_cfg.get("ml_bootstrap_retry_seconds", 15.0))
         self._ml_retrain_interval_seconds = float(signals_cfg.get("ml_retrain_interval_seconds", 21600.0))
         self._model_trainer = ModelTrainer(model_type=self._ml_model_type)
-        self._ml_scorer = MLScorer(model_path=self._ml_model_path)
+        use_adaptive_ml = bool(signals_cfg.get("use_adaptive_ml", True))
+        if use_adaptive_ml and _ADAPTIVE_ML_AVAILABLE:
+            try:
+                self._ml_scorer = AdaptiveMLScorer()
+                self._adaptive_ml = True
+                logger.info("AdaptiveMLScorer active — regime-aware ensemble + Kelly + drift detection")
+            except Exception as exc:
+                logger.warning("AdaptiveMLScorer init failed ({}), falling back to MLScorer", exc)
+                self._ml_scorer = MLScorer(model_path=self._ml_model_path)
+                self._adaptive_ml = False
+        else:
+            self._ml_scorer = MLScorer(model_path=self._ml_model_path)
+            self._adaptive_ml = False
+        self._session_filter = SessionFilter() if _SESSION_FILTER_AVAILABLE else None
         self._ml_bootstrap_task: asyncio.Task | None = None
         self._last_ml_train_ts: float = 0.0
         risk_cfg = config.get_value("risk") or {}

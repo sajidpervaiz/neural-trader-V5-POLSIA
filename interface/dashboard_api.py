@@ -508,6 +508,10 @@ def build_app(
             "auto_trading_enabled": getattr(signal_generator, "auto_trading_enabled", False),
         }
 
+    @app.get("/api/signals/weights")
+    async def api_signal_weights() -> dict[str, Any]:
+        return await signal_weights()
+
     # ── Kill switch ───────────────────────────────────────────────────────
     @app.post("/v1/kill")
     async def kill_switch_activate() -> dict[str, Any]:
@@ -2722,6 +2726,10 @@ def build_app(
             result["kelly_avg_win"] = getattr(risk_manager, '_kelly_avg_win', 0.0)
             result["kelly_avg_loss"] = getattr(risk_manager, '_kelly_avg_loss', 0.0)
         return result
+
+    @app.get("/api/clientkey")
+    async def api_clientkey() -> dict[str, Any]:
+        return {"key": api_key if api_key else ""}
 
     @app.get("/api/health/detailed")
     async def api_health_detailed() -> dict[str, Any]:

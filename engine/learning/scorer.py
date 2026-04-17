@@ -88,6 +88,15 @@ class AdaptiveMLScorer:
         # Load legacy LGB as fallback
         self._try_load_lgb()
 
+    # ── Backward-compat properties for MLScorer callers ──────────────────────
+    @property
+    def _model_loaded(self) -> bool:
+        return self._ensemble is not None or self._lgb_model is not None
+
+    @property
+    def _feature_names(self) -> list[str]:
+        return list(self._lgb_features) if self._lgb_features else list(FEATURE_COLS)
+
     # ── Loading ──────────────────────────────────────────────────────────────
     def _try_load_ensemble(self) -> None:
         if self._ensemble_path.exists():
