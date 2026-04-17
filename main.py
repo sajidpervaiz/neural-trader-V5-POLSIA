@@ -45,6 +45,8 @@ from storage.state_recovery import StateRecovery
 from storage.sqlite_store import SQLiteStore
 
 from monitoring.metrics import Metrics
+from monitoring.health_checks import HealthChecker
+from monitoring.alert_manager import build_alert_manager_from_config, AlertDispatcher
 
 from interface.dashboard_api import build_app, run_dashboard
 from interface.telegram_bot import TelegramNotifier
@@ -120,6 +122,9 @@ async def main() -> None:
     cache = Cache(config)
     sqlite_store = SQLiteStore()
     metrics = Metrics(config, event_bus)
+    health_checker = HealthChecker(check_interval=30)
+    alert_manager = build_alert_manager_from_config(config)
+    alert_dispatcher = AlertDispatcher(event_bus, alert_manager)
 
     # ── Persist candles to SQLite on each CANDLE event ────────────────────
     async def _persist_candle(candle: Any) -> None:
@@ -327,6 +332,35 @@ async def main() -> None:
     )
     _seed_only = not config.paper_mode  # live mode: seed only, WS provides data
 
+    # ── Health check component registrations ──────────────────────────────
+    async def _check_event_bus() -> bool:
+        return not getattr(event_bus, "_stopped", False)
+
+    async def _check_signal_generator() -> dict:
+        return {
+            "status": "HEALTHY",
+            "running": bool(getattr(signal_gen, "_running", False)),
+            "auto_trading": bool(getattr(signal_gen, "_auto_trading_enabled", False)),
+        }
+
+    async def _check_risk_manager() -> dict:
+        cb = getattr(risk_mgr, "_circuit_breaker", None)
+        return {
+            "status": "HEALTHY",
+            "equity": float(getattr(risk_mgr, "equity", 0)),
+            "open_positions": len(getattr(risk_mgr, "_positions", {}) or {}),
+            "circuit_breaker_open": bool(getattr(cb, "is_open", False)) if cb else False,
+        }
+
+    async def _check_data_manager() -> dict:
+        aggs = getattr(data_manager, "_aggregators", {}) or {}
+        return {"status": "HEALTHY", "symbols_tracked": len(aggs)}
+
+    await health_checker.register_component("event_bus", _check_event_bus)
+    await health_checker.register_component("signal_generator", _check_signal_generator)
+    await health_checker.register_component("risk_manager", _check_risk_manager)
+    await health_checker.register_component("data_manager", _check_data_manager)
+
     tasks = [
         asyncio.create_task(paper_feed.run(seed_only=_seed_only), name="paper_feed"),
         asyncio.create_task(dispatcher.start(), name="dispatcher"),
@@ -343,6 +377,8 @@ async def main() -> None:
         asyncio.create_task(user_stream.run(), name="user_data_stream"),
         asyncio.create_task(_periodic_liq_check(risk_mgr, stop_event), name="liq_check"),
         asyncio.create_task(_periodic_funding_check(risk_mgr, stop_event), name="funding_recheck"),
+        asyncio.create_task(health_checker.start_periodic_checks(), name="health_checker"),
+        asyncio.create_task(alert_dispatcher.run(), name="alert_dispatcher"),
     ]
 
     for executor in executors:
@@ -395,6 +431,8 @@ async def main() -> None:
     await orderbook_feed.stop()
     await telegram.stop()
     await order_mgr.stop()
+    await alert_dispatcher.stop()
+    await health_checker.stop_periodic_checks()
     await db.close()
 
     logger.info("Shutdown complete")

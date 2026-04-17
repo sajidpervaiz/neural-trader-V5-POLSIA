@@ -10,6 +10,7 @@ from execution.cex_executor import CEXExecutor
 from execution.bybit_executor import BybitExecutor
 from execution.okx_executor import OKXExecutor
 from execution.kraken_executor import KrakenExecutor
+from execution.hyperliquid_executor import HyperliquidExecutor
 from execution.risk_manager import RiskManager
 from execution.variational_executor import VariationalExecutor
 
@@ -19,6 +20,7 @@ _EXECUTOR_MAP: dict[str, type[CEXExecutor]] = {
     "bybit": BybitExecutor,
     "okx": OKXExecutor,
     "kraken": KrakenExecutor,
+    "hyperliquid": HyperliquidExecutor,
 }
 
 
