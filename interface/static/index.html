@@ -16,6 +16,17 @@
   --orange:#ff7a45; --purple:#a855f7; --cyan:#00c8ff;
   --greenBg:rgba(0,210,106,.12); --redBg:rgba(255,56,96,.12); --blueBg:rgba(56,139,255,.12);
 }
+html.theme-light {
+  --bg0:#f5f6f8; --bg1:#ffffff; --bg2:#f0f2f5; --bg3:#e6e9ef; --bg4:#d9dde6;
+  --border:#d0d4dc; --border2:#b6bcc9;
+  --text:#0f1419; --text2:#4b5563; --text3:#6b7280;
+  --green:#059669; --red:#dc2626; --blue:#2563eb; --yellow:#d97706;
+  --orange:#ea580c; --purple:#7c3aed; --cyan:#0891b2;
+  --greenBg:rgba(5,150,105,.10); --redBg:rgba(220,38,38,.10); --blueBg:rgba(37,99,235,.10);
+}
+html.theme-light .app{background:#eef0f4}
+html.theme-light .header{background:#ffffff}
+html.theme-light .body{background:#eef0f4}
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);font-family:'Inter',system-ui,sans-serif;font-size:12px;line-height:1.5}
 ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
@@ -325,6 +336,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     <span class="clock" id="clock">--:--:--</span>
     <button class="hdr-btn" id="autoBtn" onclick="toggleAuto()">🤖 Auto</button>
     <button class="hdr-btn danger" id="killBtn" onclick="toggleKill()">⚡ Kill</button>
+    <button class="hdr-btn" id="themeBtn" onclick="cycleTheme()" title="Theme (click to cycle dark/light/system)">🌙</button>
     <button class="hdr-btn" onclick="openSettings()">⚙</button>
   </div>
 
@@ -338,6 +350,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <button class="tab" data-tab="pipeline">🔗 Pipeline</button>
         <button class="tab" data-tab="portfolio">💼 Portfolio</button>
         <button class="tab" data-tab="news">📰 News</button>
+        <button class="tab" data-tab="heatmap">🔥 Heatmap <span class="btm-count" id="heatmapCount">0</span></button>
         <button class="tab" data-tab="alerts">🚨 Alerts <span class="btm-count" id="alertsCount">0</span></button>
         <button class="tab" data-tab="health">💚 Health <span class="btm-count" id="healthCount">0</span></button>
         <button class="tab" data-tab="logs">📜 Logs</button>
@@ -427,6 +440,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: News -->
       <div class="tab-content" id="tc-news"><div class="panel-body" id="newsPanel" style="padding:14px"></div></div>
+
+      <!-- Tab: Heatmap -->
+      <div class="tab-content" id="tc-heatmap"><div class="panel-body" id="heatmapPanel" style="padding:14px"></div></div>
 
       <!-- Tab: Alerts -->
       <div class="tab-content" id="tc-alerts"><div class="panel-body" id="alertsPanel" style="padding:14px"></div></div>
@@ -733,6 +749,7 @@ function bindTabs() {
     if (t.dataset.tab === 'pipeline') loadPipeline();
     if (t.dataset.tab === 'portfolio') loadPortfolio();
     if (t.dataset.tab === 'news') loadNews();
+    if (t.dataset.tab === 'heatmap') loadHeatmap();
     if (t.dataset.tab === 'alerts') loadAlerts();
     if (t.dataset.tab === 'health') loadHealth();
     if (t.dataset.tab === 'logs') loadLogs();
@@ -1782,6 +1799,59 @@ function renderPipeline(layers, quality, session) {
   html+='</div></div>';
   $('pipelinePanel').innerHTML=html;
 }
+
+/* ── Market Heatmap — colored 24h %change grid ── */
+async function loadHeatmap() {
+  try {
+    const d = await (await fetch('/api/market?per_page=80')).json();
+    const coins = (d && d.coins) ? d.coins : (Array.isArray(d) ? d : []);
+    $('heatmapCount').textContent = coins.length;
+    if (coins.length === 0) { $('heatmapPanel').innerHTML = '<div style="color:var(--text3)">No market data</div>'; return; }
+    const sorted = coins.slice().sort((a, b) => (b.change_24h || 0) - (a.change_24h || 0));
+    const maxAbs = Math.max(1, ...sorted.map(c => Math.abs(c.change_24h || 0)));
+    let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px">';
+    for (const c of sorted) {
+      const chg = Number(c.change_24h || 0);
+      const intensity = Math.min(1, Math.abs(chg) / maxAbs);
+      const alpha = 0.15 + intensity * 0.7;
+      const bg = chg >= 0 ? 'rgba(0,210,106,' + alpha.toFixed(2) + ')' : 'rgba(255,56,96,' + alpha.toFixed(2) + ')';
+      const border = chg >= 0 ? 'var(--green)' : 'var(--red)';
+      html += '<div style="padding:10px 8px;border:1px solid ' + border + ';border-radius:6px;background:' + bg + ';text-align:center;cursor:pointer" '
+        + 'onclick="setSymbol(\'' + esc(c.symbol) + '\')" title="' + esc(c.name || c.symbol) + ' · $' + Number(c.price || 0).toLocaleString() + '">'
+        + '<div style="font:700 11px \'JetBrains Mono\';color:var(--text)">' + esc(c.symbol) + '</div>'
+        + '<div style="font:600 13px \'JetBrains Mono\';color:' + (chg >= 0 ? 'var(--green)' : 'var(--red)') + ';margin-top:3px">' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</div>'
+        + '<div style="font:10px sans-serif;color:var(--text3);margin-top:2px">$' + Number(c.price || 0).toLocaleString(undefined, {maximumFractionDigits: 4}) + '</div>'
+        + '</div>';
+    }
+    html += '</div>';
+    $('heatmapPanel').innerHTML = html;
+  } catch (e) { $('heatmapPanel').innerHTML = '<div style="color:var(--text3)">Heatmap unavailable</div>'; }
+}
+function setSymbol(sym) {
+  if (typeof window.changeSymbol === 'function') { window.changeSymbol(sym); }
+  else if (typeof window.selectSymbol === 'function') { window.selectSymbol(sym); }
+}
+
+/* ── Theme toggle (dark/light/system) ── */
+function applyTheme(mode) {
+  const root = document.documentElement;
+  root.classList.remove('theme-light', 'theme-dark');
+  let effective = mode;
+  if (mode === 'system') {
+    effective = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  }
+  if (effective === 'light') root.classList.add('theme-light');
+  const btn = $('themeBtn'); if (btn) btn.textContent = mode === 'light' ? '☀' : mode === 'system' ? '🖥' : '🌙';
+  try { localStorage.setItem('nt_theme', mode); } catch(_){}
+}
+function cycleTheme() {
+  const cur = (function(){ try { return localStorage.getItem('nt_theme') || 'dark'; } catch(_){ return 'dark'; } })();
+  const next = cur === 'dark' ? 'light' : cur === 'light' ? 'system' : 'dark';
+  applyTheme(next);
+}
+(function initTheme(){
+  try { const saved = localStorage.getItem('nt_theme') || 'dark'; applyTheme(saved); } catch(_){ applyTheme('dark'); }
+})();
 
 /* ── Alerts (AlertManager history/status) ── */
 async function loadAlerts() {
