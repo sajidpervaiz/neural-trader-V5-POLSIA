@@ -2723,6 +2723,48 @@ def build_app(
             result["kelly_avg_loss"] = getattr(risk_manager, '_kelly_avg_loss', 0.0)
         return result
 
+    @app.get("/api/health/detailed")
+    async def api_health_detailed() -> dict[str, Any]:
+        hc = getattr(app.state, "health_checker", None)
+        if hc is None:
+            return {"overall": "unknown", "components": {}, "timestamp": int(time.time())}
+        try:
+            result = await hc.check_all_components()
+            return {
+                "overall": result.overall_status.value.lower(),
+                "uptime_seconds": round(result.uptime_seconds),
+                "components": {
+                    name: {
+                        "status": comp.status.value,
+                        "latency_ms": round(comp.latency_ms, 1),
+                        "message": comp.message,
+                        "last_check": comp.last_check,
+                        "details": comp.details,
+                    }
+                    for name, comp in result.components.items()
+                },
+                "timestamp": int(time.time()),
+            }
+        except Exception as exc:
+            logger.debug("health/detailed error: {}", exc)
+            return {"overall": "error", "components": {}, "error": str(exc)}
+
+    @app.get("/api/alerts/status")
+    async def api_alerts_status() -> dict[str, Any]:
+        am = getattr(app.state, "alert_manager", None)
+        if am is None:
+            return {"enabled": False}
+        status = am.get_status()
+        status["enabled"] = True
+        return status
+
+    @app.get("/api/alerts/history")
+    async def api_alerts_history() -> dict[str, Any]:
+        am = getattr(app.state, "alert_manager", None)
+        if am is None:
+            return {"alerts": [], "enabled": False}
+        history = [a.to_dict() for a in am.history[-50:]]
+        return {"alerts": history, "total": len(am.history), "enabled": True}
 
     return app
 

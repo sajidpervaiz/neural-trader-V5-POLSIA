@@ -262,6 +262,10 @@ async def main() -> None:
         metrics=metrics,
     )
 
+    if app is not None:
+        app.state.health_checker = health_checker
+        app.state.alert_manager = alert_manager
+
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)
     from interface.dashboard_api import _log_sink
     logger.add(_log_sink, level="INFO", format="{message}")
