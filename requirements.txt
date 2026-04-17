@@ -16,7 +16,9 @@ statsmodels==0.14.1
 
 # ── Technical analysis ────────────────────────────────────────────────────────
 ta-lib==0.4.28
-pandas-ta==0.4.71b0
+# pandas-ta is intentionally omitted here: the current beta release pulls in
+# numpy>=2.2.6 and breaks the pinned scientific stack used by CI/container builds.
+# The codebase already falls back to TA-Lib and native pandas implementations.
 
 # ── Machine learning ──────────────────────────────────────────────────────────
 lightgbm==4.3.0

@@ -229,16 +229,16 @@ def test_mode_toggle_switches_runtime_to_live_demo() -> None:
 
     assert resp.status_code == 200
     payload = resp.json()
-    assert payload["success"] is True
-    assert payload["mode"] == "live"
-    assert cfg.paper_mode is False
+    assert payload["success"] is False
+    assert "Cannot switch to live" in payload["error"]
+    assert cfg.paper_mode is True
 
     status_resp = client.get("/api/auto/status")
     assert status_resp.status_code == 200
     status_payload = status_resp.json()
-    assert status_payload["mode"] == "live"
-    assert status_payload["testnet"] is True
-    assert status_payload["label"] == "BINANCE DEMO"
+    assert status_payload["mode"] == "paper"
+    assert status_payload["testnet"] is False
+    assert status_payload["label"] == "PAPER"
 
 
 def test_config_exposes_ai_agent_settings() -> None:

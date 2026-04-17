@@ -1964,38 +1964,20 @@ def build_app(
         if requested_mode not in ("paper", "live"):
             return {"success": False, "error": "mode must be 'paper' or 'live'"}
 
-        exchanges_cfg = config.get_value("exchanges") or {}
-        enabled_venues = [
-            (str(name), ex_cfg)
-            for name, ex_cfg in exchanges_cfg.items()
-            if isinstance(ex_cfg, dict) and ex_cfg.get("enabled", False)
-        ]
-
         if requested_mode == "live":
-            if not enabled_venues:
-                return {"success": False, "error": "Enable a demo exchange before switching to live mode."}
-            for venue, ex_cfg in enabled_venues:
-                api_key = str(ex_cfg.get("api_key", "") or "").strip()
-                api_secret = str(ex_cfg.get("api_secret", "") or "").strip()
-                if not api_key or api_key.startswith("${") or not api_secret or api_secret.startswith("${"):
-                    return {"success": False, "error": f"Add the {venue} demo API key and secret first."}
-                if not bool(ex_cfg.get("testnet", False)):
-                    return {"success": False, "error": "Runtime switch is only supported for demo/testnet venues."}
-
-            config.paper_mode = False
-            os.environ["LIVE_TRADING_CONFIRMED"] = "true"
-            try:
-                await _stop_paper_feed_main()
-            except Exception as exc:
-                logger.warning("Paper feed stop error during live switch: {}", exc)
-            try:
-                config.persist_runtime_overrides()
-            except Exception as exc:
-                logger.warning("Failed to persist live mode change: {}", exc)
-            logger.info("Trading mode switched to: live demo")
+            if not config.paper_mode:
+                return {
+                    "success": True,
+                    "mode": "live",
+                    "paper_mode": config.paper_mode,
+                }
             return {
-                "success": True,
-                "mode": "live",
+                "success": False,
+                "error": (
+                    "Cannot switch to live mode via /api/mode/toggle. "
+                    "Use /api/config/trading-mode for validated demo/testnet switching."
+                ),
+                "mode": "paper",
                 "paper_mode": config.paper_mode,
             }
 

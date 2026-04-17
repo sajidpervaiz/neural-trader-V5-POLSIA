@@ -29,13 +29,16 @@ class CandleAggregator:
         self._start_bucket: int | None = None
 
     def _current_bucket(self, ts_us: int) -> int:
-        """Wall-clock aligned bucket so candles match standard boundaries (e.g. :00, :15, :30, :45)."""
+        """Anchor buckets to the first observed tick for deterministic per-stream candles."""
         ts_s = ts_us // 1_000_000
-        return (ts_s // self.timeframe_seconds) * self.timeframe_seconds
+        if self._start_bucket is None:
+            self._start_bucket = ts_s
+        elapsed = max(0, ts_s - self._start_bucket)
+        return self._start_bucket + (elapsed // self.timeframe_seconds) * self.timeframe_seconds
 
     def add_tick(self, tick: Tick) -> Candle | None:
-        if _RUST_AVAILABLE:
-            return self._add_tick_rust(tick)
+        # Keep candle state instance-local. The shared Rust module is still used for
+        # batch parsing, but candle aggregation must remain deterministic per stream.
         return self._add_tick_python(tick)
 
     def _add_tick_python(self, tick: Tick) -> Candle | None:

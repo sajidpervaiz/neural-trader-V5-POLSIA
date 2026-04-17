@@ -63,7 +63,7 @@ RUN curl -L http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz | 
     && rm -rf ta-lib/
 
 # Stage 4: Python gateway service
-FROM python-base AS python-gateway
+FROM python-base AS python
 
 WORKDIR /app
 
@@ -91,7 +91,7 @@ EXPOSE 8000
 CMD ["python", "main.py"]
 
 # Stage 5: Rust gateway service
-FROM gcr.io/distroless/python3-debian12 AS rust-gateway
+FROM gcr.io/distroless/python3-debian12 AS gateway
 
 WORKDIR /app
 
@@ -109,7 +109,7 @@ EXPOSE 50051 8001
 CMD ["/app/gateway"]
 
 # Stage 6: Full application
-FROM python-base AS full
+FROM python-base AS production
 
 WORKDIR /app
 

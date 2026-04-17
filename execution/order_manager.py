@@ -191,8 +191,12 @@ class OrderManager:
         self._running = False
         self._audit_log_path = audit_log_path
         self._order_state_path = order_state_path
-        self._load_audit_log()
-        self._load_order_state()
+        self._restore_state_on_startup = bool(
+            self.config.get_value("execution", "restore_orders_on_startup", default=False)
+        )
+        if self._restore_state_on_startup:
+            self._load_audit_log()
+            self._load_order_state()
 
     def get_split_strategy(self, notional_usd: float) -> Optional[str]:
         """Return 'iceberg', 'twap', or None based on order notional size."""
@@ -246,6 +250,8 @@ class OrderManager:
 
     def _save_audit_log(self):
         import json
+        if not self._audit_log_path:
+            return
         try:
             with open(self._audit_log_path, "w") as f:
                 for entry in self.audit_log:
@@ -256,6 +262,8 @@ class OrderManager:
     def _append_audit_entry(self, entry: dict) -> None:
         """Append a single audit entry (O(1) I/O instead of rewriting entire log)."""
         import json
+        if not self._audit_log_path:
+            return
         try:
             with open(self._audit_log_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -265,6 +273,8 @@ class OrderManager:
     def _load_audit_log(self):
         import json
         import os
+        if not self._audit_log_path:
+            return
         if os.path.exists(self._audit_log_path):
             try:
                 with open(self._audit_log_path, "r") as f:
@@ -274,6 +284,8 @@ class OrderManager:
 
     def _save_order_state(self):
         import json
+        if not self._order_state_path:
+            return
         try:
             # Map exchange order keys to their order_id for proper restoration
             exchange_map_save = {
@@ -293,6 +305,8 @@ class OrderManager:
     def _load_order_state(self):
         import json
         import os
+        if not self._order_state_path:
+            return
         if os.path.exists(self._order_state_path):
             try:
                 with open(self._order_state_path, "r") as f:

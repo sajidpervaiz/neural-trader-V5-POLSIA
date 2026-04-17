@@ -2460,7 +2460,13 @@ async function saveSettings(){
     if(mode==='live'&&!confirm('Switch to LIVE trading? This uses REAL MONEY. Are you sure?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
     let modeResp={success:true,mode:mode};
     try{
-      modeResp=await(await fetch('/api/mode/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})})).json();
+      const modeReq=await fetch('/api/config/trading-mode?confirmation=true',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(mode)
+      });
+      modeResp=await modeReq.json();
+      if(!modeReq.ok&&modeResp.success!==true) modeResp={success:false,error:modeResp.detail||modeResp.error||'Could not update trading mode'};
     }catch(_){modeResp={success:false,error:'Could not update trading mode'};}
     if(!modeResp.success){
       $('cfgTradingMode').value='paper';

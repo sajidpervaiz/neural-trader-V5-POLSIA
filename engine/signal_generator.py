@@ -1695,7 +1695,8 @@ class SignalGenerator:
         elif direction == "short" and weighted_sum <= -htf_thresh:
             return True, f"HTF_pass_short {detail_str}", normalized_score, agreement_count
         else:
-            return False, f"HTF_fail {detail_str}", normalized_score, agreement_count
+            bias = "bearish" if weighted_sum < 0 else ("bullish" if weighted_sum > 0 else "neutral")
+            return False, f"HTF_fail_{bias} {detail_str}", normalized_score, agreement_count
 
     # ── Session & Killzone enforcement (§5) ───────────────────────────────
 
