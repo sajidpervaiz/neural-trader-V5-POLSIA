@@ -900,6 +900,107 @@ class SignalGenerator:
         status["auto_trading_enabled"] = bool(self._auto_trading_enabled)
         return status
 
+    def get_efficiency_status(self) -> dict[str, Any]:
+        """Return efficiency-pass runtime state for the Efficiency dashboard tab."""
+        # Per-symbol funding + divergence
+        funding: dict[str, dict[str, float]] = {}
+        for sym, (rate, ts) in self._funding_by_symbol.items():
+            df = self.data_manager.get_dataframe("binance", sym, self._primary_tf)
+            div = self._funding_divergence_score(sym, df) if df is not None else 0.0
+            funding[sym] = {
+                "rate": rate,
+                "rate_bps": rate * 10000.0,
+                "age_sec": time.time() - ts,
+                "divergence": div,
+            }
+
+        # Kelly stats pulled from attached risk manager
+        kelly: dict[str, Any] = {"enabled": False}
+        rm = getattr(self, "_risk_manager", None)
+        if rm is not None:
+            try:
+                trade_hist = list(getattr(rm, "_trade_results", []) or [])
+                kelly = {
+                    "enabled": bool(getattr(rm, "_kelly_enabled", False)),
+                    "win_rate": float(getattr(rm, "_kelly_win_rate", 0.0) or 0.0),
+                    "avg_win": float(getattr(rm, "_kelly_avg_win", 0.0) or 0.0),
+                    "avg_loss": float(getattr(rm, "_kelly_avg_loss", 0.0) or 0.0),
+                    "r_multiple": (
+                        float(rm._kelly_avg_win / rm._kelly_avg_loss)
+                        if getattr(rm, "_kelly_avg_loss", 0) else 0.0
+                    ),
+                    "trade_count": len(trade_hist),
+                    "ready": len(trade_hist) >= 20,
+                }
+            except Exception:
+                pass
+
+        # Open direction tracking (who's blocking whom via correlation)
+        open_dirs = dict(self._open_directions)
+
+        return {
+            "funding": funding,
+            "kelly": kelly,
+            "open_directions": open_dirs,
+            "correlation_group": sorted(list(_CRYPTO_MAJOR_GROUP)),
+            "correlation_threshold": 0.70,
+            "min_factors": self._min_factors,
+            "min_score": self._min_score,
+            "ts": time.time(),
+        }
+
+    def get_correlation_matrix(
+        self,
+        symbols: list[str] | None = None,
+        lookback: int = 60,
+    ) -> dict[str, Any]:
+        """Return correlation matrix of recent close-return series across symbols."""
+        if symbols is None:
+            keys = set()
+            for sym in self._funding_by_symbol.keys():
+                keys.add(sym)
+            for sym in self._open_directions.keys():
+                keys.add(sym)
+            keys.update(_CRYPTO_MAJOR_GROUP)
+            symbols = sorted(keys)
+        returns: dict[str, np.ndarray] = {}
+        for sym in symbols:
+            df = self.data_manager.get_dataframe("binance", sym, self._primary_tf)
+            if df is None or len(df) < lookback + 2:
+                continue
+            r = df["close"].pct_change().dropna().tail(lookback).values
+            if len(r) >= 20:
+                returns[sym] = r
+        syms = sorted(returns.keys())
+        matrix: dict[str, dict[str, float]] = {}
+        for a in syms:
+            matrix[a] = {}
+            for b in syms:
+                if a == b:
+                    matrix[a][b] = 1.0
+                    continue
+                ra, rb = returns[a], returns[b]
+                n = min(len(ra), len(rb))
+                if n < 20:
+                    matrix[a][b] = 0.0
+                    continue
+                try:
+                    c = float(np.corrcoef(ra[-n:], rb[-n:])[0, 1])
+                    matrix[a][b] = round(c if np.isfinite(c) else 0.0, 3)
+                except Exception:
+                    matrix[a][b] = 0.0
+        return {"symbols": syms, "matrix": matrix, "lookback": lookback}
+
+    def get_execution_config(self) -> dict[str, Any]:
+        """Return execution settings summary (read from first live CEX executor if any)."""
+        cfg = (self.config.get_value("execution") or {})
+        return {
+            "maker_first": bool(cfg.get("maker_first", True)),
+            "post_only": bool(cfg.get("post_only", True)),
+            "iceberg_threshold_usd": float(cfg.get("iceberg_threshold_usd", 10000.0)),
+            "iceberg_chunks": int(cfg.get("iceberg_chunks", 4)),
+        }
+
     def get_session_status(self) -> dict[str, Any]:
         """Return active ICT killzones / sessions for the dashboard."""
         if self._session_filter is None:

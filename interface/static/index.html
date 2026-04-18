@@ -356,6 +356,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <button class="tab" data-tab="v6">🧠 V6</button>
         <button class="tab" data-tab="smc">🎯 SMC</button>
         <button class="tab" data-tab="estop">🛑 E-Stop</button>
+        <button class="tab" data-tab="efficiency">⚙️ Efficiency</button>
         <button class="tab" data-tab="logs">📜 Logs</button>
         <div class="tf-group">
           <button class="tf-btn active" data-tf="1m">1m</button>
@@ -461,6 +462,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: Emergency Stop -->
       <div class="tab-content" id="tc-estop"><div class="panel-body" id="estopPanel" style="padding:14px"></div></div>
+
+      <!-- Tab: Efficiency (Kelly / Funding / Correlation / Execution cfg) -->
+      <div class="tab-content" id="tc-efficiency"><div class="panel-body" id="efficiencyPanel" style="padding:14px"></div></div>
 
       <!-- Tab: Logs -->
       <div class="tab-content" id="tc-logs"><div class="panel-body" id="logsPanel" style="padding:14px;font-family:'JetBrains Mono',monospace"></div></div>
@@ -767,6 +771,7 @@ function bindTabs() {
     if (t.dataset.tab === 'v6') loadV6();
     if (t.dataset.tab === 'smc') loadSMC();
     if (t.dataset.tab === 'estop') loadEStop();
+    if (t.dataset.tab === 'efficiency') loadEfficiency();
     if (t.dataset.tab === 'logs') loadLogs();
   });
 }
@@ -2104,6 +2109,111 @@ async function releaseEstop() {
     $('estopResult').textContent = r.ok ? 'Released' : 'Not active';
     setTimeout(loadEStop, 400);
   } catch (e) { $('estopResult').textContent = 'Error: ' + e.message; }
+}
+
+/* ── Efficiency Tab: Kelly + Funding Divergence + Correlation + Exec Config ── */
+async function loadEfficiency() {
+  try {
+    const [eff, corr] = await Promise.all([
+      fetch('/api/efficiency/status').then(r => r.json()).catch(() => ({})),
+      fetch('/api/efficiency/correlation').then(r => r.json()).catch(() => ({symbols:[],matrix:{}})),
+    ]);
+    const k = eff.kelly || {};
+    const ex = eff.execution || {};
+    const fnd = eff.funding || {};
+    const open = eff.open_directions || {};
+
+    let html = '';
+
+    // Kelly
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin-bottom:6px">Kelly Sizing (half-Kelly)</div>';
+    html += '<div class="arms-grid">';
+    html += armCard('Status', k.ready ? 'ACTIVE' : (k.enabled ? 'WARMING' : 'OFF'), '', k.ready ? 'ok' : 'warn');
+    html += armCard('Trades', (k.trade_count ?? 0) + '/20');
+    html += armCard('Win Rate', ((k.win_rate ?? 0) * 100).toFixed(1) + '%');
+    html += armCard('R-multiple', (k.r_multiple ?? 0).toFixed(2));
+    html += armCard('Avg Win', ((k.avg_win ?? 0) * 100).toFixed(2) + '%');
+    html += armCard('Avg Loss', ((k.avg_loss ?? 0) * 100).toFixed(2) + '%');
+    html += '</div>';
+
+    // Execution config
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Execution Strategy</div>';
+    html += '<div class="arms-grid">';
+    html += armCard('Maker-first', ex.maker_first ? 'ON' : 'OFF', '', ex.maker_first ? 'ok' : 'warn');
+    html += armCard('Post-only', ex.post_only ? 'ON' : 'OFF', '', ex.post_only ? 'ok' : 'warn');
+    html += armCard('Iceberg ≥', '$' + Number(ex.iceberg_threshold_usd || 0).toLocaleString());
+    html += armCard('Chunks', ex.iceberg_chunks ?? 0);
+    html += '</div>';
+
+    // Funding divergence
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Funding Divergence (per symbol)</div>';
+    const fsyms = Object.keys(fnd).sort();
+    if (!fsyms.length) {
+      html += '<div style="color:var(--text3);font-size:11px">No funding data yet (enabled via config.macro.funding_rates)</div>';
+    } else {
+      html += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      html += '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;padding:6px 10px;font:600 9px;color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border)">'
+        + '<div>Symbol</div><div>Rate (bps)</div><div>Divergence</div><div>Age</div></div>';
+      for (const s of fsyms) {
+        const f = fnd[s] || {};
+        const d = f.divergence || 0;
+        const dColor = d > 0.2 ? 'var(--green)' : d < -0.2 ? 'var(--red)' : 'var(--text3)';
+        const barW = Math.min(100, Math.abs(d) * 100);
+        html += '<div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr;padding:6px 10px;font-size:10px;border-bottom:1px solid var(--border);cursor:pointer" onclick="setSymbol(\'' + esc(s) + '\')">'
+          + '<div><b>' + esc(s) + '</b></div>'
+          + '<div>' + (f.rate_bps ?? 0).toFixed(2) + '</div>'
+          + '<div style="color:' + dColor + '">' + d.toFixed(2) + ' <span style="display:inline-block;width:' + barW + '%;height:3px;background:' + dColor + ';vertical-align:middle;margin-left:4px"></span></div>'
+          + '<div style="color:var(--text3)">' + Math.round(f.age_sec ?? 0) + 's</div>'
+          + '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Correlation gate state
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Correlation Gate (threshold &ge; ' + (eff.correlation_threshold ?? 0.7) + ')</div>';
+    const odirs = Object.keys(open);
+    if (!odirs.length) {
+      html += '<div style="color:var(--text3);font-size:11px">No open-direction positions tracked.</div>';
+    } else {
+      html += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      for (const s of odirs) {
+        const d = open[s];
+        const col = d === 'long' ? 'var(--green)' : d === 'short' ? 'var(--red)' : 'var(--text3)';
+        html += '<div style="padding:6px 10px;font-size:10px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between">'
+          + '<b>' + esc(s) + '</b>'
+          + '<span style="color:' + col + ';text-transform:uppercase;font-weight:600">' + esc(d) + '</span></div>';
+      }
+      html += '</div>';
+    }
+
+    // Correlation matrix
+    const csyms = corr.symbols || [];
+    if (csyms.length >= 2) {
+      html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Correlation Matrix (lookback ' + (corr.lookback ?? 60) + ' bars)</div>';
+      html += '<div style="overflow:auto;border:1px solid var(--border);border-radius:6px"><table style="border-collapse:collapse;font-family:\'JetBrains Mono\',monospace;font-size:9px;width:100%">';
+      html += '<tr><th style="padding:4px 6px;background:var(--bg2);position:sticky;left:0"></th>';
+      for (const b of csyms) html += '<th style="padding:4px 6px;background:var(--bg2)">' + esc(b.replace('/USDT:USDT','').replace('/USDT','')) + '</th>';
+      html += '</tr>';
+      for (const a of csyms) {
+        html += '<tr><th style="padding:4px 6px;background:var(--bg2);text-align:left;position:sticky;left:0">' + esc(a.replace('/USDT:USDT','').replace('/USDT','')) + '</th>';
+        for (const b of csyms) {
+          const v = (corr.matrix[a] && corr.matrix[a][b] !== undefined) ? corr.matrix[a][b] : 0;
+          const absV = Math.abs(v);
+          // green for positive, red for negative, intensity by |v|
+          const alpha = absV;
+          const bg = v > 0 ? 'rgba(0,200,80,' + alpha.toFixed(2) + ')' : 'rgba(220,60,60,' + alpha.toFixed(2) + ')';
+          const fg = absV > 0.5 ? '#fff' : 'var(--text)';
+          html += '<td style="padding:4px 6px;background:' + bg + ';color:' + fg + ';text-align:center">' + v.toFixed(2) + '</td>';
+        }
+        html += '</tr>';
+      }
+      html += '</table></div>';
+    }
+
+    $('efficiencyPanel').innerHTML = html;
+  } catch (e) {
+    $('efficiencyPanel').innerHTML = '<div style="color:var(--text3)">Efficiency data unavailable: ' + esc(e.message) + '</div>';
+  }
 }
 
 /* ── Sidebar: Session Clock ── */

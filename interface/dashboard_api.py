@@ -2846,6 +2846,23 @@ def build_app(
         payload = payload or {}
         return await sg.release_estop(released_by=str(payload.get("released_by", "dashboard")))
 
+    @app.get("/api/efficiency/status")
+    async def api_efficiency_status() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_efficiency_status"):
+            return {"enabled": False}
+        data = sg.get_efficiency_status()
+        data["execution"] = sg.get_execution_config()
+        data["enabled"] = True
+        return data
+
+    @app.get("/api/efficiency/correlation")
+    async def api_efficiency_correlation() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_correlation_matrix"):
+            return {"symbols": [], "matrix": {}}
+        return sg.get_correlation_matrix()
+
     @app.get("/api/ml/retrain/status")
     async def api_ml_retrain_status() -> dict[str, Any]:
         mr = getattr(app.state, "model_retrainer", None)
