@@ -998,6 +998,20 @@ class RiskManager:
                 tier_mult = tier_risk / self._risk_per_trade
                 size *= tier_mult
 
+        # Regime-aware Kelly scaling: use signal.regime_confidence and tier
+        try:
+            regime_conf = float(getattr(signal, "regime_confidence", 1.0) or 1.0)
+            tier_sizemult = {1: 1.0, 2: 0.6, 3: 0.3, 4: 0.0}.get(tier, 1.0) if tier else 1.0
+            kelly_adj = self.compute_kelly_size(
+                base_risk_pct=self._risk_per_trade,
+                regime_confidence=regime_conf,
+                tier_multiplier=tier_sizemult,
+            )
+            if self._risk_per_trade > 0:
+                size *= (kelly_adj / self._risk_per_trade)
+        except Exception as exc:
+            logger.debug("Regime-Kelly scaling error: {}", exc)
+
         ok, reason = self._check_symbol_exposure(signal, size)
         if not ok:
             return False, reason, 0.0
@@ -1539,25 +1553,34 @@ class RiskManager:
             self._consecutive_losses = 0
 
     # ── §9 Risk: Kelly Criterion position sizing ─────────────────────────
-    def compute_kelly_size(self, base_risk_pct: float) -> float:
-        """Apply Kelly Criterion to adjust risk percentage. f* = W - (1-W)/R, half-Kelly used."""
+    def compute_kelly_size(
+        self,
+        base_risk_pct: float,
+        regime_confidence: float = 1.0,
+        tier_multiplier: float = 1.0,
+    ) -> float:
+        """Apply Kelly Criterion, scaled by regime confidence and pair tier.
+
+        regime_confidence : 0.0–1.0 — trending strong = 1.0, choppy = 0.3
+        tier_multiplier   : TIER_1=1.0, TIER_2=0.6, TIER_3=0.3 (from PairRegistry)
+        """
         if not self._kelly_enabled or len(self._trade_results) < 20:
-            return base_risk_pct
+            # No Kelly history — still apply regime/tier multipliers
+            return base_risk_pct * max(0.25, regime_confidence) * tier_multiplier
         w = self._kelly_win_rate
         if self._kelly_avg_loss <= 0:
-            return base_risk_pct
+            return base_risk_pct * max(0.25, regime_confidence) * tier_multiplier
         r = self._kelly_avg_win / self._kelly_avg_loss
         if r <= 0:
-            return base_risk_pct
+            return base_risk_pct * max(0.25, regime_confidence) * tier_multiplier
         kelly_f = w - (1.0 - w) / r
-        # Half-Kelly for safety
-        kelly_f = max(0.0, kelly_f) * 0.5
-        # Cap at 2x base risk, floor at 25% base risk
-        adjusted = base_risk_pct * max(0.25, min(2.0, kelly_f / base_risk_pct)) if base_risk_pct > 0 else 0.0
-        # Simpler approach: scale base_risk by Kelly fraction
-        adjusted = base_risk_pct * min(2.0, max(0.25, kelly_f * 50.0))  # kelly_f ~0.02 → scale factor ~1x
-        logger.debug("Kelly: W={:.2f} R={:.2f} f*={:.4f} half={:.4f} adjusted_risk={:.4f}",
-                      w, r, kelly_f * 2, kelly_f, adjusted)
+        kelly_f = max(0.0, kelly_f) * 0.5  # Half-Kelly
+        # Scale base risk by kelly_f (25% → 2x band), then by regime + tier
+        adjusted = base_risk_pct * min(2.0, max(0.25, kelly_f * 50.0))
+        adjusted *= max(0.25, min(1.0, regime_confidence))
+        adjusted *= max(0.0, min(1.0, tier_multiplier))
+        logger.debug("Kelly: W={:.2f} R={:.2f} f*={:.4f} regime={:.2f} tier={:.2f} adj={:.4f}",
+                      w, r, kelly_f * 2, regime_confidence, tier_multiplier, adjusted)
         return adjusted
 
     @property

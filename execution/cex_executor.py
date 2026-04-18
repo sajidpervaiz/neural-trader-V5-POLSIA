@@ -51,6 +51,11 @@ class CEXExecutor:
         self._running = False
         # Binance allows 1200 req/min; cap at 600/min (10/sec) for safety margin
         self._rate_limiter = RateLimiter(max_calls=10, period_seconds=1.0)
+        exec_cfg = (config.get_value("execution") or {})
+        self._maker_first = bool(exec_cfg.get("maker_first", True))
+        self._post_only = bool(exec_cfg.get("post_only", True))
+        self._iceberg_threshold_usd = float(exec_cfg.get("iceberg_threshold_usd", 10000.0))
+        self._iceberg_chunks = int(exec_cfg.get("iceberg_chunks", 4))
 
     async def _init_client(self) -> None:
         if self._client is not None:
@@ -195,12 +200,25 @@ class CEXExecutor:
                     symbol=signal.symbol, side=side, amount=amount, params={},
                 )
             else:
-                await self._rate_limiter.acquire()
-                order = await self._client.create_limit_order(
-                    symbol=signal.symbol, side=side, amount=amount,
-                    price=signal.price, params={},
-                )
-                order = await self._wait_for_fill(signal, order, amount)
+                limit_params: dict[str, Any] = {}
+                if self._post_only:
+                    limit_params["postOnly"] = True
+                notional = size
+                if (
+                    self._iceberg_threshold_usd > 0
+                    and notional > self._iceberg_threshold_usd
+                    and self._iceberg_chunks > 1
+                ):
+                    order = await self._place_iceberg(
+                        signal, side, amount, limit_params,
+                    )
+                else:
+                    await self._rate_limiter.acquire()
+                    order = await self._client.create_limit_order(
+                        symbol=signal.symbol, side=side, amount=amount,
+                        price=signal.price, params=limit_params,
+                    )
+                    order = await self._wait_for_fill(signal, order, amount)
 
             fill_price = float(order.get("average", order.get("price", signal.price)))
             filled_qty = float(order.get("filled", amount))
@@ -304,6 +322,54 @@ class CEXExecutor:
         except Exception as exc:
             logger.exception("{} live order failed: {}", self.exchange_id, exc)
             return None
+
+    async def _place_iceberg(
+        self,
+        signal: TradingSignal,
+        side: str,
+        amount: float,
+        limit_params: dict,
+    ) -> dict:
+        """Split a large order into N child limit orders at the same price.
+
+        Returns a synthetic aggregate dict compatible with the downstream fill handling.
+        """
+        chunks = max(2, int(self._iceberg_chunks))
+        chunk_amt = amount / chunks
+        logger.info(
+            "Iceberg: {} {} x {} chunks of {:.6f} (post_only={})",
+            self.exchange_id, signal.symbol, chunks, chunk_amt, self._post_only,
+        )
+        child_orders: list[dict] = []
+        filled_total = 0.0
+        avg_price_accum = 0.0
+        for i in range(chunks):
+            try:
+                await self._rate_limiter.acquire()
+                child = await self._client.create_limit_order(
+                    symbol=signal.symbol, side=side, amount=chunk_amt,
+                    price=signal.price, params=limit_params,
+                )
+                child = await self._wait_for_fill(signal, child, chunk_amt)
+                child_orders.append(child)
+                f = float(child.get("filled", 0) or 0)
+                p = float(child.get("average", child.get("price", signal.price)) or signal.price)
+                filled_total += f
+                avg_price_accum += f * p
+            except Exception as exc:
+                logger.warning("Iceberg child {} failed: {}", i, exc)
+        avg_price = avg_price_accum / filled_total if filled_total > 0 else signal.price
+        agg_status = "filled" if filled_total >= amount * 0.98 else (
+            "partially_filled" if filled_total > 0 else "cancelled"
+        )
+        return {
+            "id": "iceberg_" + str(int(time.time() * 1000)),
+            "status": agg_status,
+            "filled": filled_total,
+            "average": avg_price,
+            "price": signal.price,
+            "children": child_orders,
+        }
 
     async def _wait_for_fill(
         self, signal: TradingSignal, order: dict, amount: float,

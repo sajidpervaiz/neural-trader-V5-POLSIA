@@ -684,6 +684,7 @@ class SignalGenerator:
         self._sentiment_ts: float = 0.0
         self._macro_score: float = 0.0
         self._macro_ts: float = 0.0
+        self._funding_by_symbol: dict[str, tuple[float, float]] = {}  # symbol → (rate, ts)
         self._score_ttl: float = 3600.0  # seconds before scores go stale
         self._min_factor_magnitude: float = 0.05  # minimum |score| to count as contributing
         self._risk_manager = None  # use set_risk_manager() to wire
@@ -1344,22 +1345,55 @@ class SignalGenerator:
     def _check_correlation_block(
         self, symbol: str, direction: str,
     ) -> bool:
-        """Block trades that would create concentrated correlated exposure.
+        """Block trades creating concentrated correlated exposure.
 
+        Uses dynamic correlation from recent 15m closes (rolling 60 bars),
+        falls back to the static major-group heuristic when data missing.
         Returns True if the trade should be BLOCKED.
         """
-        if symbol not in _CRYPTO_MAJOR_GROUP:
+        CORR_THRESHOLD = 0.70
+        MAX_CORRELATED = 2
+
+        if not self._open_directions:
             return False
-        # Check how many same-direction trades exist in the major group
-        same_dir_count = 0
-        for sym, d in self._open_directions.items():
-            if sym in _CRYPTO_MAJOR_GROUP and sym != symbol and d == direction:
-                same_dir_count += 1
-        # Block if 2+ correlated assets already in same direction
-        if same_dir_count >= 2:
+
+        same_dir_count_static = 0
+        if symbol in _CRYPTO_MAJOR_GROUP:
+            for sym, d in self._open_directions.items():
+                if sym in _CRYPTO_MAJOR_GROUP and sym != symbol and d == direction:
+                    same_dir_count_static += 1
+
+        correlated_dyn = 0
+        try:
+            base_df = self.data_manager.get_dataframe("binance", symbol, self._primary_tf)
+            base_ret = None
+            if base_df is not None and len(base_df) >= 30:
+                base_ret = base_df["close"].pct_change().dropna().tail(60)
+            if base_ret is not None and len(base_ret) >= 20:
+                base_arr = base_ret.values
+                for sym, d in self._open_directions.items():
+                    if sym == symbol or d != direction:
+                        continue
+                    other_df = self.data_manager.get_dataframe("binance", sym, self._primary_tf)
+                    if other_df is None or len(other_df) < 30:
+                        continue
+                    other_ret = other_df["close"].pct_change().dropna().tail(60).values
+                    n = min(len(base_arr), len(other_ret))
+                    if n < 20:
+                        continue
+                    corr = float(np.corrcoef(base_arr[-n:], other_ret[-n:])[0, 1])
+                    if not np.isfinite(corr):
+                        continue
+                    if corr >= CORR_THRESHOLD:
+                        correlated_dyn += 1
+        except Exception as exc:
+            logger.debug("Correlation dyn calc error for {}: {}", symbol, exc)
+
+        total = max(same_dir_count_static, correlated_dyn)
+        if total >= MAX_CORRELATED:
             logger.debug(
-                "Correlation block: {} {} — already {} correlated {} positions",
-                symbol, direction, same_dir_count, direction,
+                "Correlation block: {} {} — dyn={} static={}",
+                symbol, direction, correlated_dyn, same_dir_count_static,
             )
             return True
         return False
@@ -2411,6 +2445,12 @@ class SignalGenerator:
             self._last_layer_status["risk_gate_detail"] = f"quality={quality_score}<{quality_threshold}"
             return
 
+        # Funding divergence: ±5 quality points based on crowded/squeeze bias
+        fund_div = self._funding_divergence_score(candle.symbol, df)
+        prop_sign = 1.0 if proposed_direction == "long" else -1.0
+        funding_bonus = int(round(fund_div * prop_sign * 5))  # favor when funding aligned w/ direction
+        quality_score = max(0, min(100, int(quality_score) + funding_bonus))
+
         # Quality ≥ 90 → +25% size boost (spec)
         quality_size_boost = 1.25 if quality_score >= 90 else 1.0
 
@@ -2736,6 +2776,39 @@ class SignalGenerator:
         # Negative avg → bullish bias (positive macro_score), positive avg → bearish (negative)
         self._macro_score = float(max(min(-avg * 100, 1.0), -1.0))
         self._macro_ts = time.time()
+        # Store per-symbol funding for divergence feature
+        for r in payload:
+            sym = getattr(r, "symbol", None)
+            rate = float(getattr(r, "rate", 0.0) or 0.0)
+            if sym:
+                self._funding_by_symbol[sym] = (rate, time.time())
+
+    def _funding_divergence_score(self, symbol: str, df: pd.DataFrame) -> float:
+        """Return [-1, 1] signed score based on funding vs. recent return divergence.
+
+        Crowded long (pos funding + rising price) → short bias (negative).
+        Crowded short (neg funding + falling price) → long bias (positive).
+        Divergence (funding opposite to price) → squeeze bias (same dir as price).
+        """
+        fr = self._funding_by_symbol.get(symbol)
+        if not fr or df is None or len(df) < 20:
+            return 0.0
+        rate, ts = fr
+        if time.time() - ts > 7200:  # stale beyond 2h
+            return 0.0
+        try:
+            ret = float(df["close"].iloc[-1] / df["close"].iloc[-20] - 1.0)
+        except Exception:
+            return 0.0
+        # funding in raw units (e.g., 0.0001 = 1bp). Scale: ±0.05% is notable.
+        f_norm = float(np.clip(rate / 0.0005, -1.0, 1.0))
+        r_norm = float(np.clip(ret / 0.02, -1.0, 1.0))  # 2% = full
+        # Crowded: same sign. Score opposite to crowd.
+        crowded = f_norm * r_norm  # positive when crowded
+        if crowded > 0:
+            return float(np.clip(-f_norm, -1.0, 1.0))  # fade crowded side
+        # Divergence: signs oppose. Favor price direction (squeeze momentum).
+        return float(np.clip(r_norm, -1.0, 1.0)) * 0.5
 
     async def _handle_news_sentiment(self, payload: Any) -> None:
         """Consume NEWS_SENTIMENT events — {sentiment: float, timestamp: int}."""
