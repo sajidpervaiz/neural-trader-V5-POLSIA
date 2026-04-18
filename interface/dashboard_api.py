@@ -2774,6 +2774,104 @@ def build_app(
         history = [a.to_dict() for a in am.history[-50:]]
         return {"alerts": history, "total": len(am.history), "enabled": True}
 
+    # ── V6 spec endpoints: SessionFilter, SMC, MasterScorer, Retrainer, Pairs, EStop ──
+    def _sg():
+        return signal_generator
+
+    @app.get("/api/v6/killzone")
+    async def api_killzone() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_session_status"):
+            return {"enabled": False}
+        return sg.get_session_status()
+
+    @app.get("/api/smc/{symbol:path}")
+    async def api_smc_symbol(symbol: str) -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_smc_signal"):
+            return {"symbol": symbol, "signal": None}
+        return {"symbol": symbol, "signal": sg.get_smc_signal(symbol)}
+
+    @app.get("/api/smc")
+    async def api_smc_all() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_smc_signal"):
+            return {"signals": {}}
+        return {"signals": sg.get_smc_signal()}
+
+    @app.get("/api/v6/master/{symbol:path}")
+    async def api_master_score_symbol(symbol: str) -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_master_score"):
+            return {"symbol": symbol, "score": None}
+        return {"symbol": symbol, "score": sg.get_master_score(symbol)}
+
+    @app.get("/api/v6/master")
+    async def api_master_score_all() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_master_score"):
+            return {"scores": {}}
+        return {"scores": sg.get_master_score()}
+
+    @app.get("/api/pairs/tiers")
+    async def api_pairs_tiers() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_pair_registry_snapshot"):
+            return {"enabled": False, "pairs": {}}
+        return sg.get_pair_registry_snapshot()
+
+    @app.get("/api/estop/status")
+    async def api_estop_status() -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "get_estop_status"):
+            return {"enabled": False, "active": False}
+        return sg.get_estop_status()
+
+    @app.post("/api/estop/trigger")
+    async def api_estop_trigger(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "trigger_estop"):
+            return {"ok": False, "reason": "unavailable"}
+        payload = payload or {}
+        return await sg.trigger_estop(
+            reason=str(payload.get("reason", "manual")),
+            triggered_by=str(payload.get("triggered_by", "dashboard")),
+        )
+
+    @app.post("/api/estop/release")
+    async def api_estop_release(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        sg = _sg()
+        if sg is None or not hasattr(sg, "release_estop"):
+            return {"ok": False, "reason": "unavailable"}
+        payload = payload or {}
+        return await sg.release_estop(released_by=str(payload.get("released_by", "dashboard")))
+
+    @app.get("/api/ml/retrain/status")
+    async def api_ml_retrain_status() -> dict[str, Any]:
+        mr = getattr(app.state, "model_retrainer", None)
+        if mr is None:
+            return {"enabled": False}
+        return mr.get_status()
+
+    @app.post("/api/ml/retrain/trigger")
+    async def api_ml_retrain_trigger() -> dict[str, Any]:
+        mr = getattr(app.state, "model_retrainer", None)
+        if mr is None:
+            return {"ok": False, "reason": "unavailable"}
+        try:
+            result = await mr.trigger_now()
+            if result is None:
+                return {"ok": False, "reason": "skipped_insufficient_data"}
+            return {
+                "ok": bool(result.success),
+                "auc": result.auc,
+                "rows": result.rows,
+                "duration_s": result.duration_s,
+                "reason": result.reason,
+            }
+        except Exception as exc:
+            return {"ok": False, "reason": str(exc)}
+
     return app
 
 # Top-level FastAPI app for uvicorn import

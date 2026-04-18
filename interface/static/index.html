@@ -353,6 +353,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <button class="tab" data-tab="heatmap">🔥 Heatmap <span class="btm-count" id="heatmapCount">0</span></button>
         <button class="tab" data-tab="alerts">🚨 Alerts <span class="btm-count" id="alertsCount">0</span></button>
         <button class="tab" data-tab="health">💚 Health <span class="btm-count" id="healthCount">0</span></button>
+        <button class="tab" data-tab="v6">🧠 V6</button>
+        <button class="tab" data-tab="smc">🎯 SMC</button>
+        <button class="tab" data-tab="estop">🛑 E-Stop</button>
         <button class="tab" data-tab="logs">📜 Logs</button>
         <div class="tf-group">
           <button class="tf-btn active" data-tf="1m">1m</button>
@@ -449,6 +452,15 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: Health -->
       <div class="tab-content" id="tc-health"><div class="panel-body" id="healthPanel" style="padding:14px"></div></div>
+
+      <!-- Tab: V6 (Killzone + MasterScorer + ML retrain + Pair tiers) -->
+      <div class="tab-content" id="tc-v6"><div class="panel-body" id="v6Panel" style="padding:14px"></div></div>
+
+      <!-- Tab: SMC signals -->
+      <div class="tab-content" id="tc-smc"><div class="panel-body" id="smcPanel" style="padding:14px"></div></div>
+
+      <!-- Tab: Emergency Stop -->
+      <div class="tab-content" id="tc-estop"><div class="panel-body" id="estopPanel" style="padding:14px"></div></div>
 
       <!-- Tab: Logs -->
       <div class="tab-content" id="tc-logs"><div class="panel-body" id="logsPanel" style="padding:14px;font-family:'JetBrains Mono',monospace"></div></div>
@@ -752,6 +764,9 @@ function bindTabs() {
     if (t.dataset.tab === 'heatmap') loadHeatmap();
     if (t.dataset.tab === 'alerts') loadAlerts();
     if (t.dataset.tab === 'health') loadHealth();
+    if (t.dataset.tab === 'v6') loadV6();
+    if (t.dataset.tab === 'smc') loadSMC();
+    if (t.dataset.tab === 'estop') loadEStop();
     if (t.dataset.tab === 'logs') loadLogs();
   });
 }
@@ -1924,6 +1939,171 @@ async function loadHealth() {
     html += '</div>';
     $('healthPanel').innerHTML = html;
   } catch (e) { $('healthPanel').innerHTML = '<div style="color:var(--text3)">Health data unavailable</div>'; }
+}
+
+/* ── V6 Tab: Killzone + MasterScorer + ML Retrain + Pair Tiers ── */
+async function loadV6() {
+  try {
+    const [kz, master, retrain, tiers] = await Promise.all([
+      fetch('/api/v6/killzone').then(r => r.json()).catch(() => ({})),
+      fetch('/api/v6/master').then(r => r.json()).catch(() => ({scores:{}})),
+      fetch('/api/ml/retrain/status').then(r => r.json()).catch(() => ({})),
+      fetch('/api/pairs/tiers').then(r => r.json()).catch(() => ({pairs:{}})),
+    ]);
+    let html = '';
+    // Killzone block
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin-bottom:6px">ICT Killzone (UTC ' + (kz.utc_hour ?? '?') + ':00)</div>';
+    html += '<div class="arms-grid">';
+    html += armCard('Best Zone', kz.best_killzone || 'NONE');
+    html += armCard('Priority', kz.killzone_priority ?? 0);
+    html += armCard('KZ Score', ((kz.killzone_score ?? 0) * 100).toFixed(0));
+    html += armCard('Allowed', kz.allowed === false ? 'NO' : 'YES', '', kz.allowed === false ? 'danger' : 'ok');
+    html += '</div>';
+    const sess = (kz.active_sessions || []).join(', ') || 'none';
+    const kzl  = (kz.active_killzones || []).join(', ') || 'none';
+    html += '<div style="margin-top:6px;font-size:10px;color:var(--text3)">Sessions: ' + esc(sess) + ' · Killzones: ' + esc(kzl) + '</div>';
+
+    // Master Score
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">V6 MasterScore (spec §11)</div>';
+    const scores = master.scores || {};
+    const syms = Object.keys(scores);
+    if (syms.length === 0) {
+      html += '<div style="color:var(--text3);font-size:11px">Waiting for first scored signal…</div>';
+    } else {
+      html += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      for (const s of syms.slice(0, 20)) {
+        const m = scores[s] || {};
+        const tot = m.total || 0;
+        const barColor = tot >= 90 ? 'var(--green)' : tot >= 75 ? 'var(--yellow)' : 'var(--red)';
+        html += '<div style="padding:8px 10px;border-bottom:1px solid var(--border);font-size:10px;cursor:pointer" onclick="setSymbol(\'' + esc(s) + '\')">'
+          + '<div style="display:flex;justify-content:space-between"><b>' + esc(s) + '</b><span>' + tot.toFixed(1) + ' → ' + esc(m.decision || '-').toUpperCase() + '</span></div>'
+          + '<div style="height:4px;background:var(--border);margin-top:4px;border-radius:2px;overflow:hidden"><div style="height:4px;width:' + Math.min(100, tot) + '%;background:' + barColor + '"></div></div>'
+          + '<div style="color:var(--text3);margin-top:3px">' + esc(m.explanation || '') + '</div>'
+          + '</div>';
+      }
+      html += '</div>';
+    }
+
+    // Retrainer
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">ML Model Retrainer</div>';
+    html += '<div class="arms-grid">';
+    html += armCard('Enabled', retrain.enabled === false ? 'NO' : 'YES');
+    html += armCard('Retrains', retrain.retrain_count ?? 0);
+    html += armCard('Next (h)', retrain.next_retrain_in_hours ?? '-');
+    html += armCard('Min Trades', retrain.min_trades ?? '-');
+    html += '</div>';
+    html += '<button class="btn" style="margin-top:8px" onclick="triggerRetrain()">Retrain Now</button>';
+    html += '<div id="retrainResult" style="margin-top:8px;font-size:10px;color:var(--text3)"></div>';
+
+    // Pair tiers
+    html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Pair Tiers (ARMS-V2.1)</div>';
+    const pairs = tiers.pairs || {};
+    const pnames = Object.keys(pairs);
+    if (pnames.length === 0) {
+      html += '<div style="color:var(--text3);font-size:11px">No pairs registered</div>';
+    } else {
+      html += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      for (const p of pnames) {
+        const info = pairs[p] || {};
+        const tierColor = info.tier === 'TIER_1' ? 'var(--green)' : info.tier === 'TIER_2' ? 'var(--blue)' : info.tier === 'TIER_3' ? 'var(--yellow)' : 'var(--red)';
+        html += '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:10px;display:flex;justify-content:space-between">'
+          + '<b>' + esc(p) + '</b><span style="color:' + tierColor + '">' + esc(info.tier) + ' × ' + (info.size_mult ?? '-') + '</span></div>';
+      }
+      html += '</div>';
+    }
+    $('v6Panel').innerHTML = html;
+  } catch (e) { $('v6Panel').innerHTML = '<div style="color:var(--text3)">V6 data unavailable</div>'; }
+}
+
+async function triggerRetrain() {
+  $('retrainResult').textContent = 'Triggering…';
+  try {
+    const r = await (await fetch('/api/ml/retrain/trigger', {method:'POST'})).json();
+    $('retrainResult').textContent = r.ok
+      ? 'OK — AUC ' + (r.auc ?? 0).toFixed(4) + ' on ' + (r.rows ?? 0) + ' rows (' + (r.duration_s ?? 0).toFixed(0) + 's)'
+      : 'Skipped/failed: ' + (r.reason || 'unknown');
+  } catch (e) { $('retrainResult').textContent = 'Error: ' + e.message; }
+}
+
+/* ── SMC Tab: active SMC setups per symbol ── */
+async function loadSMC() {
+  try {
+    const d = await (await fetch('/api/smc')).json();
+    const sigs = d.signals || {};
+    const syms = Object.keys(sigs);
+    let html = '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin-bottom:6px">Active SMC Setups (ICT)</div>';
+    if (syms.length === 0) {
+      html += '<div style="color:var(--text3);font-size:11px">No active SMC signals yet. Setups populate as FVGs / OBs / breaker blocks / liquidity sweeps mitigate.</div>';
+    } else {
+      html += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      for (const s of syms) {
+        const sig = sigs[s] || {};
+        const dir = sig.direction || '';
+        const dirColor = dir === 'long' ? 'var(--green)' : dir === 'short' ? 'var(--red)' : 'var(--text3)';
+        html += '<div style="padding:8px 10px;border-bottom:1px solid var(--border);font-size:10px;cursor:pointer" onclick="setSymbol(\'' + esc(s) + '\')">'
+          + '<div style="display:flex;justify-content:space-between"><b>' + esc(s) + '</b>'
+          + '<span><span style="color:' + dirColor + ';text-transform:uppercase;font-weight:600">' + esc(dir || '-') + '</span> · score ' + (sig.score ?? 0).toFixed(1) + '</span></div>'
+          + '<div style="color:var(--text3);margin-top:3px">' + esc(sig.type || '') + ' — ' + esc(sig.reason || '') + '</div>'
+          + '<div style="color:var(--text3);margin-top:2px">entry ' + (sig.entry ?? 0).toFixed(4) + ' · sl ' + (sig.stop_loss ?? 0).toFixed(4) + ' · tp ' + (sig.take_profit ?? 0).toFixed(4) + '</div>'
+          + '</div>';
+      }
+      html += '</div>';
+    }
+    $('smcPanel').innerHTML = html;
+  } catch (e) { $('smcPanel').innerHTML = '<div style="color:var(--text3)">SMC data unavailable</div>'; }
+}
+
+/* ── EStop Tab ── */
+async function loadEStop() {
+  try {
+    const d = await (await fetch('/api/estop/status')).json();
+    const active = !!d.active;
+    let html = '<div class="arms-grid">';
+    html += armCard('State', active ? 'ACTIVE' : 'NORMAL', '', active ? 'danger' : 'ok');
+    html += armCard('Reason', d.reason || '-');
+    html += armCard('Events', d.total_events ?? 0);
+    html += armCard('Duration', Math.round(d.duration_seconds ?? 0) + 's');
+    html += '</div>';
+    if (active) {
+      html += '<button class="btn" style="margin-top:10px;background:var(--green);color:#000" onclick="releaseEstop()">Release E-Stop</button>';
+    } else {
+      html += '<button class="btn" style="margin-top:10px;background:var(--red);color:#fff" onclick="triggerEstop()">🛑 Trigger E-Stop</button>';
+    }
+    html += '<div id="estopResult" style="margin-top:8px;font-size:10px;color:var(--text3)"></div>';
+    const history = d.history || [];
+    if (history.length) {
+      html += '<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Recent Events</div>';
+      html += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">';
+      for (const ev of history.slice().reverse()) {
+        const ts = ev.triggered_at ? new Date(ev.triggered_at * 1000).toLocaleString() : '';
+        html += '<div style="padding:6px 10px;border-bottom:1px solid var(--border);font-size:10px">'
+          + '<b>' + esc(ev.trigger) + '</b> by ' + esc(ev.triggered_by) + ' <span style="color:var(--text3)">' + esc(ts) + '</span>'
+          + '<div style="color:var(--text3)">cancelled ' + ev.orders_cancelled + ' · closed ' + ev.positions_closed
+          + (ev.resolved_at ? ' · released by ' + esc(ev.resolved_by) : ' · open')
+          + '</div></div>';
+      }
+      html += '</div>';
+    }
+    $('estopPanel').innerHTML = html;
+  } catch (e) { $('estopPanel').innerHTML = '<div style="color:var(--text3)">E-Stop data unavailable</div>'; }
+}
+
+async function triggerEstop() {
+  if (!confirm('Trigger Emergency Stop? This halts all new signals and cancels open orders.')) return;
+  $('estopResult').textContent = 'Triggering…';
+  try {
+    const r = await (await fetch('/api/estop/trigger', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'manual', triggered_by:'dashboard'})})).json();
+    $('estopResult').textContent = r.ok ? 'E-Stop ACTIVE' : 'Failed: ' + (r.reason || '?');
+    setTimeout(loadEStop, 400);
+  } catch (e) { $('estopResult').textContent = 'Error: ' + e.message; }
+}
+async function releaseEstop() {
+  $('estopResult').textContent = 'Releasing…';
+  try {
+    const r = await (await fetch('/api/estop/release', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({released_by:'dashboard'})})).json();
+    $('estopResult').textContent = r.ok ? 'Released' : 'Not active';
+    setTimeout(loadEStop, 400);
+  } catch (e) { $('estopResult').textContent = 'Error: ' + e.message; }
 }
 
 /* ── Sidebar: Session Clock ── */

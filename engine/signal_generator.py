@@ -37,6 +37,36 @@ except Exception:
     SessionFilter = None  # type: ignore
     _SESSION_FILTER_AVAILABLE = False
 
+try:
+    from engine.smc_signal_modules import SMCStrategySelector
+    _SMC_SELECTOR_AVAILABLE = True
+except Exception:
+    SMCStrategySelector = None  # type: ignore
+    _SMC_SELECTOR_AVAILABLE = False
+
+try:
+    from engine.master_scorer import compute_master_score, compute_exec_liquidity_score
+    _MASTER_SCORER_AVAILABLE = True
+except Exception:
+    compute_master_score = None  # type: ignore
+    compute_exec_liquidity_score = None  # type: ignore
+    _MASTER_SCORER_AVAILABLE = False
+
+try:
+    from engine.pair_registry import PairRegistry, PairTier
+    _PAIR_REGISTRY_AVAILABLE = True
+except Exception:
+    PairRegistry = None  # type: ignore
+    PairTier = None  # type: ignore
+    _PAIR_REGISTRY_AVAILABLE = False
+
+try:
+    from execution.estop import EStopManager
+    _ESTOP_AVAILABLE = True
+except Exception:
+    EStopManager = None  # type: ignore
+    _ESTOP_AVAILABLE = False
+
 
 # ── Signal Type Classification (§3) ──────────────────────────────────────────
 
@@ -716,6 +746,25 @@ class SignalGenerator:
             self._ml_scorer = MLScorer(model_path=self._ml_model_path)
             self._adaptive_ml = False
         self._session_filter = SessionFilter() if _SESSION_FILTER_AVAILABLE else None
+        self._smc_selector = SMCStrategySelector() if _SMC_SELECTOR_AVAILABLE else None
+        self._last_smc_signal_per_symbol: dict[str, dict[str, Any]] = {}
+        self._last_master_score_per_symbol: dict[str, dict[str, Any]] = {}
+        self._pair_registry: Any = PairRegistry() if _PAIR_REGISTRY_AVAILABLE else None
+        if self._pair_registry is not None:
+            try:
+                universe = config.get_value("signal_generator.universe") or config.get_value("universe") or []
+                if isinstance(universe, list):
+                    for sym in universe:
+                        if isinstance(sym, str):
+                            self._pair_registry.register(sym, daily_volume_usd=1_000_000_000)
+                        elif isinstance(sym, dict):
+                            self._pair_registry.register(
+                                sym.get("symbol", ""),
+                                daily_volume_usd=float(sym.get("volume_usd", 1_000_000_000)),
+                            )
+            except Exception as exc:
+                logger.debug("PairRegistry seed failed: {}", exc)
+        self._estop: Any = EStopManager(self.event_bus) if _ESTOP_AVAILABLE else None
         self._ml_bootstrap_task: asyncio.Task | None = None
         self._last_ml_train_ts: float = 0.0
         risk_cfg = config.get_value("risk") or {}
@@ -849,6 +898,55 @@ class SignalGenerator:
         status = self._ai_agent.get_status()
         status["auto_trading_enabled"] = bool(self._auto_trading_enabled)
         return status
+
+    def get_session_status(self) -> dict[str, Any]:
+        """Return active ICT killzones / sessions for the dashboard."""
+        if self._session_filter is None:
+            return {"enabled": False, "active_killzones": [], "active_sessions": [], "score": 0.0}
+        ctx = self._session_filter.session_context()
+        allowed, reason = self._session_filter.should_trade()
+        ctx["enabled"] = True
+        ctx["allowed"] = allowed
+        ctx["reason"] = reason
+        return ctx
+
+    def get_smc_signal(self, symbol: str | None = None) -> dict[str, Any]:
+        """Return latest SMC strategy signal per symbol (or for a given symbol)."""
+        if symbol:
+            return self._last_smc_signal_per_symbol.get(symbol, {"symbol": symbol, "signal": None})
+        return dict(self._last_smc_signal_per_symbol)
+
+    def get_master_score(self, symbol: str | None = None) -> dict[str, Any]:
+        """Return the latest V6 master score per symbol (or for a given symbol)."""
+        if symbol:
+            return self._last_master_score_per_symbol.get(symbol, {"symbol": symbol, "score": None})
+        return dict(self._last_master_score_per_symbol)
+
+    def get_pair_registry_snapshot(self) -> dict[str, Any]:
+        """Return PairRegistry snapshot for the dashboard."""
+        if self._pair_registry is None:
+            return {"enabled": False, "pairs": {}}
+        return {"enabled": True, "pairs": self._pair_registry.get_snapshot()}
+
+    def get_estop_status(self) -> dict[str, Any]:
+        """Return EStopManager status."""
+        if self._estop is None:
+            return {"enabled": False, "active": False}
+        status = self._estop.get_status()
+        status["enabled"] = True
+        return status
+
+    async def trigger_estop(self, reason: str = "manual", triggered_by: str = "dashboard") -> dict[str, Any]:
+        if self._estop is None:
+            return {"ok": False, "reason": "estop_unavailable"}
+        await self._estop.trigger(reason, triggered_by=triggered_by)
+        return {"ok": True, "status": self._estop.get_status()}
+
+    async def release_estop(self, released_by: str = "dashboard") -> dict[str, Any]:
+        if self._estop is None:
+            return {"ok": False, "reason": "estop_unavailable"}
+        ok = await self._estop.release(released_by=released_by)
+        return {"ok": ok, "status": self._estop.get_status()}
 
     def configure_agent(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Update AI agent runtime settings and return the new status."""
@@ -1570,6 +1668,7 @@ class SignalGenerator:
         tech_score_100: float = 0.0, smc_points: float = 0.0,
         volume_score_100: float = 0.0, regime_allows: bool = True,
         ml_confidence: float = 0.0, orderbook_depth_ratio: float = 0.0,
+        killzone_score: float = 0.0,
     ) -> int:
         """Compute 0-100 quality score — Spec Layer 8.
 
@@ -1622,6 +1721,9 @@ class SignalGenerator:
             + liq_component * 0.05
         )
 
+        kz = max(0.0, min(1.0, killzone_score))
+        total += kz * 5.0
+
         return min(100, max(0, int(total)))
 
     async def _handle_candle(self, payload: Any) -> None:
@@ -1650,6 +1752,25 @@ class SignalGenerator:
         if now - self._last_signal_time.get(key, 0) < self._min_signal_interval:
             logger.debug("DIAG {}: throttled (interval)", key)
             return
+
+        # E-Stop gate — block all new signals when emergency stop is active
+        if self._estop is not None and self._estop.is_active:
+            logger.debug("DIAG {}: ESTOP active ({})", key, self._estop.reason)
+            self._update_layer_status(l0="BLOCKED")
+            self._last_layer_status["session_filter_detail"] = f"ESTOP:{self._estop.reason}"
+            return
+
+        # PairRegistry tier gate — skip Tier 4 pairs
+        if self._pair_registry is not None:
+            try:
+                if self._pair_registry.get(candle.symbol) is None:
+                    self._pair_registry.register(candle.symbol, daily_volume_usd=1_000_000_000)
+                if not self._pair_registry.is_tradeable(candle.symbol):
+                    logger.debug("DIAG {}: pair tier excluded", key)
+                    self._update_layer_status(l0="BLOCKED")
+                    return
+            except Exception:
+                pass
 
         df = self.data_manager.get_dataframe(candle.exchange, candle.symbol, self._primary_tf)
         if df is None or len(df) < 30:
@@ -2185,6 +2306,12 @@ class SignalGenerator:
         # No hard gate on ML — it just feeds into quality score
 
         # ── L8: SIGNAL QUALITY (HARD GATE: ≥ 65) ────────────────────────
+        kz_score = 0.0
+        if self._session_filter is not None:
+            try:
+                kz_score = float(self._session_filter.killzone_score())
+            except Exception:
+                kz_score = 0.0
         quality_score = self._compute_quality_score(
             htf_score=htf_weighted_score, signal_type=signal_type,
             vol_ratio=vol_ratio, smc_state=smc_state, vol_flow=vol_flow,
@@ -2196,7 +2323,54 @@ class SignalGenerator:
             regime_allows=(regime_class != "CHOPPY"),
             ml_confidence=float(l7_ml_score),
             orderbook_depth_ratio=orderbook_depth_ratio,
+            killzone_score=kz_score,
         )
+
+        # ── SMC Strategy Selector (ICT modules) ───────────────────────────
+        if self._smc_selector is not None:
+            try:
+                smc_sig = self._smc_selector.select_and_evaluate(df, regime_state)
+                if smc_sig is not None:
+                    self._last_smc_signal_per_symbol[candle.symbol] = {
+                        "type": getattr(smc_sig, "signal_type", smc_sig.__class__.__name__),
+                        "direction": getattr(smc_sig, "direction", ""),
+                        "score": float(getattr(smc_sig, "score", 0.0)),
+                        "entry": float(getattr(smc_sig, "entry_price", 0.0) or 0.0),
+                        "stop_loss": float(getattr(smc_sig, "stop_loss", 0.0) or 0.0),
+                        "take_profit": float(getattr(smc_sig, "take_profit", 0.0) or 0.0),
+                        "reason": getattr(smc_sig, "reason", ""),
+                        "ts": time.time(),
+                    }
+            except Exception as exc:
+                logger.debug("SMC selector error for {}: {}", candle.symbol, exc)
+
+        # ── V6 MasterScorer composite (spec §11) ───────────────────────────
+        if _MASTER_SCORER_AVAILABLE:
+            try:
+                exec_liq = compute_exec_liquidity_score(
+                    orderbook_depth_usd=float(orderbook_depth_ratio) * 1000.0 if orderbook_depth_ratio else 0.0,
+                    position_size_usd=1000.0,
+                )
+                drift = bool(getattr(self._ml_scorer, "drift_detected", False))
+                master = compute_master_score(
+                    layer3_score=float(l4_smc_score),
+                    layer4_score=float(l3_tech_score),
+                    layer5_score=float(l5_vol_score),
+                    neural_confidence=float(l7_ml_score),
+                    exec_liquidity_score=float(exec_liq),
+                    drift_detected=drift,
+                )
+                self._last_master_score_per_symbol[candle.symbol] = {
+                    "total": master.total_score,
+                    "decision": master.decision,
+                    "size_multiplier": master.size_multiplier,
+                    "size_boost": master.size_boost,
+                    "components": master.component_scores,
+                    "explanation": master.explanation,
+                    "ts": time.time(),
+                }
+            except Exception as exc:
+                logger.debug("MasterScorer error for {}: {}", candle.symbol, exc)
 
         # Update all layer statuses for dashboard
         self._update_layer_status(

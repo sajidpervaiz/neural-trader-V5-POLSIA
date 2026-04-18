@@ -266,6 +266,23 @@ async def main() -> None:
         app.state.health_checker = health_checker
         app.state.alert_manager = alert_manager
 
+    # ── ModelRetrainer (periodic background retrain of the ML model) ──────
+    model_retrainer = None
+    try:
+        from engine.model_retrainer import ModelRetrainer
+        model_retrainer = ModelRetrainer(
+            ml_scorer=signal_gen._ml_scorer,
+            alert_manager=alert_manager,
+            config=config,
+        )
+        if app is not None:
+            app.state.model_retrainer = model_retrainer
+    except Exception as exc:
+        logger.warning("ModelRetrainer init failed: {}", exc)
+
+    if app is not None:
+        app.state.signal_generator = signal_gen
+
     # Re-add the dashboard log sink (logger.remove() in _setup_logging wipes it)
     from interface.dashboard_api import _log_sink
     logger.add(_log_sink, level="INFO", format="{message}")
@@ -384,6 +401,9 @@ async def main() -> None:
         asyncio.create_task(health_checker.start_periodic_checks(), name="health_checker"),
         asyncio.create_task(alert_dispatcher.run(), name="alert_dispatcher"),
     ]
+
+    if model_retrainer is not None:
+        tasks.append(asyncio.create_task(model_retrainer.run(), name="model_retrainer"))
 
     for executor in executors:
         tasks.append(asyncio.create_task(executor.run(), name=f"exec_{executor.exchange_id}"))
