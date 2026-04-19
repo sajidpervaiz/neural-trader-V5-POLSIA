@@ -1763,60 +1763,102 @@ async function loadPipeline() {
   } catch(e) { $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
 }
 function renderPipeline(layers, quality, session) {
-  let html='<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">';
-  // Left: 9-layer status
-  html+='<div>';
-  html+='<div style="font:700 13px sans-serif;color:var(--text1);margin-bottom:10px">9-Layer Confirmation Pipeline</div>';
+  const statusColor = st => {
+    const s = String(st||'').toLowerCase();
+    if (s==='pass') return 'var(--green)';
+    if (s==='fail' || s==='blocked') return 'var(--red)';
+    if (s==='weak' || s==='skip') return 'var(--yellow)';
+    if (s==='pending') return 'var(--cyan)';
+    return 'var(--text3)';
+  };
+  const thStyle = 'text-align:left;padding:6px 8px;font:600 10px sans-serif;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);background:var(--bg0)';
+  const tdStyle = 'padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top';
+  const sectionTitle = 'font:700 13px sans-serif;color:var(--text1);margin-bottom:10px';
+
+  let html='<div style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:14px" id="pipelineTriGrid">';
+
+  // ── Table 1: 9-Layer Pipeline ──
+  html+='<div><div style="'+sectionTitle+'">9-Layer Confirmation Pipeline</div>';
+  html+='<table style="width:100%;border-collapse:collapse;font-size:11px">';
+  html+='<thead><tr>';
+  html+='<th style="'+thStyle+';width:28px">#</th>';
+  html+='<th style="'+thStyle+'">Layer</th>';
+  html+='<th style="'+thStyle+';width:56px">Status</th>';
+  html+='</tr></thead><tbody>';
   (layers.layers||[]).forEach(l => {
-    const stRaw = String(l.status||'UNKNOWN');
-    const st = stRaw.toLowerCase();
+    const stRaw = String(l.status||'UNKNOWN').toUpperCase();
+    const color = statusColor(stRaw);
     const detail = String(l.detail || '');
-    const color = st==='pass'?'var(--green)':(st==='fail'||st==='blocked')?'var(--red)':(st==='weak'||st==='skip')?'var(--yellow)':(st==='pending'?'var(--cyan)':'var(--text3)');
-    html+='<div style="display:flex;align-items:flex-start;gap:8px;padding:6px 8px;border-bottom:1px solid var(--border)">';
-    html+='<div style="width:24px;height:24px;border-radius:50%;background:'+color+';display:flex;align-items:center;justify-content:center;font:700 11px sans-serif;color:#000;flex-shrink:0">'+l.id+'</div>';
-    html+='<div style="flex:1"><div style="font:600 11px sans-serif;color:var(--text1)">'+esc(l.name)+'</div><div style="font:10px sans-serif;color:var(--text3)">'+esc(l.description)+'</div>'+(detail?'<div style="font:10px \'JetBrains Mono\';color:var(--text2);margin-top:2px">'+esc(detail)+'</div>':'')+'</div>';
-    html+='<div style="font:600 10px \'JetBrains Mono\';color:'+color+'">'+esc(stRaw.toUpperCase())+'</div>';
-    html+='</div>';
+    html+='<tr>';
+    html+='<td style="'+tdStyle+';font:700 11px \'JetBrains Mono\';color:'+color+'">'+l.id+'</td>';
+    html+='<td style="'+tdStyle+'"><div style="font:600 11px sans-serif;color:var(--text1)">'+esc(l.name)+'</div>';
+    html+='<div style="font:10px sans-serif;color:var(--text3);margin-top:2px">'+esc(l.description||'')+'</div>';
+    if (detail) html+='<div style="font:10px \'JetBrains Mono\';color:var(--text2);margin-top:2px">'+esc(detail)+'</div>';
+    html+='</td>';
+    html+='<td style="'+tdStyle+'"><span style="display:inline-block;padding:2px 6px;border-radius:10px;background:'+color+';color:#000;font:700 9px \'JetBrains Mono\';letter-spacing:.04em">'+esc(stRaw)+'</span></td>';
+    html+='</tr>';
   });
-  html+='</div>';
-  // Right: Quality Score + Session
-  html+='<div>';
-  // Quality Score
-  html+='<div style="font:700 13px sans-serif;color:var(--text1);margin-bottom:10px">Quality Score</div>';
+  html+='</tbody></table></div>';
+
+  // ── Table 2: Quality Components ──
   const total = Number(quality.total||0);
   const partial = !!quality.partial;
-  const qColor = total>=90?'var(--green)':total>=65?'var(--yellow)':(total>0?'var(--orange)':'var(--red)');
   const preview = !!quality.preview;
+  const qColor = total>=90?'var(--green)':total>=65?'var(--yellow)':(total>0?'var(--orange)':'var(--red)');
   if ($('tvQualityChip')) {
     $('tvQualityChip').textContent = 'QUALITY ' + total + '/100' + (partial ? ' PARTIAL' : preview ? ' PREVIEW' : '');
     $('tvQualityChip').style.color = qColor;
     $('tvQualityChip').style.borderColor = qColor;
   }
-  html+='<div style="text-align:center;margin-bottom:12px"><span style="font:700 36px \'JetBrains Mono\';color:'+qColor+'">'+total+'</span><span style="font:11px sans-serif;color:var(--text3)"> / 100</span></div>';
-  if (preview) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--cyan);margin:-6px 0 10px 0">Live preview from the latest market snapshot</div>';
-  else if (partial) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--yellow);margin:-6px 0 10px 0">Partial score from current evaluated layers</div>';
+  html+='<div><div style="'+sectionTitle+'">Quality Components</div>';
+  html+='<div style="text-align:center;margin-bottom:8px">';
+  html+='<span style="font:700 36px \'JetBrains Mono\';color:'+qColor+'">'+total+'</span>';
+  html+='<span style="font:11px sans-serif;color:var(--text3)"> / 100</span>';
+  html+='</div>';
+  if (preview) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--cyan);margin:-4px 0 10px 0">Live preview from the latest market snapshot</div>';
+  else if (partial) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--yellow);margin:-4px 0 10px 0">Partial score from current evaluated layers</div>';
+  html+='<table style="width:100%;border-collapse:collapse;font-size:11px">';
+  html+='<thead><tr>';
+  html+='<th style="'+thStyle+'">Component</th>';
+  html+='<th style="'+thStyle+';width:44px;text-align:right">Score</th>';
+  html+='<th style="'+thStyle+';width:40%">Bar</th>';
+  html+='</tr></thead><tbody>';
   const comps = quality.components||{};
   for(const[k,v] of Object.entries(comps)) {
-    const pct = Math.min(100, Math.max(0, v));
-    html+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font:10px sans-serif;color:var(--text2);width:120px">'+esc(k.replace(/_/g,' '))+'</span>';
-    html+='<div style="flex:1;height:6px;background:var(--bg0);border-radius:3px"><div style="width:'+pct+'%;height:100%;background:var(--blue);border-radius:3px"></div></div>';
-    html+='<span style="font:10px \'JetBrains Mono\';color:var(--text3);width:24px;text-align:right">'+Math.round(v)+'</span></div>';
+    const num = Number(v) || 0;
+    const pct = Math.min(100, Math.max(0, num));
+    html+='<tr>';
+    html+='<td style="'+tdStyle+';font:11px sans-serif;color:var(--text2)">'+esc(k.replace(/_/g,' '))+'</td>';
+    html+='<td style="'+tdStyle+';font:11px \'JetBrains Mono\';color:var(--text1);text-align:right">'+Math.round(num)+'</td>';
+    html+='<td style="'+tdStyle+'"><div style="height:6px;background:var(--bg0);border-radius:3px"><div style="width:'+pct+'%;height:100%;background:var(--blue);border-radius:3px"></div></div></td>';
+    html+='</tr>';
   }
-  // Session info
-  html+='<div style="font:700 13px sans-serif;color:var(--text1);margin:16px 0 10px 0">Current Session</div>';
+  html+='</tbody></table></div>';
+
+  // ── Table 3: Session Rules ──
+  html+='<div><div style="'+sectionTitle+'">Session Rules</div>';
+  html+='<table style="width:100%;border-collapse:collapse;font-size:11px">';
+  html+='<thead><tr>';
+  html+='<th style="'+thStyle+';width:38%">Field</th>';
+  html+='<th style="'+thStyle+'">Value</th>';
+  html+='</tr></thead><tbody>';
   const s = session.active_session;
-  if(s){
-    html+='<div style="padding:8px;background:var(--bg0);border-radius:6px">';
-    html+='<div style="font:700 12px sans-serif;color:var(--blue)">'+esc(s.name.toUpperCase())+'</div>';
-    html+='<div style="font:10px sans-serif;color:var(--text3);margin-top:4px">UTC '+s.start+':00 — '+s.end+':00 · Size: '+s.size_mult+'x</div>';
-    html+='<div style="font:10px sans-serif;color:var(--text3)">Allowed types: '+(s.types.length?s.types.join(', '):'NONE (no-trade)')+'</div>';
-    if(session.in_killzone) html+='<div style="font:600 10px sans-serif;color:var(--yellow);margin-top:4px">⚡ ICT KILLZONE ACTIVE (C & D types, 1.2x boost)</div>';
-    if(session.is_weekend) html+='<div style="font:600 10px sans-serif;color:var(--red);margin-top:4px">🚫 WEEKEND — Trading halted</div>';
-    html+='</div>';
+  const row = (label, value, valueStyle) =>
+    '<tr><td style="'+tdStyle+';font:600 11px sans-serif;color:var(--text3)">'+esc(label)+'</td>'+
+    '<td style="'+tdStyle+';font:11px sans-serif;color:var(--text1)'+(valueStyle?';'+valueStyle:'')+'">'+value+'</td></tr>';
+  if (s) {
+    html+=row('Session', '<span style="font:700 11px sans-serif;color:var(--blue)">'+esc(String(s.name||'').toUpperCase())+'</span>');
+    html+=row('UTC Window', esc('UTC '+s.start+':00 — '+s.end+':00'));
+    html+=row('Size Mult', esc(String(s.size_mult)+'x'));
+    html+=row('Allowed Types', esc(s.types && s.types.length ? s.types.join(', ') : 'NONE (no-trade)'));
   } else {
-    html+='<div style="color:var(--text3);font-size:10px">No active session</div>';
+    html+=row('Session', '<span style="color:var(--text3)">No active session</span>');
   }
-  html+='</div></div>';
+  if (session.in_killzone) html+=row('ICT Killzone', '<span style="color:var(--yellow);font-weight:600">⚡ ACTIVE — 1.2x boost (C & D types)</span>');
+  if (session.is_weekend)  html+=row('Weekend', '<span style="color:var(--red);font-weight:600">🚫 Trading halted</span>');
+  html+='</tbody></table></div>';
+
+  html+='</div>';
   $('pipelinePanel').innerHTML=html;
 }
 
