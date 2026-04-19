@@ -176,23 +176,61 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .ex-table .pnl-neg{color:var(--red);font-weight:600}
 .ex-table .close-btn{background:var(--bg4);border:1px solid var(--border);color:var(--text3);padding:2px 8px;border-radius:3px;cursor:pointer;font:500 9px 'Inter'}
 .ex-table .close-btn:hover{background:var(--redBg);color:var(--red);border-color:var(--red)}
-/* Pipeline tri-table (matches ex-table styling, no 700px min-width) */
-.pp-grid{display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:14px}
-@media (max-width:1100px){.pp-grid{grid-template-columns:1fr}}
-.pp-section-title{font:700 13px 'Inter',sans-serif;color:var(--text1);margin-bottom:10px}
-.pp-table{width:100%;border-collapse:collapse;font:11px 'JetBrains Mono',monospace}
-.pp-table th{background:var(--bg2);padding:6px 8px;text-align:left;font:500 9px 'Inter',sans-serif;color:var(--text3);text-transform:uppercase;letter-spacing:.3px;border-bottom:1px solid var(--border);white-space:nowrap}
-.pp-table th.r,.pp-table td.r{text-align:right}
-.pp-table td{padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:top}
-.pp-table tr:hover{background:var(--bg3)}
-.pp-chip{display:inline-block;padding:2px 6px;border-radius:10px;font:700 9px 'JetBrains Mono';letter-spacing:.04em;color:#000}
-.pp-desc{font:400 10px 'Inter',sans-serif;color:var(--text3);margin-top:2px;white-space:normal}
-.pp-detail{font:10px 'JetBrains Mono';color:var(--text2);margin-top:2px;white-space:normal}
-.pp-bar{height:6px;background:var(--bg0);border-radius:3px;min-width:60px}
-.pp-bar>span{display:block;height:100%;background:var(--blue);border-radius:3px}
-.pp-total{text-align:center;margin-bottom:8px}
-.pp-total .n{font:700 36px 'JetBrains Mono'}.pp-total .d{font:11px 'Inter',sans-serif;color:var(--text3)}
-.pp-note{text-align:center;font:600 10px 'Inter',sans-serif;margin:-4px 0 10px 0}
+/* Pipeline card layout */
+.pp-wrap{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:14px}
+@media (max-width:1100px){.pp-wrap{grid-template-columns:1fr}}
+.pp-section{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:14px}
+.pp-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.pp-head-title{font:700 12px 'Inter',sans-serif;color:var(--text1);text-transform:uppercase;letter-spacing:.08em;display:flex;align-items:center;gap:6px}
+.pp-head-right{font:600 11px 'JetBrains Mono';color:var(--text2)}
+.pp-head-right .big{font:700 12px 'JetBrains Mono';color:var(--text1);margin-left:4px}
+.pp-summary{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.pp-pill{padding:3px 9px;border-radius:12px;font:700 10px 'Inter',sans-serif;letter-spacing:.06em;border:1px solid var(--border)}
+.pp-pill .n{margin-left:4px;font-family:'JetBrains Mono',monospace}
+.pp-pill.pass{color:var(--green);border-color:var(--green)}
+.pp-pill.soft{color:var(--orange);border-color:var(--orange);background:rgba(255,165,0,0.08)}
+.pp-pill.fail{color:var(--red);border-color:var(--red)}
+.pp-pill.skip{color:var(--text3)}
+.pp-summary-bar{flex:1;height:4px;background:var(--bg0);border-radius:2px;margin-left:auto;max-width:240px}
+.pp-summary-bar>span{display:block;height:100%;background:var(--green);border-radius:2px}
+.pp-grid{display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:10px}
+@media (max-width:900px){.pp-grid{grid-template-columns:repeat(2, minmax(0, 1fr))}}
+@media (max-width:600px){.pp-grid{grid-template-columns:1fr}}
+.pp-card{position:relative;background:var(--bg0);border:1px solid var(--border);border-radius:6px;padding:10px 12px;transition:border-color .15s}
+.pp-card.pass{border-color:var(--green)}
+.pp-card.soft{border-color:var(--orange)}
+.pp-card.fail{border-color:var(--red)}
+.pp-card-top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px}
+.pp-card-id{display:flex;align-items:center;gap:6px;min-width:0;flex:1}
+.pp-card-icon{width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;font:700 11px sans-serif;flex-shrink:0}
+.pp-card-icon.pass{background:rgba(0,200,120,0.15);color:var(--green)}
+.pp-card-icon.soft{background:rgba(255,165,0,0.18);color:var(--orange)}
+.pp-card-icon.fail{background:rgba(255,80,80,0.15);color:var(--red)}
+.pp-card-icon.skip{background:var(--bg3);color:var(--text3)}
+.pp-card-lbl{font:600 10px 'JetBrains Mono';color:var(--text3);letter-spacing:.04em}
+.pp-card-st{font:700 10px 'JetBrains Mono';letter-spacing:.04em}
+.pp-card-st.pass{color:var(--green)}.pp-card-st.soft{color:var(--orange)}.pp-card-st.fail{color:var(--red)}.pp-card-st.skip{color:var(--text3)}
+.pp-card-delta{font:600 10px 'JetBrains Mono';color:var(--text3);white-space:nowrap}
+.pp-card-delta.pos{color:var(--green)}.pp-card-delta.neg{color:var(--red)}
+.pp-card-name{font:700 13px 'Inter',sans-serif;color:var(--text1);margin-bottom:3px}
+.pp-card-desc{font:11px 'Inter',sans-serif;color:var(--text3);margin-bottom:8px;line-height:1.35;min-height:1.6em}
+.pp-card-stats{display:flex;justify-content:space-between;align-items:baseline;font:11px 'Inter';color:var(--text3);margin-bottom:6px}
+.pp-card-stats .v{font:700 14px 'JetBrains Mono';color:var(--text1);margin-right:4px}
+.pp-card-bar{height:4px;background:var(--bg2);border-radius:2px;overflow:hidden}
+.pp-card-bar>span{display:block;height:100%;border-radius:2px}
+.pp-card-bar.pass>span{background:var(--green)}
+.pp-card-bar.soft>span{background:var(--orange)}
+.pp-card-bar.fail>span{background:var(--red)}
+.pp-card-bar.skip>span{background:var(--text3)}
+/* Quality score side panel */
+.pp-qs-banner{background:rgba(255,165,0,0.12);border:1px solid var(--orange);color:var(--orange);padding:10px;border-radius:6px;text-align:center;font:700 12px 'Inter',sans-serif;letter-spacing:.16em;margin-bottom:12px}
+.pp-qs-banner.pass{background:rgba(0,200,120,0.10);border-color:var(--green);color:var(--green)}
+.pp-qs-banner.fail{background:rgba(255,80,80,0.10);border-color:var(--red);color:var(--red)}
+.pp-qs-row{display:grid;grid-template-columns:80px 1fr auto;gap:8px;align-items:center;margin-bottom:6px}
+.pp-qs-lbl{font:500 11px 'Inter';color:var(--text3)}
+.pp-qs-bar{height:6px;background:var(--bg0);border-radius:3px}
+.pp-qs-bar>span{display:block;height:100%;background:var(--green);border-radius:3px}
+.pp-qs-val{font:600 11px 'JetBrains Mono';color:var(--text2);min-width:28px;text-align:right}
 .empty-row{padding:20px;text-align:center;color:var(--text3);font:11px 'Inter'}
 /* Portfolio stats in sidebar */
 .port-stats{padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px}
@@ -1779,90 +1817,157 @@ async function loadPipeline() {
     renderPipeline(layers, quality, session);
   } catch(e) { $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
 }
+// Previous score map, keyed by layer id — used to compute delta between polls
+window.__pp_prev = window.__pp_prev || {};
+function _ppKind(st) {
+  const s = String(st||'').toUpperCase();
+  if (s==='PASS') return 'pass';
+  if (s==='WEAK' || s==='SOFT' || s==='WARN') return 'soft';
+  if (s==='FAIL' || s==='BLOCKED') return 'fail';
+  return 'skip'; // PENDING / UNKNOWN / SKIP
+}
+function _ppIcon(kind) {
+  return kind==='pass'?'✓':kind==='soft'?'⚠':kind==='fail'?'✕':'·';
+}
+function _ppFmtNum(v, digits) {
+  if (v === null || v === undefined || isNaN(v)) return '—';
+  const n = Number(v);
+  if (Math.abs(n) >= 100 || Number.isInteger(n)) return String(Math.round(n));
+  return n.toFixed(digits==null?2:digits);
+}
 function renderPipeline(layers, quality, session) {
-  const statusColor = st => {
-    const s = String(st||'').toLowerCase();
-    if (s==='pass') return 'var(--green)';
-    if (s==='fail' || s==='blocked') return 'var(--red)';
-    if (s==='weak' || s==='skip') return 'var(--yellow)';
-    if (s==='pending') return 'var(--cyan)';
-    return 'var(--text3)';
-  };
+  const list = layers.layers || [];
+  const counts = layers.counts || {pass:0,soft:0,fail:0,skip:0};
+  const paperMode = layers.paper_mode !== false;
+  const total = list.length || 9;
+  const passPct = total ? Math.round(100 * (counts.pass || 0) / total) : 0;
 
-  let html='<div class="pp-grid">';
-
-  // ── Table 1: 9-Layer Pipeline ──
-  html+='<div><div class="pp-section-title">9-Layer Confirmation Pipeline</div>';
-  html+='<table class="pp-table"><thead><tr>';
-  html+='<th style="width:32px">#</th><th>Layer</th><th style="width:64px">Status</th>';
-  html+='</tr></thead><tbody>';
-  (layers.layers||[]).forEach(l => {
-    const stRaw = String(l.status||'UNKNOWN').toUpperCase();
-    const color = statusColor(stRaw);
-    const detail = String(l.detail || '');
-    html+='<tr>';
-    html+='<td style="font-weight:700;color:'+color+'">'+l.id+'</td>';
-    html+='<td><div style="font-weight:600;color:var(--text1)">'+esc(l.name)+'</div>';
-    if (l.description) html+='<div class="pp-desc">'+esc(l.description)+'</div>';
-    if (detail)        html+='<div class="pp-detail">'+esc(detail)+'</div>';
-    html+='</td>';
-    html+='<td><span class="pp-chip" style="background:'+color+'">'+esc(stRaw)+'</span></td>';
-    html+='</tr>';
+  // ── Compute deltas from previous snapshot ──
+  const nextPrev = {};
+  list.forEach(l => {
+    const sc = Number(l.score);
+    if (isFinite(sc)) nextPrev[l.id] = sc;
   });
-  html+='</tbody></table></div>';
 
-  // ── Table 2: Quality Components ──
-  const total = Number(quality.total||0);
+  let html = '<div class="pp-wrap">';
+
+  // ═════ Left: 9-LAYER PIPELINE panel ═════
+  html += '<div class="pp-section">';
+  // Header
+  html += '<div class="pp-head">';
+  html += '<div class="pp-head-title">❖ 9-Layer Pipeline</div>';
+  html += '<div class="pp-head-right">' + (counts.pass||0) + '/' + total + ' PASS<span class="big">' + passPct + '%</span></div>';
+  html += '</div>';
+  // Summary chips + global bar
+  html += '<div class="pp-summary">';
+  html += '<span class="pp-pill pass">PASS<span class="n">' + (counts.pass||0) + '</span></span>';
+  html += '<span class="pp-pill soft">SOFT<span class="n">' + (counts.soft||0) + '</span></span>';
+  html += '<span class="pp-pill fail">FAIL<span class="n">' + (counts.fail||0) + '</span></span>';
+  html += '<span class="pp-pill skip">SKIP<span class="n">' + (counts.skip||0) + '</span></span>';
+  html += '<div class="pp-summary-bar"><span style="width:' + passPct + '%"></span></div>';
+  html += '</div>';
+  // Card grid
+  html += '<div class="pp-grid">';
+  list.forEach(l => {
+    const stRaw = String(l.status || 'SKIP').toUpperCase();
+    const kind = _ppKind(stRaw);
+    const idx = l.layer_index || ('L' + ((l.id||1) - 1));
+    const score = (l.score !== null && l.score !== undefined) ? Number(l.score) : null;
+    const thr   = (l.threshold !== null && l.threshold !== undefined) ? Number(l.threshold) : null;
+    // Delta vs previous snapshot
+    const prev = window.__pp_prev[l.id];
+    let deltaCls = '', deltaTxt = '— +0';
+    if (score !== null && isFinite(prev)) {
+      const d = score - prev;
+      if (d > 0.0001) { deltaCls = 'pos'; deltaTxt = '↗ +' + _ppFmtNum(d, 2); }
+      else if (d < -0.0001) { deltaCls = 'neg'; deltaTxt = '↘ ' + _ppFmtNum(d, 2); }
+      else { deltaTxt = '— +0.00'; }
+    } else if (score !== null) {
+      deltaTxt = '— ' + (_ppFmtNum(score, 2));
+    }
+    // Bar width: score / (thr * 2) so threshold line sits at 50%, cap 100%
+    let barPct = 0;
+    if (score !== null && isFinite(thr) && thr > 0) {
+      barPct = Math.min(100, Math.max(0, (score / (thr * 2)) * 100));
+    } else if (score !== null) {
+      barPct = Math.min(100, Math.max(0, score));
+    }
+
+    html += '<div class="pp-card ' + kind + '">';
+    html += '<div class="pp-card-top">';
+    html += '<div class="pp-card-id">';
+    html += '<span class="pp-card-icon ' + kind + '">' + _ppIcon(kind) + '</span>';
+    html += '<span class="pp-card-lbl">' + esc(idx) + '</span>';
+    html += '<span class="pp-card-st ' + kind + '">' + esc(stRaw) + '</span>';
+    html += '</div>';
+    html += '<div class="pp-card-delta ' + deltaCls + '">' + esc(deltaTxt) + '</div>';
+    html += '</div>';
+    html += '<div class="pp-card-name">' + esc(l.name || '') + '</div>';
+    html += '<div class="pp-card-desc">' + esc(l.description || l.detail || '') + '</div>';
+    html += '<div class="pp-card-stats">';
+    html += '<span><span class="v">' + (score===null?'—':_ppFmtNum(score,2)) + '</span>score</span>';
+    html += '<span>thr <span class="v" style="color:var(--text2);font-size:11px">' + (thr===null?'—':_ppFmtNum(thr,2)) + '</span></span>';
+    html += '</div>';
+    html += '<div class="pp-card-bar ' + kind + '"><span style="width:' + barPct + '%"></span></div>';
+    html += '</div>';
+  });
+  html += '</div></div>';
+
+  // ═════ Right: QUALITY SCORE panel ═════
+  const qTotal = Number(quality.total || 0);
   const partial = !!quality.partial;
   const preview = !!quality.preview;
-  const qColor = total>=90?'var(--green)':total>=65?'var(--yellow)':(total>0?'var(--orange)':'var(--red)');
+  const qThreshold = 65; // default paper threshold
+  const passGate = qTotal >= qThreshold;
+  const qColor = qTotal >= 90 ? 'var(--green)' : qTotal >= qThreshold ? 'var(--yellow)' : (qTotal > 0 ? 'var(--orange)' : 'var(--red)');
   if ($('tvQualityChip')) {
-    $('tvQualityChip').textContent = 'QUALITY ' + total + '/100' + (partial ? ' PARTIAL' : preview ? ' PREVIEW' : '');
+    $('tvQualityChip').textContent = 'QUALITY ' + qTotal + '/100' + (partial ? ' PARTIAL' : preview ? ' PREVIEW' : '');
     $('tvQualityChip').style.color = qColor;
     $('tvQualityChip').style.borderColor = qColor;
   }
-  html+='<div><div class="pp-section-title">Quality Components</div>';
-  html+='<div class="pp-total"><span class="n" style="color:'+qColor+'">'+total+'</span><span class="d"> / 100</span></div>';
-  if (preview)      html+='<div class="pp-note" style="color:var(--cyan)">Live preview from the latest market snapshot</div>';
-  else if (partial) html+='<div class="pp-note" style="color:var(--yellow)">Partial score from current evaluated layers</div>';
-  html+='<table class="pp-table"><thead><tr>';
-  html+='<th>Component</th><th class="r" style="width:48px">Score</th><th style="width:40%">Bar</th>';
-  html+='</tr></thead><tbody>';
-  const comps = quality.components||{};
-  for(const[k,v] of Object.entries(comps)) {
+  html += '<div class="pp-section">';
+  html += '<div class="pp-head">';
+  html += '<div class="pp-head-title">★ Quality Score</div>';
+  html += '<div class="pp-head-right" style="color:' + qColor + ';font:700 14px \'JetBrains Mono\'">' + qTotal + '/100</div>';
+  html += '</div>';
+  // PAPER PASS/FAIL banner
+  const modeLbl = paperMode ? 'PAPER' : 'LIVE';
+  const bannerCls = passGate ? 'pass' : (qTotal > 0 ? '' : 'fail');
+  html += '<div class="pp-qs-banner ' + bannerCls + '">' + modeLbl + '&nbsp;&nbsp;' + (passGate ? 'PASS' : (qTotal>0 ? 'PENDING' : 'FAIL')) + '</div>';
+  if (preview)      html += '<div style="font:600 10px \'Inter\';color:var(--cyan);text-align:center;margin:-6px 0 10px">Live preview from the latest market snapshot</div>';
+  else if (partial) html += '<div style="font:600 10px \'Inter\';color:var(--yellow);text-align:center;margin:-6px 0 10px">Partial score from current evaluated layers</div>';
+  // Component rows
+  const comps = quality.components || {};
+  const componentLabels = {
+    htf_trend: 'HTF Trend', technical_confluence: 'Technical', smc_confluence: 'SMC/ICT',
+    volume_flow: 'Volume', regime: 'Regime', ml_confidence: 'ML Model', liquidity_depth: 'Liquidity'
+  };
+  for (const [k, v] of Object.entries(comps)) {
     const num = Number(v) || 0;
     const pct = Math.min(100, Math.max(0, num));
-    html+='<tr>';
-    html+='<td style="color:var(--text2)">'+esc(k.replace(/_/g,' '))+'</td>';
-    html+='<td class="r" style="color:var(--text1)">'+Math.round(num)+'</td>';
-    html+='<td><div class="pp-bar"><span style="width:'+pct+'%"></span></div></td>';
-    html+='</tr>';
+    const lbl = componentLabels[k] || k.replace(/_/g, ' ');
+    html += '<div class="pp-qs-row">';
+    html += '<div class="pp-qs-lbl">' + esc(lbl) + '</div>';
+    html += '<div class="pp-qs-bar"><span style="width:' + pct + '%"></span></div>';
+    html += '<div class="pp-qs-val">' + Math.round(num) + '</div>';
+    html += '</div>';
   }
-  html+='</tbody></table></div>';
-
-  // ── Table 3: Session Rules ──
-  html+='<div><div class="pp-section-title">Session Rules</div>';
-  html+='<table class="pp-table"><thead><tr>';
-  html+='<th style="width:38%">Field</th><th>Value</th>';
-  html+='</tr></thead><tbody>';
-  const row = (label, value) =>
-    '<tr><td style="color:var(--text3);font-weight:600">'+esc(label)+'</td>'+
-    '<td style="color:var(--text1)">'+value+'</td></tr>';
+  // Session sub-section (compact)
   const s = session.active_session;
   if (s) {
-    html+=row('Session', '<span style="color:var(--blue);font-weight:700">'+esc(String(s.name||'').toUpperCase())+'</span>');
-    html+=row('UTC Window', esc('UTC '+s.start+':00 — '+s.end+':00'));
-    html+=row('Size Mult', esc(String(s.size_mult)+'x'));
-    html+=row('Allowed Types', esc(s.types && s.types.length ? s.types.join(', ') : 'NONE (no-trade)'));
-  } else {
-    html+=row('Session', '<span style="color:var(--text3)">No active session</span>');
+    html += '<div style="margin-top:14px;padding-top:10px;border-top:1px solid var(--border)">';
+    html += '<div class="pp-head-title" style="margin-bottom:6px">⏱ Session</div>';
+    html += '<div style="font:600 11px \'JetBrains Mono\';color:var(--blue)">' + esc(String(s.name||'').toUpperCase()) + '</div>';
+    html += '<div style="font:10px \'Inter\';color:var(--text3);margin-top:2px">UTC ' + s.start + ':00 — ' + s.end + ':00 · Size ' + s.size_mult + 'x</div>';
+    if (session.in_killzone) html += '<div style="font:600 10px \'Inter\';color:var(--yellow);margin-top:4px">⚡ ICT KILLZONE ACTIVE</div>';
+    if (session.is_weekend)  html += '<div style="font:600 10px \'Inter\';color:var(--red);margin-top:4px">🚫 WEEKEND — Trading halted</div>';
+    html += '</div>';
   }
-  if (session.in_killzone) html+=row('ICT Killzone', '<span style="color:var(--yellow);font-weight:600">⚡ ACTIVE — 1.2x boost (C & D types)</span>');
-  if (session.is_weekend)  html+=row('Weekend',      '<span style="color:var(--red);font-weight:600">🚫 Trading halted</span>');
-  html+='</tbody></table></div>';
+  html += '</div>';
 
-  html+='</div>';
-  $('pipelinePanel').innerHTML=html;
+  html += '</div>';
+  $('pipelinePanel').innerHTML = html;
+  window.__pp_prev = nextPrev;
 }
 
 /* ── Market Heatmap — colored 24h %change grid ── */

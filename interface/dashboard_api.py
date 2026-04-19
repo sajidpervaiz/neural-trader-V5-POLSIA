@@ -2396,16 +2396,28 @@ def build_app(
     async def api_layers() -> dict[str, Any]:
         """Return current state of the 9-layer confirmation pipeline."""
         layers = [
-            {"id": 1, "name": "Session Filter", "description": "Trading session & killzone enforcement"},
-            {"id": 2, "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
-            {"id": 3, "name": "Technical Confluence", "description": "RSI, MACD, BB, EMA alignment"},
-            {"id": 4, "name": "Smart Money Concepts", "description": "BOS/CHoCH + OB/FVG zones"},
-            {"id": 5, "name": "Volume Flow", "description": "Delta, CVD, VWAP deviation"},
-            {"id": 6, "name": "Regime Detection", "description": "Market regime (trending/ranging/breakout)"},
-            {"id": 7, "name": "ML Ensemble", "description": "Model prediction confidence"},
-            {"id": 8, "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
-            {"id": 9, "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
+            {"id": 1, "layer_index": "L0", "name": "Session Filter", "description": "Trading session & killzone enforcement"},
+            {"id": 2, "layer_index": "L1", "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
+            {"id": 3, "layer_index": "L2", "name": "Technical Confluence", "description": "RSI, MACD, BB, EMA alignment"},
+            {"id": 4, "layer_index": "L3", "name": "Smart Money Concepts", "description": "BOS/CHoCH + OB/FVG zones"},
+            {"id": 5, "layer_index": "L4", "name": "Volume Flow", "description": "Delta, CVD, VWAP deviation"},
+            {"id": 6, "layer_index": "L5", "name": "Regime Detection", "description": "Market regime (trending/ranging/breakout)"},
+            {"id": 7, "layer_index": "L6", "name": "ML Ensemble", "description": "Model prediction confidence"},
+            {"id": 8, "layer_index": "L7", "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
+            {"id": 9, "layer_index": "L8", "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
         ]
+        default_thresholds = {
+            "session_filter": 1.0,
+            "htf_trend": 3.0,
+            "technical_confluence": 30.0,
+            "smart_money_concepts": 0.0,
+            "volume_flow": 20.0,
+            "regime_detection": 1.0,
+            "ml_ensemble": 0.5,
+            "signal_quality": 65.0,
+            "risk_gate": 1.0,
+        }
+
         def _score_to_status(score: float | int | None) -> str:
             try:
                 numeric = float(score if score is not None else 0)
@@ -2416,6 +2428,27 @@ def build_app(
             if numeric >= 40:
                 return "WEAK"
             return "FAIL"
+
+        def _parse_score_threshold(detail: str) -> tuple[float | None, float | None]:
+            """Extract numeric score and threshold from detail strings like
+            'score=42<30', 'score=0.82', 'score=BLOCKED'."""
+            import re as _re
+            if not detail:
+                return None, None
+            m = _re.search(r"score\s*=\s*(-?[\d.]+)\s*(?:[<>]=?)?\s*(-?[\d.]+)?", detail)
+            if not m:
+                return None, None
+            try:
+                score = float(m.group(1))
+            except (TypeError, ValueError):
+                score = None
+            thr: float | None = None
+            if m.group(2) is not None:
+                try:
+                    thr = float(m.group(2))
+                except (TypeError, ValueError):
+                    thr = None
+            return score, thr
 
         # Populate layer status from signal_generator if available
         if signal_generator is not None:
@@ -2454,9 +2487,50 @@ def build_app(
                 if raw_status == "UNKNOWN" and "score=0" in detail:
                     raw_status = "FAIL"
 
+                score, thr = _parse_score_threshold(detail)
+                if score is None:
+                    fs = fallback_scores.get(key)
+                    if fs is not None:
+                        try:
+                            score = float(fs)
+                        except (TypeError, ValueError):
+                            score = None
+                if thr is None:
+                    thr = default_thresholds.get(key)
+
                 layer["status"] = raw_status
                 layer["detail"] = detail or "awaiting evaluation"
-        return {"layers": layers, "total": 9}
+                layer["score"] = score
+                layer["threshold"] = thr
+        else:
+            for layer in layers:
+                key = layer["name"].lower().replace(" ", "_")
+                layer["status"] = "UNKNOWN"
+                layer["detail"] = "signal generator unavailable"
+                layer["score"] = None
+                layer["threshold"] = default_thresholds.get(key)
+
+        # Summary counts (PASS / SOFT / FAIL / SKIP)
+        counts = {"pass": 0, "soft": 0, "fail": 0, "skip": 0, "other": 0}
+        for lay in layers:
+            st = str(lay.get("status", "")).upper()
+            if st == "PASS":
+                counts["pass"] += 1
+            elif st in ("WEAK", "SOFT", "WARN"):
+                counts["soft"] += 1
+            elif st in ("FAIL", "BLOCKED"):
+                counts["fail"] += 1
+            elif st in ("SKIP", "PENDING", "UNKNOWN", ""):
+                counts["skip"] += 1
+            else:
+                counts["other"] += 1
+
+        return {
+            "layers": layers,
+            "total": 9,
+            "counts": counts,
+            "paper_mode": bool(getattr(signal_generator, "_is_paper_mode", lambda: True)()) if signal_generator is not None else True,
+        }
 
     # ── §5 Spec: Session & killzone status ────────────────────────────────
     @app.get("/api/session")
