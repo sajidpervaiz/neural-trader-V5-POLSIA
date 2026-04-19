@@ -176,6 +176,23 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .ex-table .pnl-neg{color:var(--red);font-weight:600}
 .ex-table .close-btn{background:var(--bg4);border:1px solid var(--border);color:var(--text3);padding:2px 8px;border-radius:3px;cursor:pointer;font:500 9px 'Inter'}
 .ex-table .close-btn:hover{background:var(--redBg);color:var(--red);border-color:var(--red)}
+/* Pipeline tri-table (matches ex-table styling, no 700px min-width) */
+.pp-grid{display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:14px}
+@media (max-width:1100px){.pp-grid{grid-template-columns:1fr}}
+.pp-section-title{font:700 13px 'Inter',sans-serif;color:var(--text1);margin-bottom:10px}
+.pp-table{width:100%;border-collapse:collapse;font:11px 'JetBrains Mono',monospace}
+.pp-table th{background:var(--bg2);padding:6px 8px;text-align:left;font:500 9px 'Inter',sans-serif;color:var(--text3);text-transform:uppercase;letter-spacing:.3px;border-bottom:1px solid var(--border);white-space:nowrap}
+.pp-table th.r,.pp-table td.r{text-align:right}
+.pp-table td{padding:6px 8px;border-bottom:1px solid var(--border);color:var(--text);vertical-align:top}
+.pp-table tr:hover{background:var(--bg3)}
+.pp-chip{display:inline-block;padding:2px 6px;border-radius:10px;font:700 9px 'JetBrains Mono';letter-spacing:.04em;color:#000}
+.pp-desc{font:400 10px 'Inter',sans-serif;color:var(--text3);margin-top:2px;white-space:normal}
+.pp-detail{font:10px 'JetBrains Mono';color:var(--text2);margin-top:2px;white-space:normal}
+.pp-bar{height:6px;background:var(--bg0);border-radius:3px;min-width:60px}
+.pp-bar>span{display:block;height:100%;background:var(--blue);border-radius:3px}
+.pp-total{text-align:center;margin-bottom:8px}
+.pp-total .n{font:700 36px 'JetBrains Mono'}.pp-total .d{font:11px 'Inter',sans-serif;color:var(--text3)}
+.pp-note{text-align:center;font:600 10px 'Inter',sans-serif;margin:-4px 0 10px 0}
 .empty-row{padding:20px;text-align:center;color:var(--text3);font:11px 'Inter'}
 /* Portfolio stats in sidebar */
 .port-stats{padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px}
@@ -1771,31 +1788,25 @@ function renderPipeline(layers, quality, session) {
     if (s==='pending') return 'var(--cyan)';
     return 'var(--text3)';
   };
-  const thStyle = 'text-align:left;padding:6px 8px;font:600 10px sans-serif;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);background:var(--bg0)';
-  const tdStyle = 'padding:6px 8px;border-bottom:1px solid var(--border);vertical-align:top';
-  const sectionTitle = 'font:700 13px sans-serif;color:var(--text1);margin-bottom:10px';
 
-  let html='<div style="display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:14px" id="pipelineTriGrid">';
+  let html='<div class="pp-grid">';
 
   // ── Table 1: 9-Layer Pipeline ──
-  html+='<div><div style="'+sectionTitle+'">9-Layer Confirmation Pipeline</div>';
-  html+='<table style="width:100%;border-collapse:collapse;font-size:11px">';
-  html+='<thead><tr>';
-  html+='<th style="'+thStyle+';width:28px">#</th>';
-  html+='<th style="'+thStyle+'">Layer</th>';
-  html+='<th style="'+thStyle+';width:56px">Status</th>';
+  html+='<div><div class="pp-section-title">9-Layer Confirmation Pipeline</div>';
+  html+='<table class="pp-table"><thead><tr>';
+  html+='<th style="width:32px">#</th><th>Layer</th><th style="width:64px">Status</th>';
   html+='</tr></thead><tbody>';
   (layers.layers||[]).forEach(l => {
     const stRaw = String(l.status||'UNKNOWN').toUpperCase();
     const color = statusColor(stRaw);
     const detail = String(l.detail || '');
     html+='<tr>';
-    html+='<td style="'+tdStyle+';font:700 11px \'JetBrains Mono\';color:'+color+'">'+l.id+'</td>';
-    html+='<td style="'+tdStyle+'"><div style="font:600 11px sans-serif;color:var(--text1)">'+esc(l.name)+'</div>';
-    html+='<div style="font:10px sans-serif;color:var(--text3);margin-top:2px">'+esc(l.description||'')+'</div>';
-    if (detail) html+='<div style="font:10px \'JetBrains Mono\';color:var(--text2);margin-top:2px">'+esc(detail)+'</div>';
+    html+='<td style="font-weight:700;color:'+color+'">'+l.id+'</td>';
+    html+='<td><div style="font-weight:600;color:var(--text1)">'+esc(l.name)+'</div>';
+    if (l.description) html+='<div class="pp-desc">'+esc(l.description)+'</div>';
+    if (detail)        html+='<div class="pp-detail">'+esc(detail)+'</div>';
     html+='</td>';
-    html+='<td style="'+tdStyle+'"><span style="display:inline-block;padding:2px 6px;border-radius:10px;background:'+color+';color:#000;font:700 9px \'JetBrains Mono\';letter-spacing:.04em">'+esc(stRaw)+'</span></td>';
+    html+='<td><span class="pp-chip" style="background:'+color+'">'+esc(stRaw)+'</span></td>';
     html+='</tr>';
   });
   html+='</tbody></table></div>';
@@ -1810,44 +1821,36 @@ function renderPipeline(layers, quality, session) {
     $('tvQualityChip').style.color = qColor;
     $('tvQualityChip').style.borderColor = qColor;
   }
-  html+='<div><div style="'+sectionTitle+'">Quality Components</div>';
-  html+='<div style="text-align:center;margin-bottom:8px">';
-  html+='<span style="font:700 36px \'JetBrains Mono\';color:'+qColor+'">'+total+'</span>';
-  html+='<span style="font:11px sans-serif;color:var(--text3)"> / 100</span>';
-  html+='</div>';
-  if (preview) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--cyan);margin:-4px 0 10px 0">Live preview from the latest market snapshot</div>';
-  else if (partial) html+='<div style="text-align:center;font:600 10px sans-serif;color:var(--yellow);margin:-4px 0 10px 0">Partial score from current evaluated layers</div>';
-  html+='<table style="width:100%;border-collapse:collapse;font-size:11px">';
-  html+='<thead><tr>';
-  html+='<th style="'+thStyle+'">Component</th>';
-  html+='<th style="'+thStyle+';width:44px;text-align:right">Score</th>';
-  html+='<th style="'+thStyle+';width:40%">Bar</th>';
+  html+='<div><div class="pp-section-title">Quality Components</div>';
+  html+='<div class="pp-total"><span class="n" style="color:'+qColor+'">'+total+'</span><span class="d"> / 100</span></div>';
+  if (preview)      html+='<div class="pp-note" style="color:var(--cyan)">Live preview from the latest market snapshot</div>';
+  else if (partial) html+='<div class="pp-note" style="color:var(--yellow)">Partial score from current evaluated layers</div>';
+  html+='<table class="pp-table"><thead><tr>';
+  html+='<th>Component</th><th class="r" style="width:48px">Score</th><th style="width:40%">Bar</th>';
   html+='</tr></thead><tbody>';
   const comps = quality.components||{};
   for(const[k,v] of Object.entries(comps)) {
     const num = Number(v) || 0;
     const pct = Math.min(100, Math.max(0, num));
     html+='<tr>';
-    html+='<td style="'+tdStyle+';font:11px sans-serif;color:var(--text2)">'+esc(k.replace(/_/g,' '))+'</td>';
-    html+='<td style="'+tdStyle+';font:11px \'JetBrains Mono\';color:var(--text1);text-align:right">'+Math.round(num)+'</td>';
-    html+='<td style="'+tdStyle+'"><div style="height:6px;background:var(--bg0);border-radius:3px"><div style="width:'+pct+'%;height:100%;background:var(--blue);border-radius:3px"></div></div></td>';
+    html+='<td style="color:var(--text2)">'+esc(k.replace(/_/g,' '))+'</td>';
+    html+='<td class="r" style="color:var(--text1)">'+Math.round(num)+'</td>';
+    html+='<td><div class="pp-bar"><span style="width:'+pct+'%"></span></div></td>';
     html+='</tr>';
   }
   html+='</tbody></table></div>';
 
   // ── Table 3: Session Rules ──
-  html+='<div><div style="'+sectionTitle+'">Session Rules</div>';
-  html+='<table style="width:100%;border-collapse:collapse;font-size:11px">';
-  html+='<thead><tr>';
-  html+='<th style="'+thStyle+';width:38%">Field</th>';
-  html+='<th style="'+thStyle+'">Value</th>';
+  html+='<div><div class="pp-section-title">Session Rules</div>';
+  html+='<table class="pp-table"><thead><tr>';
+  html+='<th style="width:38%">Field</th><th>Value</th>';
   html+='</tr></thead><tbody>';
+  const row = (label, value) =>
+    '<tr><td style="color:var(--text3);font-weight:600">'+esc(label)+'</td>'+
+    '<td style="color:var(--text1)">'+value+'</td></tr>';
   const s = session.active_session;
-  const row = (label, value, valueStyle) =>
-    '<tr><td style="'+tdStyle+';font:600 11px sans-serif;color:var(--text3)">'+esc(label)+'</td>'+
-    '<td style="'+tdStyle+';font:11px sans-serif;color:var(--text1)'+(valueStyle?';'+valueStyle:'')+'">'+value+'</td></tr>';
   if (s) {
-    html+=row('Session', '<span style="font:700 11px sans-serif;color:var(--blue)">'+esc(String(s.name||'').toUpperCase())+'</span>');
+    html+=row('Session', '<span style="color:var(--blue);font-weight:700">'+esc(String(s.name||'').toUpperCase())+'</span>');
     html+=row('UTC Window', esc('UTC '+s.start+':00 — '+s.end+':00'));
     html+=row('Size Mult', esc(String(s.size_mult)+'x'));
     html+=row('Allowed Types', esc(s.types && s.types.length ? s.types.join(', ') : 'NONE (no-trade)'));
@@ -1855,7 +1858,7 @@ function renderPipeline(layers, quality, session) {
     html+=row('Session', '<span style="color:var(--text3)">No active session</span>');
   }
   if (session.in_killzone) html+=row('ICT Killzone', '<span style="color:var(--yellow);font-weight:600">⚡ ACTIVE — 1.2x boost (C & D types)</span>');
-  if (session.is_weekend)  html+=row('Weekend', '<span style="color:var(--red);font-weight:600">🚫 Trading halted</span>');
+  if (session.is_weekend)  html+=row('Weekend',      '<span style="color:var(--red);font-weight:600">🚫 Trading halted</span>');
   html+='</tbody></table></div>';
 
   html+='</div>';
