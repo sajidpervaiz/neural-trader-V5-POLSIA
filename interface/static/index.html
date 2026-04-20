@@ -261,7 +261,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
 /* ── ARMS-v2 3×3 panel grid ── */
 .arms2-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
-@media(max-width:1100px){.arms2-wrap{grid-template-columns:1fr}}
+@media(max-width:1400px){.arms2-wrap{gap:10px}}
+@media(max-width:1200px){.arms2-wrap{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}}
+@media(max-width:760px){.arms2-wrap{grid-template-columns:1fr;gap:8px}}
+@media(max-width:760px){.arms2-head{padding:8px 10px}.arms2-body{padding:8px 10px;gap:6px}.arms2-row{font-size:10.5px}.arms2-title{font-size:9.5px}}
 .arms2-panel{background:var(--bg1);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;min-height:0}
 .arms2-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.01)}
 .arms2-title{display:flex;align-items:center;gap:6px;font:600 10px 'Inter',sans-serif;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
@@ -2843,7 +2846,30 @@ async function saveSettings(){
     }else{toast('error',d.error||'Save failed');return;}
     // Save trading mode
     const mode=$('cfgTradingMode').value;
-    if(mode==='live'&&!confirm('Switch to LIVE trading? This uses REAL MONEY. Are you sure?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
+    if(mode==='live'){
+      // Preflight: validate keys against exchange before flipping to live
+      const venues=[['binance','cfgBinKey','cfgBinSec','cfgBinOn'],['bybit','cfgBybitKey','cfgBybitSec','cfgBybitOn'],['okx','cfgOkxKey','cfgOkxSec','cfgOkxOn'],['kraken','cfgKrakenKey','cfgKrakenSec','cfgKrakenOn']];
+      let passed=null;
+      for(const[v,kId,sId,onId] of venues){
+        if(!$(onId).checked) continue;
+        const k=$(kId).value.trim(), s=$(sId).value.trim();
+        if(!k||k==='****'||!s||s==='****') continue;
+        toast('info','Validating '+v.toUpperCase()+' keys…');
+        try{
+          const pf=await(await fetch('/api/config/test-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venue:v,api_key:k,api_secret:s})})).json();
+          if(pf.success){
+            passed={venue:v,balances:pf.balances||[],count:pf.balance_count||0};
+            toast('success',v.toUpperCase()+' keys valid — '+(pf.balance_count||0)+' assets');
+            break;
+          } else {
+            toast('error',v.toUpperCase()+' key validation failed: '+(pf.error||'unknown'));
+            $('cfgTradingMode').value='paper';updateModeWarning();return;
+          }
+        }catch(e){toast('error',v.toUpperCase()+' preflight error');$('cfgTradingMode').value='paper';updateModeWarning();return;}
+      }
+      if(!passed){toast('error','No enabled venue has valid keys');$('cfgTradingMode').value='paper';updateModeWarning();return;}
+      if(!confirm('Switch to LIVE trading? '+passed.venue.toUpperCase()+' validated — '+passed.count+' assets found. This uses REAL MONEY. Continue?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
+    }
     let modeResp={success:true,mode:mode};
     try{
       const modeReq=await fetch('/api/config/trading-mode?confirmation=true',{

@@ -2312,6 +2312,71 @@ def build_app(
             },
         }
 
+    # ── /api/config/test-keys — preflight validation (real ccxt call) ────
+    @app.post("/api/config/test-keys")
+    async def api_config_test_keys(request: Request) -> dict[str, Any]:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        venue = str(body.get("venue") or body.get("exchange") or "binance").lower().strip()
+        api_key = str(body.get("api_key") or "").strip()
+        api_secret = str(body.get("api_secret") or "").strip()
+        testnet = bool(body.get("testnet", False))
+
+        if not api_key or not api_secret:
+            return {"success": False, "error": "api_key and api_secret required"}
+
+        try:
+            import ccxt.async_support as ccxt_async  # type: ignore[import-not-found]
+        except Exception as exc:
+            return {"success": False, "error": f"ccxt not installed: {exc}"}
+
+        cls = getattr(ccxt_async, venue, None)
+        if cls is None:
+            return {"success": False, "error": f"unknown venue: {venue}"}
+
+        params: dict[str, Any] = {"apiKey": api_key, "secret": api_secret, "enableRateLimit": True}
+        if venue == "okx":
+            passphrase = body.get("passphrase") or body.get("api_password") or ""
+            if passphrase:
+                params["password"] = str(passphrase)
+        client = cls(params)
+        if testnet and hasattr(client, "set_sandbox_mode"):
+            try:
+                client.set_sandbox_mode(True)
+            except Exception:
+                pass
+
+        balances_summary: list[dict[str, Any]] = []
+        try:
+            bal = await asyncio.wait_for(client.fetch_balance(), timeout=8.0)
+            totals = (bal or {}).get("total") or {}
+            for ccy, amt in sorted(totals.items(), key=lambda kv: -float(kv[1] or 0))[:10]:
+                try:
+                    amtf = float(amt)
+                except Exception:
+                    amtf = 0.0
+                if amtf > 0:
+                    balances_summary.append({"asset": ccy, "total": amtf})
+            logger.info(
+                "test-keys OK venue={} key={}*** balances_nonzero={}",
+                venue, api_key[:4], len(balances_summary),
+            )
+            return {"success": True, "venue": venue, "testnet": testnet,
+                    "balances": balances_summary, "balance_count": len(balances_summary)}
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "exchange timeout (8s)"}
+        except Exception as exc:
+            msg = str(exc)[:200]
+            logger.warning("test-keys FAIL venue={} key={}***: {}", venue, api_key[:4], msg)
+            return {"success": False, "error": f"{type(exc).__name__}: {msg}"}
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
     # ── /api/realtime/snapshot — polling fallback ─────────────────────────
     @app.get("/api/realtime/snapshot")
     async def api_realtime_snapshot(
