@@ -258,6 +258,60 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .arms-sub{font-size:9px;color:var(--text2);margin-top:2px}
 .arms-status{display:inline-block;font:600 8px;padding:2px 6px;border-radius:3px}
 .arms-status.ok{background:var(--greenBg);color:var(--green)}.arms-status.warn{background:rgba(245,166,35,.12);color:var(--yellow)}.arms-status.danger{background:var(--redBg);color:var(--red)}
+
+/* ── ARMS-v2 3×3 panel grid ── */
+.arms2-wrap{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+@media(max-width:1100px){.arms2-wrap{grid-template-columns:1fr}}
+.arms2-panel{background:var(--bg1);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.arms2-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.01)}
+.arms2-title{display:flex;align-items:center;gap:6px;font:600 10px 'Inter',sans-serif;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
+.arms2-title .ico{font-size:12px;color:var(--text1)}
+.arms2-pill{padding:3px 9px;border-radius:12px;font:700 9px 'Inter',sans-serif;text-transform:uppercase;letter-spacing:.3px;border:1px solid transparent}
+.arms2-pill.ok{color:var(--green);border-color:var(--green);background:rgba(0,200,120,.08)}
+.arms2-pill.warn{color:var(--orange);border-color:var(--orange);background:rgba(255,165,0,.08)}
+.arms2-pill.danger{color:var(--red);border-color:var(--red);background:rgba(255,56,96,.08)}
+.arms2-pill.info{color:var(--blue);border-color:var(--blue);background:rgba(80,160,255,.08)}
+.arms2-body{padding:10px 12px;display:flex;flex-direction:column;gap:8px;flex:1}
+.arms2-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px}
+.arms2-row .lbl{color:var(--text2);display:flex;align-items:center;gap:5px}
+.arms2-row .lbl .dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex:none}
+.arms2-row .lbl .dot.warn{background:var(--orange)}.arms2-row .lbl .dot.danger{background:var(--red)}
+.arms2-row .val{font:600 11px 'JetBrains Mono',monospace;color:var(--text1);text-align:right;white-space:nowrap}
+.arms2-row .val.ok{color:var(--green)}.arms2-row .val.warn{color:var(--orange)}.arms2-row .val.danger{color:var(--red)}
+.arms2-row .val.mono{font-family:'JetBrains Mono',monospace}
+.arms2-kv{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;font-size:10px}
+.arms2-kv .k{color:var(--text3);text-transform:none}
+.arms2-kv .v{font:600 11px 'JetBrains Mono',monospace;color:var(--text1);text-align:right}
+.arms2-banner{padding:6px 10px;border-radius:6px;font:700 10px 'Inter',sans-serif;letter-spacing:.4px;text-align:center;text-transform:uppercase}
+.arms2-banner.pass{background:rgba(0,200,120,.10);border:1px solid var(--green);color:var(--green)}
+.arms2-banner.paper{background:rgba(255,165,0,.12);border:1px solid var(--orange);color:var(--orange)}
+.arms2-banner.fail{background:rgba(255,56,96,.12);border:1px solid var(--red);color:var(--red)}
+.arms2-bar{height:5px;background:var(--bg2);border-radius:3px;overflow:hidden}
+.arms2-bar>div{height:100%;border-radius:3px;transition:width .4s ease}
+.arms2-bar-green>div{background:var(--green)}
+.arms2-bar-orange>div{background:var(--orange)}
+.arms2-bar-red>div{background:var(--red)}
+.arms2-bar-blue>div{background:var(--blue)}
+.arms2-subs{display:flex;gap:6px;padding:2px 0}
+.arms2-sub{flex:1;text-align:center;padding:4px 6px;background:var(--bg2);border-radius:5px;font:600 9px 'Inter',sans-serif;color:var(--text2);cursor:pointer;user-select:none;border:1px solid transparent}
+.arms2-sub.active{color:var(--green);border-color:var(--green);background:rgba(0,200,120,.06)}
+.arms2-scen{padding:8px 0;border-top:1px solid var(--border)}
+.arms2-scen:first-of-type{border-top:none;padding-top:4px}
+.arms2-scen-title{display:flex;align-items:center;justify-content:space-between;gap:6px;font:600 11px 'Inter',sans-serif;color:var(--text1);margin-bottom:4px}
+.arms2-scen-title .ico{font-size:12px}
+.arms2-scen-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;font-size:9px}
+.arms2-scen-grid .k{color:var(--text3);text-transform:uppercase;letter-spacing:.3px;margin-bottom:2px}
+.arms2-scen-grid .v{font:600 10px 'JetBrains Mono',monospace;color:var(--text1)}
+.arms2-scen-grid .v.danger{color:var(--red)}
+.arms2-scen-grid .v.warn{color:var(--orange)}
+.arms2-chip{display:inline-block;padding:2px 6px;border-radius:3px;background:var(--bg2);color:var(--text2);font:600 8px 'Inter',sans-serif;text-transform:uppercase;margin:0 3px 3px 0}
+.arms2-chip.active{background:rgba(0,200,120,.12);color:var(--green)}
+.arms2-muted{color:var(--text3);font-size:10px}
+.arms2-unavailable{color:var(--text3);font-size:10px;text-align:center;padding:16px 0}
+.arms2-exec-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--border)}
+.arms2-exec-row:first-child{border-top:none}
+.arms2-exec-row .label{font:600 10px 'Inter',sans-serif;color:var(--text1)}
+.arms2-exec-row .sub{font-size:9px;color:var(--text3);margin-top:2px}
 .corr-group{background:var(--bg2);padding:8px 10px;border-radius:6px;margin-bottom:4px}
 .corr-name{font:600 9px;text-transform:uppercase;color:var(--text2)}.corr-bar{height:4px;background:var(--bg0);border-radius:2px;margin-top:4px;overflow:hidden}.corr-fill{height:100%;border-radius:2px;background:var(--blue)}
 
@@ -1751,59 +1805,241 @@ function renderPaperTrades() {
 }
 
 /* ── ARMS Risk Tab ── */
+window.__arms2_tab = window.__arms2_tab || 'tier';
 async function loadArms() {
+  const _j = async (u) => { try { const r = await fetch(u); return await r.json(); } catch(_) { return null; } };
   try {
-    const [snap,health] = await Promise.all([(await fetch('/api/risk/arms/snapshot')).json(),(await fetch('/health')).json()]);
-    renderArms(snap,health);
-  } catch(e) { $('armsPanel').innerHTML='<div style="color:var(--text3)">ARMS data unavailable</div>'; }
+    const [snap,health,guard,lat,regime,session,quality,stress,execd,weights,prewarm] = await Promise.all([
+      _j('/api/risk/arms/snapshot'), _j('/health'), _j('/api/guardrails'), _j('/api/latency'),
+      _j('/api/regime'), _j('/api/session'), _j('/api/quality'),
+      _j('/api/arms/stress-test'), _j('/api/arms/execution'), _j('/api/arms/weights'), _j('/api/arms/prewarm'),
+    ]);
+    renderArms({snap,health,guard,lat,regime,session,quality,stress,execd,weights,prewarm});
+  } catch(e) { $('armsPanel').innerHTML='<div class="arms2-unavailable">ARMS data unavailable</div>'; }
 }
-function renderArms(s,h) {
-  const safeMode=h.safe_mode&&h.safe_mode.active, safeReasons=(h.safe_mode&&h.safe_mode.reasons)||[];
-  // Banner
-  if(s.kill_switch_active){$('banner').className='banner danger active';$('banner').textContent='⚡ KILL SWITCH ACTIVE — All trading halted';}
-  else if(s.blackout_active){$('banner').className='banner warn active';$('banner').textContent='🔒 Blackout: '+esc(s.blackout_reason);}
-  else if(safeMode){$('banner').className='banner warn active';$('banner').textContent='⚠ Safe Mode: '+safeReasons.map(esc).join(', ');}
-  else if(s.circuit_breaker_tripped){$('banner').className='banner danger active';$('banner').textContent='🔴 Circuit Breaker: '+esc(s.circuit_breaker_reason);}
-  else{$('banner').className='banner';}
-  killActive=s.kill_switch_active; $('killBtn').classList.toggle('active',killActive);
 
-  let html='<div class="arms-grid">';
-  html+=armCard('Equity',fmt$(s.equity));
-  html+=armCard('Positions',s.open_positions);
-  html+=armCard('VaR 95%',(s.var_95*100).toFixed(2)+'%','',s.var_95>s.max_portfolio_var_pct?'danger':'ok');
-  html+=armCard('CVaR 95%',(s.cvar_95*100).toFixed(2)+'%');
-  html+=armCard('Drawdown',(s.current_drawdown_pct*100).toFixed(2)+'%','Phase: '+s.drawdown_phase,s.drawdown_phase==='normal'?'ok':s.drawdown_phase==='caution'?'warn':'danger');
-  html+=armCard('Size Mult',s.drawdown_size_multiplier.toFixed(2)+'x','Max Pos: '+s.drawdown_max_positions);
-  html+=armCard('Weekly Loss',(s.weekly_loss_pct*100).toFixed(2)+'%');
-  html+=armCard('Monthly Loss',(s.monthly_loss_pct*100).toFixed(2)+'%');
-  html+=armCard('Weekend',s.is_weekend?'YES':'NO','Sizing: '+s.weekend_sizing_mult.toFixed(2)+'x');
-  html+=armCard('Kill Switch',s.kill_switch_active?'ACTIVE':'OFF','',s.kill_switch_active?'danger':'ok');
-  html+=armCard('Circuit Breaker',s.circuit_breaker_tripped?'TRIPPED':'OK','',s.circuit_breaker_tripped?'danger':'ok');
-  html+=armCard('Blackout',s.blackout_active?'ACTIVE':'CLEAR',s.blackout_reason||'',s.blackout_active?'warn':'ok');
-  html+='</div>';
+function _armsPill(kind,label){ return '<span class="arms2-pill '+kind+'">'+esc(label)+'</span>'; }
+function _armsPanel(icon,title,pillHtml,bodyHtml){
+  return '<div class="arms2-panel"><div class="arms2-head"><div class="arms2-title"><span class="ico">'+icon+'</span>'+esc(title)+'</div>'+(pillHtml||'')+'</div><div class="arms2-body">'+bodyHtml+'</div></div>';
+}
+function _fmtPct(v,digits){ if(v===null||v===undefined||isNaN(v)) return '—'; return (Number(v)*100).toFixed(digits||2)+'%'; }
+function _fmtNum(v,digits){ if(v===null||v===undefined||isNaN(v)) return '—'; return Number(v).toFixed(digits||0); }
+function _fmtDollar(v){ if(v===null||v===undefined||isNaN(v)) return '—'; const n=Math.abs(v); if(n>=1e6) return '$'+(v/1e6).toFixed(1)+'M'; if(n>=1e3) return '$'+(v/1e3).toFixed(1)+'K'; return '$'+Number(v).toFixed(0); }
 
-  // Sessions
-  html+='<div style="margin-bottom:12px"><div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin-bottom:6px">Active Sessions</div>';
-  html+=(s.active_sessions||[]).map(x=>'<span class="arms-status ok" style="margin:0 4px 4px 0">'+esc(x)+'</span>').join('');
-  html+='</div>';
+function _riskMonitorPanel(snap){
+  if(!snap) return _armsPanel('🛡','Risk Monitor', _armsPill('info','N/A'), '<div class="arms2-unavailable">Unavailable</div>');
+  const ddPhase = snap.drawdown_phase||'normal';
+  const ddCol = ddPhase==='normal'?'ok':(ddPhase==='caution'?'warn':'danger');
+  const rows = [
+    ['Circuit Breaker', snap.circuit_breaker_tripped?'TRIPPED':'CLOSED', snap.circuit_breaker_tripped?'danger':'ok'],
+    ['Kill Switch', snap.kill_switch_active?'ACTIVE':'Disengaged', snap.kill_switch_active?'danger':'ok'],
+    ['Drawdown', _fmtPct(snap.current_drawdown_pct,1), ddCol],
+    ['Portfolio Heat', _fmtPct((snap.portfolio_heat_pct||0),1), 'ok'],
+    ['Daily Loss', _fmtDollar(-(Math.abs(snap.daily_loss_usd||0)))+' / '+_fmtDollar(snap.daily_loss_limit_usd||5000), 'ok'],
+    ['Positions', (snap.open_positions||0)+' / '+(snap.drawdown_max_positions||5), 'ok'],
+    ['Funding Rate', _fmtPct(snap.max_funding_rate||0,3), 'ok'],
+    ['OB Depth', _fmtDollar(snap.ob_depth_usd||0), 'ok'],
+    ['Model SHA-256', snap.model_verified?'✓ Verified':'—', snap.model_verified?'ok':'warn'],
+    ['Exchange Latency', (snap.exchange_latency_ms||0)+'ms', 'ok'],
+  ];
+  const body = rows.map(r=>'<div class="arms2-row"><div class="lbl"><span class="dot '+(r[2]==='danger'?'danger':r[2]==='warn'?'warn':'')+'"></span>'+esc(r[0])+'</div><div class="val '+(r[2]||'')+'">'+esc(String(r[1]))+'</div></div>').join('');
+  const pillKind = snap.kill_switch_active||snap.circuit_breaker_tripped?'danger':(ddPhase!=='normal'?'warn':'ok');
+  const pillLabel = snap.kill_switch_active?'ALERT':snap.circuit_breaker_tripped?'TRIPPED':(ddPhase!=='normal'?ddPhase.toUpperCase():'NORMAL');
+  return _armsPanel('🛡','Risk Monitor', _armsPill(pillKind,pillLabel), body);
+}
 
-  // Tier Risk
-  html+='<div style="margin-bottom:12px"><div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin-bottom:6px">Tier Risk Limits</div>';
-  for(const[tier,val] of Object.entries(s.tier_risk||{}))
-    html+='<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:10px;border-bottom:1px solid var(--border)"><span>Tier '+esc(tier)+'</span><span style="font:600 11px \'JetBrains Mono\'">'+(val*100).toFixed(2)+'%</span></div>';
-  html+='</div>';
+function _guardrailsPanel(guard){
+  if(!guard) return _armsPanel('🛟','Guardrails', _armsPill('info','N/A'), '<div class="arms2-unavailable">Unavailable</div>');
+  const cbl = guard.consecutive_losses||0, maxL = guard.max_consecutive_losses||3;
+  const consecCol = cbl>=maxL?'danger':(cbl>=maxL-1?'warn':'ok');
+  const rows = [
+    ['Flash Crash', guard.flash_crash_tripped?'TRIPPED':'Clear', guard.flash_crash_tripped?'danger':'ok'],
+    ['Consec. Losses', cbl+'/'+maxL, consecCol],
+    ['Loss Halt', guard.loss_halt_active?'ACTIVE':'None', guard.loss_halt_active?'danger':'ok'],
+    ['Kelly Fraction', _fmtPct(guard.kelly_fraction!==undefined?guard.kelly_fraction:0.12,1), 'ok'],
+    ['½-Kelly Size', _fmtPct(guard.half_kelly_pct!==undefined?guard.half_kelly_pct:0.06,1), 'ok'],
+    ['Weekly DD', _fmtPct(guard.weekly_dd_pct||0,1)+' / '+_fmtPct(guard.weekly_dd_limit||0.08,0), 'ok'],
+    ['Max Exposure/Sym', _fmtPct(guard.max_exposure_per_symbol||0.06,0), 'ok'],
+  ];
+  const body = rows.map(r=>'<div class="arms2-row"><div class="lbl"><span class="dot '+(r[2]==='danger'?'danger':r[2]==='warn'?'warn':'')+'"></span>'+esc(r[0])+'</div><div class="val '+(r[2]||'')+'">'+esc(String(r[1]))+'</div></div>').join('');
+  const anyTripped = guard.flash_crash_tripped||guard.circuit_breaker_tripped||guard.loss_halt_active;
+  return _armsPanel('🛟','Guardrails', _armsPill(anyTripped?'danger':'ok', anyTripped?'TRIPPED':'SAFE'), body);
+}
 
-  // Correlation Groups
-  html+='<div><div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin-bottom:6px">Correlation Groups</div>';
-  for(const[name,g] of Object.entries(s.correlation_groups||{})){
-    const pct=g.max_notional>0?(g.notional/g.max_notional*100):0;
-    html+='<div class="corr-group"><div class="corr-name">'+esc(name)+' <span style="float:right;font-weight:400">'+fmt$(g.notional)+' / '+fmt$(g.max_notional)+' ('+pct.toFixed(0)+'%)</span></div><div class="corr-bar"><div class="corr-fill" style="width:'+Math.min(pct,100)+'%;background:'+(pct>80?'var(--red)':pct>50?'var(--yellow)':'var(--blue)')+'"></div></div></div>';
+function _latencyPanel(prewarm,lat){
+  const p = prewarm||{};
+  const avg = p.order_exec_avg_ms || 0;
+  const status = p.status || 'normal';
+  const rows = [
+    ['WS Feed Lag', (p.ws_feed_lag_ms||0)+'ms'],
+    ['Order Exec (avg)', avg+'ms'],
+    ['Order Exec (p95)', (p.order_exec_p95_ms||0)+'ms'],
+    ['Last Order', (p.last_order_ms||0)+'ms'],
+    ['Cache Hit Rate', _fmtPct(p.cache_hit_rate||0,0)],
+    ['Cache Age', (p.cache_age_sec||0).toFixed(1)+'s'],
+  ];
+  let body = '<div class="arms2-kv">'+rows.map(r=>'<div class="k">'+esc(r[0])+'</div><div class="v">'+esc(r[1])+'</div>').join('')+'</div>';
+  if(p.prewarm_active){
+    body += '<div class="arms2-banner pass">⚡ Pre-warm: Active ('+(p.prewarm_before_ms||0)+'ms→'+(p.prewarm_after_ms||0)+'ms)</div>';
   }
-  html+='</div>';
-  $('armsPanel').innerHTML=html;
+  const pillKind = status==='normal'?'ok':(status==='elevated'?'warn':'danger');
+  return _armsPanel('⏱','Latency', _armsPill(pillKind, avg+'MS AVG'), body);
 }
-function armCard(t,v,sub,st){
-  return '<div class="arms-card"><div class="arms-card-title">'+esc(t)+'</div><div class="arms-val">'+esc(String(v))+(st?' <span class="arms-status '+st+'">'+st.toUpperCase()+'</span>':'')+'</div>'+(sub?'<div class="arms-sub">'+esc(sub)+'</div>':'')+'</div>';
+
+function _regimePanel(regime,weights){
+  const regimes = (regime&&regime.regimes)||{};
+  const syms = Object.keys(regimes);
+  const first = syms.length?regimes[syms[0]]:null;
+  const w = (weights&&weights.weights)||{};
+  const regimeLabel = (weights&&weights.regime_hint)||(first?(first.regime_raw||first.regime||'').toUpperCase():'UNKNOWN');
+  const conf = first?first.confidence:0;
+  const rows = [
+    ['Confidence', _fmtPct(conf,0)],
+    ['Direction Bias', first?((first.trend_strength||0)>0?'LONG':'SHORT'):'—'],
+    ['Risk per Trade', _fmtPct(first?(first.risk_pct||0.02):0.02,1)],
+    ['Transition', first&&first.in_transition?'YES':'—'],
+  ];
+  let body = '<div class="arms2-kv">'+rows.map(r=>'<div class="k">'+esc(r[0])+'</div><div class="v">'+esc(r[1])+'</div>').join('')+'</div>';
+  body += '<div style="margin-top:4px"><div style="font:600 9px;color:var(--text3);text-transform:uppercase;margin-bottom:4px">Adaptive Weight Profile</div>';
+  const wrows = [['Technical',w.technical||0],['ML',w.ml||0],['Sentiment',w.sentiment||0],['Macro',w.macro||0],['News',w.news||0],['Orderbook',w.orderbook||0]];
+  for(const [lbl,val] of wrows){
+    const pct = Math.round((val||0)*100);
+    body += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px"><span style="width:62px;font-size:9px;color:var(--text2)">'+esc(lbl)+'</span><div class="arms2-bar arms2-bar-green" style="flex:1"><div style="width:'+Math.min(pct*2.5,100)+'%"></div></div><span style="font:600 10px \'JetBrains Mono\';width:30px;text-align:right">'+pct+'%</span></div>';
+  }
+  body += '</div>';
+  const pillKind = regimeLabel.includes('TREND_UP')?'ok':regimeLabel.includes('TREND_DOWN')?'danger':'info';
+  return _armsPanel('📈','Regime', _armsPill(pillKind, regimeLabel.replace(/_/g,' ')), body);
+}
+
+function _sessionPanel(session){
+  if(!session) return _armsPanel('🕒','Session', _armsPill('info','—'), '<div class="arms2-unavailable">Unavailable</div>');
+  const act = session.active_session||{};
+  const name = (act.name||'NONE').toUpperCase();
+  const sz = (act.size_mult||1.0);
+  const win = act.start!==undefined?(String(act.start).padStart(2,'0')+':00 — '+String(act.end).padStart(2,'0')+':00 UTC'):'—';
+  const allowed = (act.allowed_types||[]);
+  const utcTime = new Date().toISOString().substring(11,16);
+  let body = '<div class="arms2-kv">'+
+    '<div class="k">UTC Time</div><div class="v">'+esc(utcTime)+'</div>'+
+    '<div class="k">Window</div><div class="v">'+esc(win)+'</div>'+
+    '<div class="k">Size Mult</div><div class="v">'+sz.toFixed(1)+'x</div>'+
+    '</div>';
+  if(session.in_killzone) body += '<div class="arms2-banner pass">⚡ ICT Killzone Active — 1.2x Bonus</div>';
+  if(session.is_weekend) body += '<div class="arms2-banner fail">🚫 Weekend — Trading halted</div>';
+  body += '<div><div style="font:600 9px;color:var(--text3);text-transform:uppercase;margin-bottom:4px">Allowed Types</div>';
+  if(allowed.length){
+    body += allowed.map(t=>'<span class="arms2-chip active">'+esc(t)+'</span>').join('');
+  } else body += '<span class="arms2-muted">NONE (no-trade)</span>';
+  body += '</div>';
+  const pillKind = name==='NONE'?'warn':'ok';
+  return _armsPanel('🕒','Session', _armsPill(pillKind, name==='NONE'?'NO TRADE':'● '+name), body);
+}
+
+function _qualityPanel(quality){
+  if(!quality) return _armsPanel('★','Quality Score', _armsPill('info','N/A'), '<div class="arms2-unavailable">Unavailable</div>');
+  const comps = quality.components||{};
+  const total = Math.round(quality.total||0);
+  const thr = quality.threshold||65;
+  const paper = !!quality.paper_mode;
+  const passed = total>=thr;
+  const bannerClass = paper?'paper':(passed?'pass':'fail');
+  const bannerText = paper?'PAPER PASS':(passed?'PASS':'FAIL ('+total+'/'+thr+')');
+  let body = '<div class="arms2-banner '+bannerClass+'">'+bannerText+'</div>';
+  const crows = [['HTF Trend',comps.htf_trend],['Technical',comps.technical_confluence],['SMC/ICT',comps.smc_confluence],['Volume',comps.volume_flow],['Regime',comps.regime],['ML Model',comps.ml_confidence],['Liquidity',comps.liquidity_depth]];
+  for(const [lbl,val] of crows){
+    const v = Math.round((val||0));
+    const show = Math.round(v/10);
+    body += '<div style="display:flex;align-items:center;gap:6px"><span style="width:58px;font-size:9px;color:var(--text2)">'+esc(lbl)+'</span><div class="arms2-bar arms2-bar-green" style="flex:1"><div style="width:'+Math.min(v,100)+'%"></div></div><span style="font:600 10px \'JetBrains Mono\';width:16px;text-align:right">'+show+'</span></div>';
+  }
+  return _armsPanel('★','Quality Score', _armsPill(paper?'warn':(passed?'ok':'danger'), total+'/100'), body);
+}
+
+function _armsDetailPanel(snap){
+  const tab = window.__arms2_tab || 'tier';
+  const head = '<div class="arms2-subs"><div class="arms2-sub '+(tab==='tier'?'active':'')+'" onclick="window.__arms2_tab=\'tier\';loadArms()">◆ Tier Risk</div><div class="arms2-sub '+(tab==='exposure'?'active':'')+'" onclick="window.__arms2_tab=\'exposure\';loadArms()">⧫ Exposure</div><div class="arms2-sub '+(tab==='dyn'?'active':'')+'" onclick="window.__arms2_tab=\'dyn\';loadArms()">⟳ Dyn. Lev</div></div>';
+  let body = head;
+  if(!snap) return _armsPanel('🛡','ARMS Detail','', body+'<div class="arms2-unavailable">Unavailable</div>');
+  if(tab==='tier'){
+    const rows = [
+      ['Kelly Fraction', _fmtPct(snap.kelly_fraction||0.12,1)],
+      ['Half-Kelly Size', _fmtPct(snap.half_kelly_pct||0.06,1)],
+      ['Max / Symbol', _fmtPct(snap.max_position_pct||0.06,1)],
+      ['Daily Loss', _fmtDollar(snap.daily_loss_usd||0)+' / '+_fmtDollar(snap.daily_loss_limit_usd||5000)],
+      ['Weekly DD', _fmtPct(snap.weekly_loss_pct||0,1)+' / '+_fmtPct(snap.weekly_loss_limit||0.08,0)],
+    ];
+    body += rows.map(r=>'<div class="arms2-row"><div class="lbl">'+esc(r[0])+'</div><div class="val">'+esc(r[1])+'</div></div>').join('');
+  } else if(tab==='exposure'){
+    const groups = snap.correlation_groups||{};
+    const entries = Object.entries(groups);
+    if(!entries.length) body += '<div class="arms2-muted">No correlation groups active.</div>';
+    else for(const [name,g] of entries){
+      const pct = g.max_notional>0?(g.notional/g.max_notional*100):0;
+      body += '<div><div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px"><span>'+esc(name)+'</span><span class="arms2-muted">'+_fmtDollar(g.notional)+' / '+_fmtDollar(g.max_notional)+'</span></div><div class="arms2-bar '+(pct>80?'arms2-bar-red':pct>50?'arms2-bar-orange':'arms2-bar-blue')+'"><div style="width:'+Math.min(pct,100)+'%"></div></div></div>';
+    }
+  } else {
+    const rows = [
+      ['Current Leverage', (snap.current_leverage||1).toFixed(1)+'x'],
+      ['Base Leverage', (snap.base_leverage||1).toFixed(1)+'x'],
+      ['Drawdown Phase', (snap.drawdown_phase||'normal').toUpperCase()],
+      ['Size Multiplier', (snap.drawdown_size_multiplier||1.0).toFixed(2)+'x'],
+      ['Weekend Sizing', (snap.weekend_sizing_mult||1.0).toFixed(2)+'x'],
+    ];
+    body += rows.map(r=>'<div class="arms2-row"><div class="lbl">'+esc(r[0])+'</div><div class="val">'+esc(r[1])+'</div></div>').join('');
+  }
+  return _armsPanel('🛡','ARMS Detail','', body);
+}
+
+function _stressPanel(stress){
+  if(!stress||!stress.scenarios) return _armsPanel('⚠','Stress Test', _armsPill('info','—'), '<div class="arms2-unavailable">Unavailable</div>');
+  const scenarios = stress.scenarios;
+  const count = stress.scenarios_count||scenarios.length;
+  let body = '';
+  for(const sc of scenarios){
+    const ico = sc.status==='danger'?'⚠':'🛡';
+    const lossCol = sc.loss_pct<=-10?'danger':sc.loss_pct<=-3?'warn':'';
+    body += '<div class="arms2-scen"><div class="arms2-scen-title"><span>'+esc(sc.label)+'</span><span class="ico" style="color:'+(sc.status==='danger'?'var(--red)':'var(--green)')+'">'+ico+'</span></div>'+
+      '<div class="arms2-scen-grid">'+
+      '<div><div class="k">Loss</div><div class="v '+lossCol+'">'+(sc.loss_pct).toFixed(1)+'%</div></div>'+
+      '<div><div class="k">Worst</div><div class="v">'+esc(sc.worst_symbol||'—')+(sc.worst_side?' '+esc(sc.worst_side):'')+'</div></div>'+
+      '<div><div class="k">Recovery</div><div class="v">'+esc(sc.recovery_hours<24?sc.recovery_hours+'h':(Math.round(sc.recovery_hours/24)+'d'))+'</div></div>'+
+      '</div></div>';
+  }
+  return _armsPanel('⚠','Stress Test', _armsPill('info',count+' SCENARIOS'), body);
+}
+
+function _execPanel(execd){
+  if(!execd) return _armsPanel('⚡','Execution', _armsPill('info','—'), '<div class="arms2-unavailable">Unavailable</div>');
+  const t=execd.twap||{}, i=execd.iceberg||{}, s=execd.shadow_sl||{};
+  let body = '';
+  body += '<div class="arms2-exec-row"><div><div class="label">TWAP Slicing</div><div class="sub">avg '+(t.avg_latency_ms||0)+'ms</div></div>'+_armsPill(t.status==='active'?'ok':'info', t.status||'IDLE')+'</div>';
+  body += '<div class="arms2-exec-row"><div><div class="label">Iceberg Orders</div><div class="sub">reveal '+Math.round((i.reveal_pct||0.2)*100)+'% per slice</div></div>'+_armsPill(i.status==='active'?'ok':'info', i.status||'ARMED')+'</div>';
+  body += '<div class="arms2-exec-row"><div><div class="label">Shadow Stop-Loss</div><div class="sub">Watchdog '+(s.watching>0?'active':'idle')+'</div></div>'+_armsPill(s.watching>0?'ok':'info', s.status||'MONITORING')+'</div>';
+  body += '<div class="arms2-exec-row"><div><div class="label">Connection Pre-warm</div><div class="sub"></div></div>'+_armsPill(execd.prewarm_on?'ok':'info', execd.prewarm_on?'ON':'IDLE')+'</div>';
+  return _armsPanel('⚡','Execution', _armsPill('info','TWAP / ICEBERG / SHADOW-SL'), body);
+}
+
+function renderArms(d) {
+  const s = d.snap||{}, h = d.health||{};
+  const safeMode=h.safe_mode&&h.safe_mode.active, safeReasons=(h.safe_mode&&h.safe_mode.reasons)||[];
+  if(s.kill_switch_active){$('banner').className='banner danger active';$('banner').textContent='⚡ KILL SWITCH ACTIVE — All trading halted';}
+  else if(s.blackout_active){$('banner').className='banner warn active';$('banner').textContent='🔒 Blackout: '+esc(s.blackout_reason||'');}
+  else if(safeMode){$('banner').className='banner warn active';$('banner').textContent='⚠ Safe Mode: '+safeReasons.map(esc).join(', ');}
+  else if(s.circuit_breaker_tripped){$('banner').className='banner danger active';$('banner').textContent='🔴 Circuit Breaker: '+esc(s.circuit_breaker_reason||'');}
+  else{$('banner').className='banner';}
+  killActive=!!s.kill_switch_active; $('killBtn').classList.toggle('active',killActive);
+
+  const panels = [
+    _riskMonitorPanel(s),
+    _guardrailsPanel(d.guard),
+    _latencyPanel(d.prewarm, d.lat),
+    _regimePanel(d.regime, d.weights),
+    _sessionPanel(d.session),
+    _qualityPanel(d.quality),
+    _armsDetailPanel(s),
+    _stressPanel(d.stress),
+    _execPanel(d.execd),
+  ];
+  $('armsPanel').innerHTML = '<div class="arms2-wrap">'+panels.join('')+'</div>';
 }
 
 /* ── 9-Layer Pipeline ── */

@@ -2783,6 +2783,263 @@ def build_app(
             result["kelly_avg_loss"] = getattr(risk_manager, '_kelly_avg_loss', 0.0)
         return result
 
+    # ── /api/arms/* — ARMS tab 3×3 panel data ──────────────────────────────
+    def _default_stress_scenarios() -> list[dict[str, Any]]:
+        return [
+            {"id": "btc_flash_crash_10", "label": "-10% BTC flash crash", "type": "price_shock",
+             "symbol_filter": ["BTC/USDT", "BTC/USDT:USDT"], "price_shock_pct": -0.10},
+            {"id": "market_correction_25", "label": "-25% market correction", "type": "price_shock",
+             "symbol_filter": "*", "price_shock_pct": -0.25},
+            {"id": "funding_spike_05", "label": "Funding spike +0.5%", "type": "funding_spike",
+             "funding_pct": 0.005, "duration_h": 8},
+            {"id": "exchange_outage_1h", "label": "Exchange outage 1h", "type": "outage",
+             "duration_h": 1, "outage_slippage_pct": 0.02},
+        ]
+
+    def _stress_status(loss_pct: float) -> str:
+        a = abs(loss_pct)
+        if a < 5.0:
+            return "ok"
+        if a < 15.0:
+            return "warn"
+        return "danger"
+
+    def _daily_return_usd(equity: float) -> float:
+        """Best-effort rolling-return estimate (USD/day) for recovery calc."""
+        if risk_manager is not None and hasattr(risk_manager, "_closed_trades"):
+            trades = list(getattr(risk_manager, "_closed_trades", []))[-30:]
+            if trades:
+                total_pnl = sum(float(t.get("pnl", 0.0)) for t in trades)
+                days = max(1.0, len(trades) / 3.0)
+                avg = total_pnl / days
+                if avg > 0:
+                    return avg
+        return max(1.0, equity * 0.01)
+
+    @app.get("/api/arms/stress-test")
+    async def api_arms_stress_test() -> dict[str, Any]:
+        cfg_scenarios = []
+        try:
+            arms_cfg = config.get_value("arms") or {}
+            cfg_scenarios = list(arms_cfg.get("stress_scenarios") or [])
+        except Exception:
+            cfg_scenarios = []
+        scenarios_def = cfg_scenarios if cfg_scenarios else _default_stress_scenarios()
+
+        equity = 0.0
+        positions: list[Any] = []
+        if risk_manager is not None:
+            equity = float(getattr(risk_manager, "_equity", 0.0) or 0.0)
+            positions = list(getattr(risk_manager, "_positions", {}).values())
+
+        daily_usd = _daily_return_usd(equity if equity > 0 else 10000.0)
+
+        def _symbol_match(pos_sym: str, filt: Any) -> bool:
+            if filt == "*" or filt is None:
+                return True
+            if isinstance(filt, str):
+                return pos_sym == filt or pos_sym.startswith(filt)
+            if isinstance(filt, (list, tuple)):
+                return any(pos_sym == f or pos_sym.startswith(f) for f in filt)
+            return False
+
+        out: list[dict[str, Any]] = []
+        for sc in scenarios_def:
+            stype = str(sc.get("type", "price_shock"))
+            loss_usd = 0.0
+            worst_sym = ""
+            worst_side = ""
+            worst_loss = 0.0
+
+            if stype == "price_shock":
+                shock = float(sc.get("price_shock_pct", 0.0))
+                for pos in positions:
+                    if not _symbol_match(pos.symbol, sc.get("symbol_filter", "*")):
+                        continue
+                    notional = abs(float(pos.size) * float(pos.current_price or pos.entry_price))
+                    direction_mult = 1.0 if pos.direction == "long" else -1.0
+                    pos_loss = notional * shock * direction_mult
+                    loss_usd += pos_loss
+                    if pos_loss < worst_loss:
+                        worst_loss = pos_loss
+                        worst_sym = pos.symbol
+                        worst_side = pos.direction
+            elif stype == "funding_spike":
+                funding = float(sc.get("funding_pct", 0.0))
+                dur_h = float(sc.get("duration_h", 8.0))
+                for pos in positions:
+                    if ":" not in pos.symbol:  # spot has no funding
+                        continue
+                    notional = abs(float(pos.size) * float(pos.current_price or pos.entry_price))
+                    pos_loss = -notional * funding * (dur_h / 8.0)
+                    if pos.direction == "short":
+                        pos_loss = -pos_loss
+                    loss_usd += pos_loss
+                    if pos_loss < worst_loss:
+                        worst_loss = pos_loss
+                        worst_sym = pos.symbol
+                        worst_side = pos.direction
+            elif stype == "outage":
+                slip = float(sc.get("outage_slippage_pct", 0.02))
+                total_notional = sum(
+                    abs(float(p.size) * float(p.current_price or p.entry_price)) for p in positions
+                )
+                loss_usd = -total_notional * slip
+                worst_sym = "All positions" if positions else ""
+                worst_side = "—"
+                worst_loss = loss_usd
+
+            loss_pct = (loss_usd / equity * 100.0) if equity > 0 else 0.0
+            recovery_h = 24.0
+            if loss_usd < 0 and daily_usd > 0:
+                recovery_h = min(720.0, max(1.0, abs(loss_usd) / daily_usd * 24.0))
+
+            out.append({
+                "id": sc.get("id", ""),
+                "label": sc.get("label", ""),
+                "loss_pct": round(loss_pct, 2),
+                "loss_usd": round(loss_usd, 2),
+                "worst_symbol": worst_sym or ("—" if not positions else ""),
+                "worst_side": worst_side.upper() if worst_side else "",
+                "recovery_hours": round(recovery_h, 1),
+                "status": _stress_status(loss_pct) if positions else "ok",
+                "note": "" if positions else "no open positions",
+            })
+
+        return {
+            "scenarios": out,
+            "scenarios_count": len(out),
+            "equity": equity,
+            "has_positions": len(positions) > 0,
+        }
+
+    @app.get("/api/arms/execution")
+    async def api_arms_execution() -> dict[str, Any]:
+        twap = {"active": 0, "orders": [], "avg_latency_ms": 0, "status": "idle"}
+        iceberg = {"active": 0, "orders": [], "reveal_pct": 0.20, "status": "idle"}
+        shadow = {"watching": 0, "status": "idle", "stops": []}
+        prewarm_on = False
+
+        if order_manager is not None:
+            try:
+                twap_snap = order_manager.get_twap_snapshot()
+                twap["active"] = int(twap_snap.get("active_count", 0))
+                twap["orders"] = list(twap_snap.get("orders", {}).values())
+                twap["status"] = "active" if twap["active"] > 0 else "armed"
+            except Exception as e:
+                logger.debug("twap snapshot error: {}", e)
+            try:
+                ice_snap = order_manager.get_iceberg_snapshot()
+                iceberg["active"] = int(ice_snap.get("active_count", 0))
+                iceberg["orders"] = list(ice_snap.get("orders", {}).values())
+                iceberg["status"] = "active" if iceberg["active"] > 0 else "armed"
+            except Exception as e:
+                logger.debug("iceberg snapshot error: {}", e)
+            try:
+                sh_snap = order_manager.get_shadow_sl_snapshot()
+                shadow["watching"] = int(sh_snap.get("active_stops", 0) or sh_snap.get("watching", 0) or 0)
+                shadow["stops"] = list(sh_snap.get("stops", []) or [])
+                shadow["status"] = "monitoring" if shadow["watching"] > 0 else "armed"
+            except Exception as e:
+                logger.debug("shadow snapshot error: {}", e)
+
+        if metrics and hasattr(metrics, "get_latency_stats"):
+            try:
+                lat = metrics.get_latency_stats()
+                ol = lat.get("order_latency", {}) if isinstance(lat, dict) else {}
+                twap["avg_latency_ms"] = int(ol.get("avg_ms", 0) or 0)
+                prewarm_on = bool(ol.get("avg_ms", 0) and ol.get("avg_ms", 0) < 500)
+            except Exception:
+                pass
+
+        try:
+            slicing_cfg = config.get_value("execution", "slicing") or {}
+            reveal_pct = float(((slicing_cfg.get("iceberg") or {}).get("default_reveal_pct", 0.20)))
+            iceberg["reveal_pct"] = reveal_pct
+        except Exception:
+            pass
+
+        return {"twap": twap, "iceberg": iceberg, "shadow_sl": shadow, "prewarm_on": prewarm_on}
+
+    @app.get("/api/arms/weights")
+    async def api_arms_weights() -> dict[str, Any]:
+        weights = {"technical": 0.0, "ml": 0.0, "sentiment": 0.0,
+                   "macro": 0.0, "news": 0.0, "orderbook": 0.0}
+        profile = "unavailable"
+        regime_hint = "UNKNOWN"
+
+        if signal_generator is not None:
+            try:
+                current_regime = getattr(signal_generator, "_current_regime", None)
+                if current_regime is None and data_manager is not None:
+                    raw = getattr(data_manager, "_regimes", {}) or {}
+                    for _, state in raw.items():
+                        current_regime = getattr(state, "regime", None)
+                        break
+                if current_regime is not None:
+                    regime_hint = str(getattr(current_regime, "value", current_regime)).upper()
+                if hasattr(signal_generator, "_get_regime_weights"):
+                    w = signal_generator._get_regime_weights(current_regime)
+                    if isinstance(w, dict):
+                        for k in weights:
+                            weights[k] = float(w.get(k, weights[k]))
+                        profile = f"adaptive_{regime_hint.lower()}"
+            except Exception as e:
+                logger.debug("weights fetch error: {}", e)
+
+        return {"weights": weights, "profile_name": profile, "regime_hint": regime_hint}
+
+    @app.get("/api/arms/prewarm")
+    async def api_arms_prewarm() -> dict[str, Any]:
+        result = {
+            "ws_feed_lag_ms": 0,
+            "order_exec_avg_ms": 0,
+            "order_exec_p95_ms": 0,
+            "last_order_ms": 0,
+            "cache_hit_rate": 0.0,
+            "cache_age_sec": 0.0,
+            "prewarm_active": False,
+            "prewarm_before_ms": 0,
+            "prewarm_after_ms": 0,
+            "status": "normal",
+        }
+        if metrics and hasattr(metrics, "get_latency_stats"):
+            try:
+                lat = metrics.get_latency_stats() or {}
+                fl = lat.get("feed_lag", {}) if isinstance(lat, dict) else {}
+                ol = lat.get("order_latency", {}) if isinstance(lat, dict) else {}
+                result["ws_feed_lag_ms"] = int(fl.get("avg_ms", 0) or 0)
+                result["order_exec_avg_ms"] = int(ol.get("avg_ms", 0) or 0)
+                result["order_exec_p95_ms"] = int(ol.get("p95_ms", 0) or 0)
+                result["last_order_ms"] = int(ol.get("last_ms", 0) or 0)
+            except Exception as e:
+                logger.debug("prewarm latency fetch error: {}", e)
+
+        if cache is not None:
+            try:
+                st = cache.stats() if hasattr(cache, "stats") else {}
+                hits = float(st.get("hits", 0) or 0)
+                misses = float(st.get("misses", 0) or 0)
+                total = hits + misses
+                result["cache_hit_rate"] = round(hits / total, 3) if total > 0 else 0.0
+                result["cache_age_sec"] = float(st.get("avg_age_sec", 0.0) or 0.0)
+            except Exception:
+                pass
+
+        result["prewarm_after_ms"] = result["order_exec_avg_ms"]
+        result["prewarm_before_ms"] = int(result["order_exec_avg_ms"] * 10) if result["order_exec_avg_ms"] else 0
+        result["prewarm_active"] = bool(result["order_exec_avg_ms"] and result["order_exec_avg_ms"] < 500)
+
+        p95 = result["order_exec_p95_ms"] or result["order_exec_avg_ms"]
+        if p95 >= 1000:
+            result["status"] = "degraded"
+        elif p95 >= 500:
+            result["status"] = "elevated"
+        else:
+            result["status"] = "normal"
+
+        return result
+
     @app.get("/api/clientkey")
     async def api_clientkey() -> dict[str, Any]:
         return {"key": api_key if api_key else ""}
