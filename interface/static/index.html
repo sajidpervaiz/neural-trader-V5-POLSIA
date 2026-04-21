@@ -735,7 +735,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
     <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
       <select id="cfgTradingMode" onchange="updateModeWarning()" style="background:var(--bg0);color:var(--text1);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font:11px 'JetBrains Mono';flex:1;max-width:200px">
         <option value="paper">PAPER</option>
-        <option value="simulation">SIMULATION</option>
+        <option value="demo">DEMO</option>
         <option value="live">LIVE</option>
       </select>
       <span id="modeWarning" style="color:var(--red);font:700 10px 'JetBrains Mono';display:none">⚠ REAL MONEY</span>
@@ -763,9 +763,11 @@ let watchlistData = [];
 let streamSource = null;
 let lastSnap = 0;
 let isLiveMode = false;
+let isDemoMode = false;
 let activeVenue = 'paper';
 let isTestnetMode = false;
 let exchangePositions = [];
+let exchangeBalance = null;
 let exchangeOrders = [];
 let exchangeCurrencies = [];
 let agentChatHistory = [{sender:'Assistant', msg:'Ask for status, risk, learning, or say retrain model.'}];
@@ -775,7 +777,10 @@ function esc(v) { return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;'
 function $(id) { return document.getElementById(id); }
 function fmt$(n) { return '$' + Number(n||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:2}); }
 function getConnectionLabel(state='') {
-  const venue = String(activeVenue || (isLiveMode ? 'binance' : 'paper')).toUpperCase();
+  const venue = String(activeVenue || (isLiveMode || isDemoMode ? 'binance' : 'paper')).toUpperCase();
+  if (isDemoMode) {
+    return state ? venue + ' DEMO · ' + state : venue + ' DEMO';
+  }
   if (!isLiveMode) return state ? 'PAPER · ' + state : 'PAPER';
   const network = isTestnetMode ? 'DEMO' : 'LIVE';
   return state ? venue + ' ' + network + ' · ' + state : venue + ' ' + network;
@@ -1189,7 +1194,9 @@ function applySnapshot(s) {
   if (s.indicators) applyTech(s.indicators);
   if (s.auto) {
     autoTrading=!!s.auto.enabled;
-    activeVenue = String(s.auto.exchange || (isLiveMode ? 'binance' : 'paper'));
+    isLiveMode = s.auto.mode === 'live';
+    isDemoMode = s.auto.mode === 'demo';
+    activeVenue = String(s.auto.exchange || (isLiveMode || isDemoMode ? 'binance' : 'paper'));
     isTestnetMode = !!s.auto.testnet;
     $('autoBtn').classList.toggle('active',autoTrading);
     $('modeBadge').textContent=String(s.auto.label || s.auto.mode || 'paper').toUpperCase();
@@ -1202,8 +1209,8 @@ function applySnapshot(s) {
 async function loadAll() {
   await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadAgentStatus(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
   // Mode-specific loaders
-  if (isLiveMode) {
-    await Promise.all([loadExchangePositions(), loadExchangeOrders(), loadTradeHistory()]);
+  if (isLiveMode || isDemoMode) {
+    await Promise.all([loadExchangeBalance(), loadExchangePositions(), loadExchangeOrders(), loadTradeHistory()]);
   } else {
     await loadPaperTrades();
   }
@@ -1211,7 +1218,9 @@ async function loadAll() {
 
 async function loadStatus() { try { applyStatus(await (await fetch('/api/status')).json()); } catch(_){} }
 function applyStatus(d) {
-  const equity = d.equity||0, upnl = d.unrealized_pnl||0, dd = d.drawdown_pct||0;
+  const rawEquity = d.equity||0;
+  const equity = (exchangeBalance && (isDemoMode || isLiveMode) && exchangeBalance.equity_usd) ? exchangeBalance.equity_usd : rawEquity;
+  const upnl = d.unrealized_pnl||0, dd = d.drawdown_pct||0;
   $('hEquity').textContent = fmt$(equity);
   $('hPnl').textContent = (upnl>=0?'+':'')+fmt$(upnl); $('hPnl').style.color = upnl>=0?'var(--green)':'var(--red)';
   $('hDD').textContent = dd.toFixed(1)+'%';
@@ -1357,7 +1366,8 @@ async function loadAutoStatus() {
     const d=await(await fetch('/api/auto/status')).json();
     autoTrading=!!d.enabled;
     isLiveMode = d.mode === 'live';
-    activeVenue = String(d.exchange || (isLiveMode ? 'binance' : 'paper'));
+    isDemoMode = d.mode === 'demo';
+    activeVenue = String(d.exchange || (isLiveMode || isDemoMode ? 'binance' : 'paper'));
     isTestnetMode = !!d.testnet;
     $('autoBtn').classList.toggle('active',autoTrading);
     $('modeBadge').textContent=String(d.label || d.mode || 'paper').toUpperCase();
@@ -1367,6 +1377,8 @@ async function loadAutoStatus() {
         ? 'linear-gradient(135deg,#00c853,#00acc1)'
         : 'linear-gradient(135deg,#ff3b30,#ff2d55)';
       if ($('tradeSym') && $('tradeSym').value === 'BTC/USDT') $('tradeSym').value = 'BTC/USDT:USDT';
+    } else if (d.mode === 'demo') {
+      $('modeBadge').style.background='linear-gradient(135deg,#5856d6,#af52de)';
     } else {
       $('modeBadge').style.background='linear-gradient(135deg,#ff9500,#ff5e3a)';
     }
@@ -1502,6 +1514,21 @@ function updateAgentProviderUI() {
     : (provider === 'openai'
       ? 'Paste your OpenAI API key here to enable live OpenAI trade review.'
       : 'Local mode keeps supervision on-device without a remote API call.');
+}
+
+/* ── Exchange Balance (demo/live) ── */
+async function loadExchangeBalance() {
+  if (!isDemoMode && !isLiveMode) { exchangeBalance = null; return; }
+  try {
+    const d = await (await fetch('/api/exchange/balance')).json();
+    if (d && d.success) {
+      exchangeBalance = d;
+      // Re-apply status so equity display picks up the real balance.
+      try { await loadStatus(); } catch(_){}
+    } else {
+      exchangeBalance = null;
+    }
+  } catch(_){ exchangeBalance = null; }
 }
 
 /* ── Exchange Positions (live mode) ── */
@@ -2825,7 +2852,7 @@ function updateModeWarning(){
   const v=$('cfgTradingMode').value;
   $('modeWarning').style.display=v==='live'?'inline':'none';
   $('modeBadge').textContent=v.toUpperCase();
-  $('modeBadge').style.background=v==='live'?'linear-gradient(135deg,#ff3b30,#ff2d55)':v==='simulation'?'linear-gradient(135deg,#5856d6,#af52de)':'linear-gradient(135deg,#ff9500,#ff5e3a)';
+  $('modeBadge').style.background=v==='live'?'linear-gradient(135deg,#ff3b30,#ff2d55)':v==='demo'?'linear-gradient(135deg,#5856d6,#af52de)':'linear-gradient(135deg,#ff9500,#ff5e3a)';
 }
 function renderReg(recs){
   const el=$('connRegistry');
@@ -2846,20 +2873,21 @@ async function saveSettings(){
     }else{toast('error',d.error||'Save failed');return;}
     // Save trading mode
     const mode=$('cfgTradingMode').value;
-    if(mode==='live'){
-      // Preflight: validate keys against exchange before flipping to live
+    if(mode==='live'||mode==='demo'){
+      // Preflight: validate keys against exchange (testnet for demo, mainnet for live).
       const venues=[['binance','cfgBinKey','cfgBinSec','cfgBinOn'],['bybit','cfgBybitKey','cfgBybitSec','cfgBybitOn'],['okx','cfgOkxKey','cfgOkxSec','cfgOkxOn'],['kraken','cfgKrakenKey','cfgKrakenSec','cfgKrakenOn']];
+      const useTestnet=(mode==='demo');
       let passed=null;
       for(const[v,kId,sId,onId] of venues){
         if(!$(onId).checked) continue;
         const k=$(kId).value.trim(), s=$(sId).value.trim();
         if(!k||k==='****'||!s||s==='****') continue;
-        toast('info','Validating '+v.toUpperCase()+' keys…');
+        toast('info','Validating '+v.toUpperCase()+(useTestnet?' demo':'')+' keys…');
         try{
-          const pf=await(await fetch('/api/config/test-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venue:v,api_key:k,api_secret:s})})).json();
+          const pf=await(await fetch('/api/config/test-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venue:v,api_key:k,api_secret:s,testnet:useTestnet})})).json();
           if(pf.success){
             passed={venue:v,balances:pf.balances||[],count:pf.balance_count||0};
-            toast('success',v.toUpperCase()+' keys valid — '+(pf.balance_count||0)+' assets');
+            toast('success',v.toUpperCase()+(useTestnet?' demo ':' ')+'keys valid — '+(pf.balance_count||0)+' assets');
             break;
           } else {
             toast('error',v.toUpperCase()+' key validation failed: '+(pf.error||'unknown'));
@@ -2868,7 +2896,7 @@ async function saveSettings(){
         }catch(e){toast('error',v.toUpperCase()+' preflight error');$('cfgTradingMode').value='paper';updateModeWarning();return;}
       }
       if(!passed){toast('error','No enabled venue has valid keys');$('cfgTradingMode').value='paper';updateModeWarning();return;}
-      if(!confirm('Switch to LIVE trading? '+passed.venue.toUpperCase()+' validated — '+passed.count+' assets found. This uses REAL MONEY. Continue?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
+      if(mode==='live'&&!confirm('Switch to LIVE trading? '+passed.venue.toUpperCase()+' validated — '+passed.count+' assets found. This uses REAL MONEY. Continue?')){$('cfgTradingMode').value='paper';updateModeWarning();toast('info','Kept paper mode');return;}
     }
     let modeResp={success:true,mode:mode};
     try{
@@ -2888,7 +2916,8 @@ async function saveSettings(){
     }
     $('cfgTradingMode').value=modeResp.mode||mode;
     updateModeWarning();
-    loadAutoStatus();
+    await loadAutoStatus();
+    await loadExchangeBalance();
     toast('success','Settings saved');
   }catch(_){toast('error','Save failed');}
 }

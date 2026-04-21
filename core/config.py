@@ -110,11 +110,13 @@ class Config:
         return self._path.with_name(f"{self._path.stem}.runtime.yaml")
 
     def persist_runtime_overrides(self) -> Path:
-        payload: dict[str, Any] = {
-            "system": {
-                "paper_mode": self.paper_mode,
-            }
+        system_block: dict[str, Any] = {
+            "paper_mode": self.paper_mode,
         }
+        trading_mode = (self._data.get("system") or {}).get("trading_mode")
+        if trading_mode:
+            system_block["trading_mode"] = trading_mode
+        payload: dict[str, Any] = {"system": system_block}
 
         exchanges = self._data.get("exchanges", {})
         if isinstance(exchanges, dict):

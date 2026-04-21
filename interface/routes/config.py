@@ -16,25 +16,44 @@ router = APIRouter(prefix="/config", tags=["config"])
 _CONFIG: Optional[Config] = None
 _RISK_MANAGER: Optional[RiskManager] = None
 _ORDER_MANAGER: Optional[OrderManager] = None
+_EXECUTORS: list = []
 
 
 def configure_config_routes(
     config: Optional[Config],
     risk_manager: Optional[RiskManager] = None,
     order_manager: Optional[OrderManager] = None,
+    executors: Optional[list] = None,
 ) -> None:
-    global _CONFIG, _RISK_MANAGER, _ORDER_MANAGER, _TRADING_MODE
+    global _CONFIG, _RISK_MANAGER, _ORDER_MANAGER, _EXECUTORS, _TRADING_MODE
     _CONFIG = config
     _RISK_MANAGER = risk_manager
     _ORDER_MANAGER = order_manager
+    _EXECUTORS = list(executors or [])
     if _CONFIG is not None:
-        _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
+        data = getattr(_CONFIG, "_data", None)
+        persisted = None
+        if isinstance(data, dict):
+            persisted = (data.get("system") or {}).get("trading_mode")
+        if persisted:
+            try:
+                _TRADING_MODE = TradingMode(persisted)
+            except Exception:
+                _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
+        else:
+            _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
 
 
 class TradingMode(str, Enum):
     PAPER = "paper"
     LIVE = "live"
-    SIMULATION = "simulation"
+    DEMO = "demo"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str) and value.lower() == "simulation":
+            return cls.DEMO
+        return None
 
 
 class AlgoConfig(BaseModel):
@@ -97,9 +116,64 @@ def _effective_venues() -> dict[str, dict[str, Any]]:
 
 def _runtime_mode() -> TradingMode:
     global _TRADING_MODE
+    # Preserve explicit DEMO selection — paper_mode alone cannot distinguish PAPER from DEMO.
+    if _TRADING_MODE == TradingMode.DEMO:
+        return _TRADING_MODE
     if _CONFIG is not None:
         _TRADING_MODE = TradingMode.PAPER if bool(getattr(_CONFIG, "paper_mode", True)) else TradingMode.LIVE
     return _TRADING_MODE
+
+
+def get_active_trading_mode() -> str:
+    """Public getter for other modules that need the user-selected trading mode."""
+    return _runtime_mode().value
+
+
+def _validate_demo_switch() -> Optional[str]:
+    venues = _effective_venues()
+    enabled = [name for name, data in venues.items() if data.get("enabled")]
+    if not enabled:
+        return "Enable a venue (e.g. Binance) before switching to demo mode."
+    for venue in enabled:
+        data = venues.get(venue, {})
+        if not data.get("api_key_configured") or not data.get("api_secret_configured"):
+            return f"Add the {venue} demo API key and secret first."
+    return None
+
+
+async def _refresh_executor_clients() -> None:
+    """Close+reinitialise every executor's ccxt client so testnet/key changes apply."""
+    for executor in _EXECUTORS:
+        client = getattr(executor, "_client", None)
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+        executor._client = None
+        executor._order_placer = None
+        try:
+            await executor._init_client()
+        except Exception as exc:
+            logger.warning(
+                "executor {} re-init failed after mode switch: {}",
+                getattr(executor, "exchange_id", "?"), exc,
+            )
+
+
+def _apply_testnet_to_enabled_venues() -> None:
+    """Flip the testnet flag to true on every enabled venue so DEMO hits sandbox URLs."""
+    if _CONFIG is None:
+        return
+    exchanges = _CONFIG._data.setdefault("exchanges", {})
+    if not isinstance(exchanges, dict):
+        return
+    for venue, venue_cfg in exchanges.items():
+        if not isinstance(venue_cfg, dict):
+            continue
+        enabled = _VENUE_OVERRIDES.get(venue, bool(venue_cfg.get("enabled", False)))
+        if enabled:
+            venue_cfg["testnet"] = True
 
 
 def _validate_live_switch() -> Optional[str]:
@@ -154,16 +228,32 @@ async def set_trading_mode(
                 raise HTTPException(status_code=400, detail=validation_error)
             if _CONFIG is not None:
                 _CONFIG.paper_mode = False
+        elif mode == TradingMode.DEMO:
+            validation_error = _validate_demo_switch()
+            if validation_error:
+                raise HTTPException(status_code=400, detail=validation_error)
+            if _CONFIG is not None:
+                _CONFIG.paper_mode = True
+                _apply_testnet_to_enabled_venues()
         else:
             if _CONFIG is not None:
                 _CONFIG.paper_mode = True
 
-        _TRADING_MODE = _runtime_mode() if mode != TradingMode.SIMULATION else mode
+        _TRADING_MODE = mode
         if _CONFIG is not None:
+            data = getattr(_CONFIG, "_data", None)
+            if isinstance(data, dict):
+                data.setdefault("system", {})["trading_mode"] = mode.value
             try:
-                _CONFIG.persist_runtime_overrides()
+                if hasattr(_CONFIG, "persist_runtime_overrides"):
+                    _CONFIG.persist_runtime_overrides()
             except Exception as exc:
                 logger.warning(f"Failed to persist trading mode override: {exc}")
+
+        # Refresh executor clients so venue.testnet flag takes effect immediately.
+        if mode in (TradingMode.DEMO, TradingMode.LIVE):
+            await _refresh_executor_clients()
+
         _record_change("trading_mode", {"mode": _TRADING_MODE.value, "confirmation": confirmation})
 
         return {

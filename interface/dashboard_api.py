@@ -231,7 +231,7 @@ def build_app(
     configure_order_routes(order_manager)
     configure_risk_routes(risk_manager)
     configure_positions_routes(risk_manager)
-    configure_config_routes(config, risk_manager, order_manager)
+    configure_config_routes(config, risk_manager, order_manager, executors=executors)
     # Mount existing routers under /api prefix so UI /api/* calls work
     app.include_router(config_router, prefix="/api")
     app.include_router(orders_router, prefix="/api")
@@ -817,6 +817,77 @@ def build_app(
             return {"coins": cached_coins[:requested]}
 
         return {"coins": coins[:requested]}
+
+    # ── /api/exchange/balance — fetch REAL account balance (demo/live) ─────
+    @app.get("/api/exchange/balance")
+    async def api_exchange_balance() -> dict[str, Any]:
+        """Fetch actual balance from the first connected exchange (testnet/mainnet).
+
+        When trading-mode is DEMO or LIVE, this surfaces the real ccxt balance
+        for the first enabled venue that has a live client attached. PAPER mode
+        returns an empty response so the UI can fall back to simulated equity.
+        """
+        try:
+            from interface.routes.config import get_active_trading_mode
+            active_mode = get_active_trading_mode()
+        except Exception:
+            active_mode = "paper" if config.paper_mode else "live"
+
+        if active_mode == "paper":
+            return {"success": False, "mode": "paper", "error": "paper mode — no exchange balance"}
+
+        for exc in (executors or []):
+            client = getattr(exc, "_client", None)
+            ex_id = getattr(exc, "exchange_id", "unknown")
+            if client is None:
+                try:
+                    await exc._init_client()
+                    client = getattr(exc, "_client", None)
+                except Exception as init_err:
+                    logger.warning("balance: {} client init failed: {}", ex_id, init_err)
+                    continue
+            if client is None:
+                continue
+            try:
+                rl = getattr(exc, "_rate_limiter", None)
+                if rl:
+                    await rl.acquire()
+                bal = await asyncio.wait_for(client.fetch_balance(), timeout=8.0)
+            except asyncio.TimeoutError:
+                return {"success": False, "exchange": ex_id, "error": "exchange timeout (8s)"}
+            except Exception as fetch_err:
+                logger.warning("fetch_balance failed for {}: {}", ex_id, fetch_err)
+                return {"success": False, "exchange": ex_id, "error": f"{type(fetch_err).__name__}: {str(fetch_err)[:200]}"}
+
+            totals = (bal or {}).get("total") or {}
+            frees = (bal or {}).get("free") or {}
+            used = (bal or {}).get("used") or {}
+            rows: list[dict[str, Any]] = []
+            for ccy, amt in sorted(totals.items(), key=lambda kv: -float(kv[1] or 0)):
+                try:
+                    amtf = float(amt)
+                except Exception:
+                    amtf = 0.0
+                if amtf <= 0:
+                    continue
+                rows.append({
+                    "asset": ccy,
+                    "total": amtf,
+                    "free": float(frees.get(ccy, 0) or 0),
+                    "used": float(used.get(ccy, 0) or 0),
+                })
+            equity_usd = float(totals.get("USDT", totals.get("USD", 0)) or 0)
+            venue_cfg = config.get_value("exchanges", ex_id) or {}
+            return {
+                "success": True,
+                "mode": active_mode,
+                "exchange": ex_id,
+                "testnet": bool(venue_cfg.get("testnet", False)),
+                "equity_usd": equity_usd,
+                "balances": rows,
+                "balance_count": len(rows),
+            }
+        return {"success": False, "mode": active_mode, "error": "no connected exchange client"}
 
     # ── /api/exchange/positions — fetch REAL exchange positions ────────────
     @app.get("/api/exchange/positions")
@@ -1943,12 +2014,25 @@ def build_app(
                 if isinstance(maybe_cfg, dict):
                     primary_cfg = maybe_cfg
 
-        testnet = bool(primary_cfg.get("testnet", False)) if not config.paper_mode else False
-        label = "PAPER" if config.paper_mode else f"{primary_exchange.upper()} {'DEMO' if testnet else 'LIVE'}"
+        try:
+            from interface.routes.config import get_active_trading_mode
+            active_mode = get_active_trading_mode()
+        except Exception:
+            active_mode = "paper" if config.paper_mode else "live"
+
+        if active_mode == "demo":
+            testnet = True
+            label = f"{primary_exchange.upper()} DEMO"
+        elif active_mode == "live":
+            testnet = bool(primary_cfg.get("testnet", False))
+            label = f"{primary_exchange.upper()} {'DEMO' if testnet else 'LIVE'}"
+        else:
+            testnet = False
+            label = "PAPER"
 
         return {
             "enabled": enabled,
-            "mode": "paper" if config.paper_mode else "live",
+            "mode": active_mode,
             "auto_trading_enabled": enabled,
             "paper_mode": config.paper_mode,
             "exchange": primary_exchange,
