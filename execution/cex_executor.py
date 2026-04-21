@@ -86,6 +86,10 @@ class CEXExecutor:
                 "fetchCurrencies": False,
                 "fetchMargins": False,
                 "warnOnFetchOpenOrdersWithoutSymbol": False,
+                # Restrict load_markets/fetch_balance to futures-only — without this,
+                # ccxt issues signed sapi calls to api.binance.com (mainnet) for spot
+                # margin/capital lookup, which fail with -2008 under testnet keys.
+                "fetchMarkets": ["linear", "inverse"],
             }
         try:
             self._client = cls(params)
