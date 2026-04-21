@@ -18,6 +18,12 @@ _RISK_MANAGER: Optional[RiskManager] = None
 _ORDER_MANAGER: Optional[OrderManager] = None
 _EXECUTORS: list = []
 
+# Snapshot of venue.testnet values that DEMO mode flipped to True. Populated when
+# entering DEMO; consumed (and cleared) when leaving DEMO so that PAPER/LIVE see
+# the user's original configuration. Without this, a single DEMO trip would
+# permanently set testnet=True on every enabled venue at runtime.
+_DEMO_TESTNET_SNAPSHOT: dict[str, Any] = {}
+
 
 def configure_config_routes(
     config: Optional[Config],
@@ -51,8 +57,11 @@ class TradingMode(str, Enum):
 
     @classmethod
     def _missing_(cls, value):
+        # Legacy "simulation" value maps to PAPER, not DEMO. Mapping to DEMO would
+        # silently route a previously offline simulation to the real testnet exchange
+        # on the next boot — a behaviour change too large for a config-load fallback.
         if isinstance(value, str) and value.lower() == "simulation":
-            return cls.DEMO
+            return cls.PAPER
         return None
 
 
@@ -162,7 +171,12 @@ async def _refresh_executor_clients() -> None:
 
 
 def _apply_testnet_to_enabled_venues() -> None:
-    """Flip the testnet flag to true on every enabled venue so DEMO hits sandbox URLs."""
+    """Flip the testnet flag to true on every enabled venue so DEMO hits sandbox URLs.
+
+    Captures the prior value into _DEMO_TESTNET_SNAPSHOT so a later switch out of
+    DEMO can restore it. Snapshot writes are sticky — re-entering DEMO before
+    leaving it does not overwrite the original value.
+    """
     if _CONFIG is None:
         return
     exchanges = _CONFIG._data.setdefault("exchanges", {})
@@ -172,8 +186,23 @@ def _apply_testnet_to_enabled_venues() -> None:
         if not isinstance(venue_cfg, dict):
             continue
         enabled = _VENUE_OVERRIDES.get(venue, bool(venue_cfg.get("enabled", False)))
-        if enabled:
-            venue_cfg["testnet"] = True
+        if not enabled:
+            continue
+        if venue not in _DEMO_TESTNET_SNAPSHOT:
+            _DEMO_TESTNET_SNAPSHOT[venue] = venue_cfg.get("testnet", False)
+        venue_cfg["testnet"] = True
+
+
+def _restore_testnet_from_snapshot() -> None:
+    """Undo DEMO's testnet flips. Called when leaving DEMO for PAPER or LIVE."""
+    if _CONFIG is None or not _DEMO_TESTNET_SNAPSHOT:
+        return
+    exchanges = _CONFIG._data.get("exchanges") or {}
+    for venue, prior in list(_DEMO_TESTNET_SNAPSHOT.items()):
+        venue_cfg = exchanges.get(venue)
+        if isinstance(venue_cfg, dict):
+            venue_cfg["testnet"] = bool(prior)
+    _DEMO_TESTNET_SNAPSHOT.clear()
 
 
 def _validate_live_switch() -> Optional[str]:
@@ -222,11 +251,15 @@ async def set_trading_mode(
                 detail="Confirmation required for live trading"
             )
 
+        leaving_demo = _TRADING_MODE == TradingMode.DEMO and mode != TradingMode.DEMO
+
         if mode == TradingMode.LIVE:
             validation_error = _validate_live_switch()
             if validation_error:
                 raise HTTPException(status_code=400, detail=validation_error)
             if _CONFIG is not None:
+                if leaving_demo:
+                    _restore_testnet_from_snapshot()
                 _CONFIG.paper_mode = False
         elif mode == TradingMode.DEMO:
             validation_error = _validate_demo_switch()
@@ -237,6 +270,8 @@ async def set_trading_mode(
                 _apply_testnet_to_enabled_venues()
         else:
             if _CONFIG is not None:
+                if leaving_demo:
+                    _restore_testnet_from_snapshot()
                 _CONFIG.paper_mode = True
 
         _TRADING_MODE = mode
@@ -250,9 +285,11 @@ async def set_trading_mode(
             except Exception as exc:
                 logger.warning(f"Failed to persist trading mode override: {exc}")
 
-        # Refresh executor clients so venue.testnet flag takes effect immediately.
-        if mode in (TradingMode.DEMO, TradingMode.LIVE):
-            await _refresh_executor_clients()
+        # Always refresh executor clients so any venue.testnet/paper_mode change is
+        # reflected in the live ccxt client. Applies to PAPER too — going DEMO→PAPER
+        # must rebind the client back to the source-config testnet value (or close it
+        # if the venue is no longer enabled).
+        await _refresh_executor_clients()
 
         _record_change("trading_mode", {"mode": _TRADING_MODE.value, "confirmation": confirmation})
 

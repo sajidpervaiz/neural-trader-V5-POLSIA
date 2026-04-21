@@ -1230,7 +1230,17 @@ function applyStatus(d) {
   // Portfolio sidebar stats
   if ($('psValue')) {
     $('psValue').textContent = fmt$(equity);
-    const avail = Math.max(0, equity - Math.abs(upnl));
+    // Available margin: in DEMO/LIVE prefer the exchange's free-balance for the quote
+    // asset (USDT first, USDC fallback). In PAPER we estimate from portfolio_heat
+    // because the engine doesn't surface used_margin directly.
+    let avail;
+    if ((isDemoMode || isLiveMode) && exchangeBalance && Array.isArray(exchangeBalance.balances)) {
+      const stables = exchangeBalance.balances.filter(b => b.asset === 'USDT' || b.asset === 'USDC');
+      avail = stables.reduce((s, b) => s + Number(b.free || 0), 0);
+    } else {
+      const heat = Number(d.portfolio_heat || 0);
+      avail = Math.max(0, equity * (1 - Math.min(1, heat)));
+    }
     $('psAvail').textContent = fmt$(avail);
     $('psUpnl').textContent = (upnl>=0?'+$':'-$')+Math.abs(upnl).toFixed(2);
     $('psUpnl').style.color = upnl>=0?'var(--green)':'var(--red)';
@@ -1244,8 +1254,8 @@ function applyStatus(d) {
   // Exchange-style positions table
   const el = $('positionsBody');
   if (!el) return;
-  // In live mode, prefer exchange positions (fetched from actual exchange)
-  const positions = (isLiveMode && exchangePositions.length) ? exchangePositions : (d.positions||[]);
+  // In live or demo mode, prefer real exchange positions (testnet/mainnet) over the paper ledger.
+  const positions = ((isLiveMode || isDemoMode) && exchangePositions.length) ? exchangePositions : (d.positions||[]);
   const posN2 = positions.length;
   $('posCount').textContent = posN2;
   if (!posN2) {
@@ -2752,9 +2762,23 @@ async function loadLogs() {
 async function loadPortfolio() {
   try {
     const [status,bt]=await Promise.all([(await fetch('/api/status')).json(),(await fetch('/api/backtest/summary')).json()]);
+    // In DEMO/LIVE, refresh real-exchange equity & positions before rendering so the
+    // Portfolio tab matches what the header card shows ($4,981 testnet, not $100k paper).
+    if (isDemoMode || isLiveMode) {
+      await Promise.all([loadExchangeBalance(), loadExchangePositions()]);
+    }
+    const useExchange = (isDemoMode || isLiveMode);
+    const equity = (useExchange && exchangeBalance && exchangeBalance.equity_usd)
+      ? exchangeBalance.equity_usd : (status.equity||0);
+    const positions = (useExchange && exchangePositions.length)
+      ? exchangePositions : (status.positions||[]);
+    const upnl = (useExchange && positions.length)
+      ? positions.reduce((s,p)=>s + Number(p.pnl||p.unrealizedPnl||0), 0)
+      : Number(status.unrealized_pnl||0);
+
     let h='<div class="metrics">';
-    h+='<div class="metric"><div class="metric-val">'+fmt$(status.equity)+'</div><div class="metric-lbl">Equity</div></div>';
-    h+='<div class="metric"><div class="metric-val" style="color:'+(status.unrealized_pnl>=0?'var(--green)':'var(--red)')+'">$'+Number(status.unrealized_pnl||0).toFixed(2)+'</div><div class="metric-lbl">Unrealized P&L</div></div>';
+    h+='<div class="metric"><div class="metric-val">'+fmt$(equity)+'</div><div class="metric-lbl">Equity</div></div>';
+    h+='<div class="metric"><div class="metric-val" style="color:'+(upnl>=0?'var(--green)':'var(--red)')+'">$'+Number(upnl).toFixed(2)+'</div><div class="metric-lbl">Unrealized P&L</div></div>';
     h+='<div class="metric"><div class="metric-val">'+Number(status.win_rate||0).toFixed(1)+'%</div><div class="metric-lbl">Win Rate</div></div>';
     h+='<div class="metric"><div class="metric-val">'+Number(status.total_trades||0)+'</div><div class="metric-lbl">Total Trades</div></div>';
     h+='<div class="metric"><div class="metric-val">'+Number(bt.sharpe||0).toFixed(2)+'</div><div class="metric-lbl">Sharpe</div></div>';
@@ -2763,8 +2787,13 @@ async function loadPortfolio() {
     h+='<div class="metric"><div class="metric-val">'+fmt$(bt.avg_trade_notional)+'</div><div class="metric-lbl">Avg Trade</div></div>';
     h+='</div>';
     h+='<div style="font:600 10px;color:var(--text2);text-transform:uppercase;margin:10px 0 6px">Open Positions</div>';
-    if((status.positions||[]).length) {
-      h+=status.positions.map(p=>'<div class="pos-row"><div><b>'+esc(p.symbol)+'</b> <span style="color:'+(p.side==='long'?'var(--green)':'var(--red)')+'">'+esc(p.side)+'</span> '+Number(p.size).toFixed(4)+'</div><div style="font:600 10px \'JetBrains Mono\';color:'+(p.pnl>=0?'var(--green)':'var(--red)')+'">$'+Number(p.pnl).toFixed(2)+'</div></div>').join('');
+    if(positions.length) {
+      h+=positions.map(p=>{
+        const side = p.side || p.direction || '';
+        const sz = Number(p.size||p.contracts||0);
+        const pnl = Number(p.pnl||p.unrealizedPnl||0);
+        return '<div class="pos-row"><div><b>'+esc(p.symbol)+'</b> <span style="color:'+(side==='long'?'var(--green)':'var(--red)')+'">'+esc(side)+'</span> '+sz.toFixed(4)+'</div><div style="font:600 10px \'JetBrains Mono\';color:'+(pnl>=0?'var(--green)':'var(--red)')+'">$'+pnl.toFixed(2)+'</div></div>';
+      }).join('');
     } else h+='<div style="color:var(--text3);padding:12px 0">No open positions</div>';
     $('portfolioPanel').innerHTML=h;
   } catch(_){ $('portfolioPanel').innerHTML='<div style="color:var(--text3)">Portfolio unavailable</div>'; }
@@ -2777,8 +2806,8 @@ async function executeTrade(side) {
   const sl=parseFloat($('tradeSL').value||'0'), tp=parseFloat($('tradeTP').value||'0');
   const lev=parseInt($('tradeLev').value||'1',10);
   if(size<=0) return toast('error','Size must be > 0');
-  // Auto-normalize symbol for futures
-  if(isLiveMode && sym.includes('/') && !sym.includes(':USDT') && sym.endsWith('USDT')) sym += ':USDT';
+  // Auto-normalize symbol for futures (also covers DEMO — testnet positions are perpetuals).
+  if((isLiveMode || isDemoMode) && sym.includes('/') && !sym.includes(':USDT') && sym.endsWith('USDT')) sym += ':USDT';
   try{
     const d=await(await fetch('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,side,size,order_type:type,price,stop_loss_pct:sl,take_profit_pct:tp,leverage:lev,venue:'binance'})})).json();
     if(d.success){
@@ -2793,7 +2822,11 @@ async function closeAll() {
   try{await fetch('/api/positions/close-all',{method:'POST'});toast('success','Close-all requested');loadStatus();}catch(_){toast('error','Failed');}
 }
 async function closePosition(sym, venue) {
-  venue = venue || 'binance';
+  // Default to whichever venue the auto-status reported as active so the close routes to
+  // the same exchange the position was opened on. Falls back to 'binance' for callers that
+  // pre-date the activeVenue plumbing.
+  venue = venue || activeVenue || 'binance';
+  if (venue === 'paper') venue = 'binance';
   if(!confirm('Close position for '+sym+'?'))return;
   try{const d=await(await fetch('/api/positions/close',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,venue:venue})})).json();if(d.success){toast('success','Position closed — PnL: $'+(d.realized_pnl||0).toFixed(2));loadAll();}else toast('error',d.error||'Failed');}catch(_){toast('error','Failed');}
 }
