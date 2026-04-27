@@ -462,6 +462,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <button class="tab" data-tab="pipeline">🔗 Pipeline</button>
         <button class="tab" data-tab="portfolio">💼 Portfolio</button>
         <button class="tab" data-tab="news">📰 News</button>
+        <button class="tab" data-tab="geo">🌍 Geo</button>
         <button class="tab" data-tab="heatmap">🔥 Heatmap <span class="btm-count" id="heatmapCount">0</span></button>
         <button class="tab" data-tab="alerts">🚨 Alerts <span class="btm-count" id="alertsCount">0</span></button>
         <button class="tab" data-tab="health">💚 Health <span class="btm-count" id="healthCount">0</span></button>
@@ -556,6 +557,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: News -->
       <div class="tab-content" id="tc-news"><div class="panel-body" id="newsPanel" style="padding:14px"></div></div>
+
+      <div class="tab-content" id="tc-geo"><div class="panel-body" id="geoPanel" style="padding:14px"></div></div>
 
       <!-- Tab: Heatmap -->
       <div class="tab-content" id="tc-heatmap"><div class="panel-body" id="heatmapPanel" style="padding:14px"></div></div>
@@ -725,7 +728,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
           <option value="local">LOCAL</option>
           <option value="claude">CLAUDE</option>
           <option value="openai">OPENAI</option>
+          <option value="gemini">GEMINI</option>
         </select>
+        <button onclick="testAiAgent()" style="margin-left:8px;background:var(--bg0);color:var(--text1);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font:11px 'JetBrains Mono';cursor:pointer">Test</button>
       </label>
     </div>
     <div class="modal-row"><input class="modal-input" id="cfgAiModel" placeholder="Model, e.g. claude-3-5-sonnet-latest"><input class="modal-input" id="cfgAiKey" placeholder="API Key"></div>
@@ -882,6 +887,7 @@ function bindTabs() {
     if (t.dataset.tab === 'pipeline') loadPipeline();
     if (t.dataset.tab === 'portfolio') loadPortfolio();
     if (t.dataset.tab === 'news') loadNews();
+    if (t.dataset.tab === 'geo') loadGeopolitical();
     if (t.dataset.tab === 'heatmap') loadHeatmap();
     if (t.dataset.tab === 'alerts') loadAlerts();
     if (t.dataset.tab === 'health') loadHealth();
@@ -1517,13 +1523,37 @@ function updateAgentProviderUI() {
   const keyInput = $('cfgAiKey');
   const modelInput = $('cfgAiModel');
   const hint = $('cfgAiHint');
-  if (keyInput) keyInput.placeholder = provider === 'claude' ? 'Anthropic API Key' : (provider === 'openai' ? 'OpenAI API Key' : 'Not required for local mode');
-  if (modelInput && !modelInput.value) modelInput.placeholder = provider === 'openai' ? 'Model, e.g. gpt-4o-mini' : 'Model, e.g. claude-3-5-sonnet-latest';
-  if (hint) hint.textContent = provider === 'claude'
-    ? 'Paste your Anthropic API key here to enable live Claude trade review.'
-    : (provider === 'openai'
-      ? 'Paste your OpenAI API key here to enable live OpenAI trade review.'
-      : 'Local mode keeps supervision on-device without a remote API call.');
+  const keyPlaceholders = {
+    claude: 'Anthropic API Key',
+    openai: 'OpenAI API Key',
+    gemini: 'Google AI Studio API Key',
+  };
+  const modelPlaceholders = {
+    claude: 'Model, e.g. claude-sonnet-4-6',
+    openai: 'Model, e.g. gpt-4o-mini',
+    gemini: 'Model, e.g. gemini-1.5-flash',
+  };
+  const hints = {
+    claude: 'Paste your Anthropic API key here to enable live Claude trade review.',
+    openai: 'Paste your OpenAI API key here to enable live OpenAI trade review.',
+    gemini: 'Paste your Google AI Studio API key here to enable live Gemini trade review.',
+    local: 'Local mode keeps supervision on-device without a remote API call.',
+  };
+  if (keyInput) keyInput.placeholder = keyPlaceholders[provider] || 'Not required for local mode';
+  if (modelInput && !modelInput.value) modelInput.placeholder = modelPlaceholders[provider] || modelPlaceholders.claude;
+  if (hint) hint.textContent = hints[provider] || hints.local;
+}
+
+async function testAiAgent() {
+  appendAgentChat('System', 'Testing AI provider connection...');
+  try {
+    const r = await fetch('/api/agent/test', {method:'POST'});
+    const d = await r.json();
+    const tag = d && d.success ? 'OK' : 'FAIL';
+    appendAgentChat('System', tag + ' [' + (d.provider || '?') + (d.model ? ':' + d.model : '') + '] — ' + (d.message || d.reason || 'no detail'));
+  } catch (e) {
+    appendAgentChat('System', 'Test failed: ' + e);
+  }
 }
 
 /* ── Exchange Balance (demo/live) ── */
@@ -2085,12 +2115,13 @@ function renderArms(d) {
 /* ── 9-Layer Pipeline ── */
 async function loadPipeline() {
   try {
-    const [layers, quality, session] = await Promise.all([
+    const [layers, quality, session, geo] = await Promise.all([
       (await fetch('/api/layers')).json(),
       (await fetch('/api/quality')).json(),
       (await fetch('/api/session')).json(),
+      (await fetch('/api/geopolitical')).json().catch(() => ({available:false})),
     ]);
-    renderPipeline(layers, quality, session);
+    renderPipeline(layers, quality, session, geo);
   } catch(e) { $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
 }
 // Previous score map, keyed by layer id — used to compute delta between polls
@@ -2111,9 +2142,35 @@ function _ppFmtNum(v, digits) {
   if (Math.abs(n) >= 100 || Number.isInteger(n)) return String(Math.round(n));
   return n.toFixed(digits==null?2:digits);
 }
-function renderPipeline(layers, quality, session) {
-  const list = layers.layers || [];
-  const counts = layers.counts || {pass:0,soft:0,fail:0,skip:0};
+function renderPipeline(layers, quality, session, geo) {
+  const list = (layers.layers || []).slice();
+  // ── Synthesise Layer 10 (Geopolitical) from /api/geopolitical when available ──
+  if (geo && geo.available !== false) {
+    const syms = geo.symbols || {};
+    let topSym = null, topAbs = -1, topScore = 0;
+    for (const k of Object.keys(syms)) {
+      const sc = Number((syms[k]||{}).score) || 0;
+      if (Math.abs(sc) > topAbs) { topAbs = Math.abs(sc); topSym = k; topScore = sc; }
+    }
+    let st = 'SKIP', detail = (geo.events || 0) + ' events / ' + (geo.polls || 0) + ' polls';
+    if (topSym !== null) {
+      detail = topSym + ' ' + (topScore>=0?'+':'') + topScore.toFixed(2) + ' · ' + (geo.events||0) + ' events';
+      if (topAbs >= 0.5) st = 'PASS';
+      else if (topAbs >= 0.1) st = 'SOFT';
+      else st = 'SKIP';
+    }
+    list.push({
+      id: 10, layer_index: 'L10', name: 'Geopolitical',
+      description: 'RSS-driven per-symbol news factor',
+      status: st, score: topAbs >= 0 ? topAbs * 100 : 0, threshold: 50,
+      detail: detail,
+    });
+  }
+  const counts = {pass:0, soft:0, fail:0, skip:0, other:0};
+  list.forEach(l => {
+    const k = _ppKind(String(l.status||'SKIP').toUpperCase());
+    counts[k] = (counts[k]||0) + 1;
+  });
   const paperMode = layers.paper_mode !== false;
   const total = list.length || 9;
   const passPct = total ? Math.round(100 * (counts.pass || 0) / total) : 0;
@@ -2131,7 +2188,7 @@ function renderPipeline(layers, quality, session) {
   html += '<div class="pp-section">';
   // Header
   html += '<div class="pp-head">';
-  html += '<div class="pp-head-title">❖ 9-Layer Pipeline</div>';
+  html += '<div class="pp-head-title">❖ ' + total + '-Layer Pipeline</div>';
   html += '<div class="pp-head-right">' + (counts.pass||0) + '/' + total + ' PASS<span class="big">' + passPct + '%</span></div>';
   html += '</div>';
   // Summary chips + global bar
@@ -2748,6 +2805,85 @@ async function loadNews() {
 function renderNewsTab(d) {
   $('newsPanel').innerHTML = (d.provider?'<div style="margin-bottom:8px;font-size:9px;color:var(--text3)">Source: '+esc(d.provider)+'</div>':'') +
     ((d.items||[]).map(n=>'<div class="news-item"><span class="news-time">'+new Date(n.ts).toLocaleTimeString('en-GB')+'</span> <span class="news-tag '+n.sentiment+'">'+esc(n.sentiment)+'</span><div class="news-title">'+esc(n.title)+'</div></div>').join('') || '<div style="color:var(--text3)">No news available</div>');
+}
+
+/* ── Geopolitical Tab — Layer 10 RSS scorer ── */
+async function loadGeopolitical() {
+  try { const d=await(await fetch('/api/geopolitical')).json(); renderGeopolitical(d); }
+  catch(_){ $('geoPanel').innerHTML='<div style="color:var(--text3)">Geopolitical data unavailable</div>'; }
+}
+function _geoScoreColor(s) {
+  const v = Number(s) || 0;
+  if (v >=  0.5) return 'var(--green)';
+  if (v >=  0.1) return 'var(--cyan)';
+  if (v <= -0.5) return 'var(--red)';
+  if (v <= -0.1) return 'var(--orange)';
+  return 'var(--text2)';
+}
+function _geoScoreLabel(s) {
+  const v = Number(s) || 0;
+  if (v >=  0.5) return 'STRONG LONG';
+  if (v >=  0.1) return 'LONG BIAS';
+  if (v <= -0.5) return 'STRONG SHORT';
+  if (v <= -0.1) return 'SHORT BIAS';
+  return 'NEUTRAL';
+}
+function renderGeopolitical(d) {
+  if (!d || d.available === false) {
+    const reason = (d && (d.reason || d.error)) || 'feed not configured';
+    $('geoPanel').innerHTML = '<div style="color:var(--text3)">Geopolitical feed: '+esc(reason)+'</div>';
+    return;
+  }
+  const errs = d.errors || {};
+  const errTotal = (errs.dns||0)+(errs.http||0)+(errs.parse||0)+(errs.other||0);
+  let h = '<div class="metrics">';
+  h += '<div class="metric"><div class="metric-val">'+(d.polls||0)+'</div><div class="metric-lbl">RSS Polls</div></div>';
+  h += '<div class="metric"><div class="metric-val">'+(d.articles||0)+'</div><div class="metric-lbl">Articles</div></div>';
+  h += '<div class="metric"><div class="metric-val">'+(d.events||0)+'</div><div class="metric-lbl">Scored Events</div></div>';
+  h += '<div class="metric"><div class="metric-val" style="color:'+(errTotal?'var(--orange)':'var(--text2)')+'">'+errTotal+'</div><div class="metric-lbl">Errors</div></div>';
+  h += '<div class="metric"><div class="metric-val">'+(d.not_modified||0)+'</div><div class="metric-lbl">304 Not-Mod</div></div>';
+  h += '</div>';
+
+  const symbols = d.symbols || {};
+  const keys = Object.keys(symbols);
+  h += '<div style="font:600 10px \'Inter\';color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Per-Symbol Scores</div>';
+  if (!keys.length) {
+    h += '<div style="color:var(--text3)">No symbol scores yet — feed has not received scoreable events.</div>';
+  } else {
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">';
+    for (const sym of keys) {
+      const s = symbols[sym] || {};
+      const sc = Number(s.score)||0;
+      const evt = Number(s.events)||0;
+      const open = !!s.trading_open;
+      const color = _geoScoreColor(sc);
+      const label = _geoScoreLabel(sc);
+      const barPct = Math.min(100, Math.max(0, Math.abs(sc)*100));
+      h += '<div style="border:1px solid var(--border);border-radius:6px;padding:10px;background:var(--bg2)">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:center">';
+      h += '<span style="font:700 12px \'JetBrains Mono\';color:var(--text1)">'+esc(sym)+'</span>';
+      h += '<span style="font:600 9px \'Inter\';color:'+(open?'var(--green)':'var(--text3)')+'">'+(open?'● OPEN':'○ CLOSED')+'</span>';
+      h += '</div>';
+      h += '<div style="margin-top:6px;font:700 18px \'JetBrains Mono\';color:'+color+'">'+(sc>=0?'+':'')+sc.toFixed(2)+'</div>';
+      h += '<div style="font:600 9px \'Inter\';color:'+color+';letter-spacing:.5px">'+label+'</div>';
+      h += '<div style="margin-top:8px;height:4px;background:var(--bg1);border-radius:2px;overflow:hidden"><span style="display:block;height:100%;width:'+barPct+'%;background:'+color+'"></span></div>';
+      h += '<div style="margin-top:6px;font:10px \'Inter\';color:var(--text3)">'+evt+' event'+(evt===1?'':'s')+' in window</div>';
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+
+  // Error breakdown
+  if (errTotal) {
+    h += '<div style="font:600 10px \'Inter\';color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Error Breakdown</div>';
+    h += '<div style="display:flex;gap:14px;font:11px \'JetBrains Mono\';color:var(--text2)">';
+    h += '<span>DNS <b style="color:var(--orange)">'+(errs.dns||0)+'</b></span>';
+    h += '<span>HTTP <b style="color:var(--orange)">'+(errs.http||0)+'</b></span>';
+    h += '<span>Parse <b style="color:var(--orange)">'+(errs.parse||0)+'</b></span>';
+    h += '<span>Other <b style="color:var(--orange)">'+(errs.other||0)+'</b></span>';
+    h += '</div>';
+  }
+  $('geoPanel').innerHTML = h;
 }
 
 /* ── Logs Tab ── */
