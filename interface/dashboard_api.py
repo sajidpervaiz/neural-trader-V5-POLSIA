@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hmac
 import json
 import os
 import re
+import socket
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from typing import Any
 
 from loguru import logger
@@ -80,6 +82,10 @@ _market_cache: dict[str, Any] = {"coins": [], "ts": 0.0}  # TTL cache for market
 _exchange_cache: dict[str, tuple[float, Any]] = {}  # key -> (expiry_ts, data)
 _EXCHANGE_CACHE_TTL = 5.0  # seconds
 
+# ── TTL cache for /api/layers (cold get_quality_preview runs full ML+SMC+HTF pipeline) ─
+_layers_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_LAYERS_CACHE_TTL = 2.5  # seconds; sits under get_quality_preview's 3s inner cache
+
 def _cache_get(key: str) -> Any | None:
     entry = _exchange_cache.get(key)
     if entry and entry[0] > time.monotonic():
@@ -139,6 +145,7 @@ def build_app(
     reconciliation_result: Any = None,
     sqlite_store: Any = None,
     metrics: Any = None,
+    geopolitical_feed: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -154,15 +161,11 @@ def build_app(
 
     dashboard_cfg = config.get_value("monitoring", "dashboard_api", default={}) or {}
     cors_origins = dashboard_cfg.get("allow_origins") or ["http://localhost", "http://127.0.0.1"]
-    # In paper mode, allow all origins for dev convenience (Codespace proxies, etc.)
-    if config.paper_mode:
-        cors_origins = ["*"]
-    # Block wildcard CORS in non-paper (live) mode
-    if not config.paper_mode and "*" in cors_origins:
-        logger.warning(
-            "CORS wildcard '*' blocked in live mode — restricting to localhost only"
-        )
-        cors_origins = [o for o in cors_origins if o != "*"] or ["http://localhost"]
+    # Wildcard CORS is never safe — even in paper mode it lets any site the user
+    # visits issue state-changing calls against the local dashboard.
+    if "*" in cors_origins:
+        logger.warning("CORS wildcard '*' removed — falling back to localhost-only origins")
+        cors_origins = [o for o in cors_origins if o != "*"] or ["http://localhost", "http://127.0.0.1"]
     auth_cfg = dashboard_cfg.get("auth", {}) if hasattr(dashboard_cfg, "get") else {}
     if not isinstance(auth_cfg, dict):
         auth_cfg = {}
@@ -171,6 +174,7 @@ def build_app(
     api_key = str(auth_cfg.get("api_key", "") or "").strip()
     rate_limit_per_min = int(auth_cfg.get("rate_limit_per_min", 120))
     allow_unauthenticated_non_paper = bool(auth_cfg.get("allow_unauthenticated_non_paper", False))
+    trusted_proxy_hops = int(auth_cfg.get("trusted_proxy_hops", 0))
 
     # Secure-by-default posture: non-paper mode requires API auth unless explicitly overridden.
     if not config.paper_mode and not require_api_key and not allow_unauthenticated_non_paper:
@@ -179,49 +183,66 @@ def build_app(
             "Enabling API key requirement automatically for non-paper mode; "
             "set monitoring.dashboard_api.auth.allow_unauthenticated_non_paper=true to override"
         )
+    # /health leaks equity/positions/kill-switch state — gate it like everything else.
+    # /livez is a plain liveness probe, safe to expose.
     exempt_paths = {
         "/",
-        "/health",
+        "/livez",
         "/docs",
         "/openapi.json",
         "/redoc",
     }
 
-    # In-memory limiter is sufficient for single-instance Tier 0 deployments.
-    ip_rate_state: dict[str, dict[str, int]] = defaultdict(lambda: {"window_start": 0, "count": 0})
+    # LRU-bounded in-memory limiter — prevents unbounded growth from unique-IP floods.
+    _MAX_RL_IPS = 10_000
+    ip_rate_state: OrderedDict[str, dict[str, int]] = OrderedDict()
+
+    def _client_ip(request: Request) -> str:
+        if trusted_proxy_hops > 0:
+            xff = request.headers.get("x-forwarded-for", "") or ""
+            chain = [p.strip() for p in xff.split(",") if p.strip()]
+            if len(chain) >= trusted_proxy_hops:
+                return chain[-trusted_proxy_hops]
+        return request.client.host if request.client else "unknown"
 
     @app.middleware("http")
     async def api_guard(request: Request, call_next):
         path = request.url.path
-        if path not in exempt_paths:
-            if rate_limit_per_min > 0:
-                ip = request.client.host if request.client else "unknown"
-                now = int(time.time())
-                state = ip_rate_state[ip]
-                if now - state["window_start"] >= 60:
-                    state["window_start"] = now
-                    state["count"] = 0
-                state["count"] += 1
-                if state["count"] > rate_limit_per_min:
-                    return JSONResponse(status_code=429, content={"detail": "rate_limit_exceeded"})
+        if path in exempt_paths:
+            return await call_next(request)
 
-            if require_api_key and api_key:
-                provided = request.headers.get("x-api-key")
-                if not provided:
-                    auth_header = request.headers.get("authorization", "")
-                    if auth_header.lower().startswith("bearer "):
-                        provided = auth_header[7:].strip()
-                if not hmac.compare_digest(provided, api_key):
-                    return JSONResponse(status_code=401, content={"detail": "unauthorized"})
-            elif require_api_key and not api_key:
+        if rate_limit_per_min > 0:
+            ip = _client_ip(request)
+            now = int(time.time())
+            state = ip_rate_state.get(ip) or {"window_start": now, "count": 0}
+            if now - state["window_start"] >= 60:
+                state["window_start"] = now
+                state["count"] = 0
+            state["count"] += 1
+            ip_rate_state[ip] = state
+            ip_rate_state.move_to_end(ip)
+            if len(ip_rate_state) > _MAX_RL_IPS:
+                ip_rate_state.popitem(last=False)
+            if state["count"] > rate_limit_per_min:
+                return JSONResponse(status_code=429, content={"detail": "rate_limit_exceeded"})
+
+        if require_api_key:
+            if not api_key:
                 return JSONResponse(status_code=503, content={"detail": "api_auth_misconfigured"})
+            provided = request.headers.get("x-api-key") or ""
+            if not provided:
+                auth_header = request.headers.get("authorization", "") or ""
+                if auth_header.lower().startswith("bearer "):
+                    provided = auth_header[7:].strip()
+            if not hmac.compare_digest(provided.encode("utf-8"), api_key.encode("utf-8")):
+                return JSONResponse(status_code=401, content={"detail": "unauthorized"})
 
         return await call_next(request)
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
-        allow_methods=["*"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         allow_headers=["*"],
     )
 
@@ -277,6 +298,11 @@ def build_app(
             "config": "/config/summary",
         }
 
+    @app.get("/livez")
+    async def livez() -> dict[str, Any]:
+        """Unauthenticated liveness probe — no sensitive data."""
+        return {"ok": True, "uptime_seconds": int(time.time()) - app.state.started_at}
+
     @app.get("/health")
     async def health() -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -285,6 +311,7 @@ def build_app(
             "timestamp": int(time.time()),
             "uptime_seconds": int(time.time()) - app.state.started_at,
         }
+        component_errors: list[str] = []
 
         # Risk snapshot
         if risk_manager is not None:
@@ -297,8 +324,10 @@ def build_app(
                     "kill_switch": getattr(rm, "kill_switch", False),
                     "daily_loss": getattr(rm, "daily_loss", 0.0),
                 }
-            except Exception:
+            except Exception as exc:
+                logger.exception("health: risk snapshot failed")
                 result["risk"] = {"error": "unavailable"}
+                component_errors.append(f"risk:{type(exc).__name__}")
 
         # Safe mode
         try:
@@ -310,8 +339,9 @@ def build_app(
                     "active": status.get("safe_mode_active", False),
                     "reasons": [r["reason"] for r in status.get("active_reasons", [])],
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("health: safe_mode status failed")
+            component_errors.append(f"safe_mode:{type(exc).__name__}")
 
         # Alert manager
         try:
@@ -319,8 +349,9 @@ def build_app(
             am = getattr(app.state, "alert_manager", None)
             if am is not None and isinstance(am, AlertManager):
                 result["alerts"] = am.get_status()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("health: alert_manager status failed")
+            component_errors.append(f"alerts:{type(exc).__name__}")
 
         # Component health (if a HealthChecker is attached)
         try:
@@ -337,8 +368,15 @@ def build_app(
                     }
                     for name, comp in hcr.components.items()
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("health: component checker failed")
+            component_errors.append(f"components:{type(exc).__name__}")
+
+        if component_errors:
+            # Only downgrade if HealthChecker didn't already set a richer status.
+            if result["status"] == "ok":
+                result["status"] = "degraded"
+            result["component_errors"] = component_errors
 
         return result
 
@@ -1320,6 +1358,30 @@ def build_app(
             logger.debug("News direct fetch error: {}", exc)
         return {"provider": "unavailable", "items": []}
 
+    # ── /api/geopolitical — Layer 10 RSS scorer snapshot ──────────────────
+    @app.get("/api/geopolitical")
+    async def api_geopolitical() -> dict[str, Any]:
+        if geopolitical_feed is None:
+            return {"available": False, "reason": "geopolitical feed not configured"}
+        try:
+            stats = geopolitical_feed.stats()
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+        return {
+            "available": True,
+            "polls": stats.get("polls", 0),
+            "articles": stats.get("articles", 0),
+            "events": stats.get("events", 0),
+            "errors": {
+                "dns": stats.get("errors_dns", 0),
+                "http": stats.get("errors_http", 0),
+                "parse": stats.get("errors_parse", 0),
+                "other": stats.get("errors_other", 0),
+            },
+            "not_modified": stats.get("not_modified", 0),
+            "symbols": stats.get("scorer", {}),
+        }
+
     # ── /api/system/data-sources — module source map ──────────────────────
     @app.get("/api/system/data-sources")
     async def api_data_sources() -> dict[str, Any]:
@@ -2215,7 +2277,7 @@ def build_app(
             "atr_position_sizing_enabled": bool(risk_cfg.get("atr_stop", {}).get("enabled")),
             "ai_agent_enabled": bool(agent_status.get("enabled", ai_cfg.get("enabled", True))),
             "ai_agent_provider": str(agent_status.get("provider", ai_cfg.get("provider", "local"))),
-            "ai_agent_model": str(agent_status.get("model", ai_cfg.get("model", "claude-3-5-sonnet-latest"))),
+            "ai_agent_model": str(agent_status.get("model", ai_cfg.get("model", "claude-sonnet-4-6"))),
             "ai_agent_api_key": _mask(_get_ai_key(ai_cfg)),
             "ai_agent_timeout_seconds": float(agent_status.get("timeout_seconds", ai_cfg.get("timeout_seconds", 8.0)) or 8.0),
             "ai_agent_remote_weight": float(ai_cfg.get("remote_weight", 0.35) or 0.35),
@@ -2287,9 +2349,9 @@ def build_app(
 
         # ── Telegram notifications ──
         notif = config._data.setdefault("notifications", {}).setdefault("telegram", {})
-        tg_token = body.get("telegram_bot_token", "")
+        tg_token = body.get("telegram_bot_token", "")  # noqa: S105 — user-supplied, not hardcoded
         tg_chat = body.get("telegram_chat_id", "")
-        if tg_token and tg_token != "****":
+        if tg_token and tg_token != "****":  # noqa: S105 — sentinel mask, not a secret
             notif["bot_token"] = tg_token
         if tg_chat:
             notif["chat_id"] = tg_chat
@@ -2298,7 +2360,7 @@ def build_app(
         ai_cfg = config._data.setdefault("ai_agent", {})
         ai_cfg["enabled"] = bool(body.get("ai_agent_enabled", ai_cfg.get("enabled", True)))
         ai_cfg["provider"] = str(body.get("ai_agent_provider", ai_cfg.get("provider", "local")) or "local")
-        default_model = "gpt-4o-mini" if ai_cfg["provider"] == "openai" else "claude-3-5-sonnet-latest"
+        default_model = "gpt-4o-mini" if ai_cfg["provider"] == "openai" else "claude-sonnet-4-6"
         ai_cfg["model"] = str(body.get("ai_agent_model", ai_cfg.get("model", default_model)) or default_model)
         key_val = body.get("ai_agent_api_key", "")
         if key_val and key_val != "****":
@@ -2320,7 +2382,7 @@ def build_app(
             signal_generator.configure_agent(payload={
                 "enabled": ai_cfg.get("enabled", True),
                 "provider": ai_cfg.get("provider", "local"),
-                "model": ai_cfg.get("model", "claude-3-5-sonnet-latest"),
+                "model": ai_cfg.get("model", "claude-sonnet-4-6"),
                 "api_key": ai_cfg.get("api_key", ""),
                 "timeout_seconds": ai_cfg.get("timeout_seconds", 8.0),
                 "remote_weight": ai_cfg.get("remote_weight", 0.35),
@@ -2351,7 +2413,7 @@ def build_app(
             "ai_agent": {
                 "enabled": ai_cfg.get("enabled", True),
                 "provider": ai_cfg.get("provider", "local"),
-                "model": ai_cfg.get("model", "claude-3-5-sonnet-latest"),
+                "model": ai_cfg.get("model", "claude-sonnet-4-6"),
                 "remote_weight": ai_cfg.get("remote_weight", 0.35),
                 "api_configured": bool(ai_cfg.get("api_key", "")),
             },
@@ -2544,6 +2606,9 @@ def build_app(
     @app.get("/api/layers")
     async def api_layers() -> dict[str, Any]:
         """Return current state of the 9-layer confirmation pipeline."""
+        cached = _layers_cache.get("_")
+        if cached and (time.monotonic() - cached[0]) < _LAYERS_CACHE_TTL:
+            return cached[1]
         layers = [
             {"id": 1, "layer_index": "L0", "name": "Session Filter", "description": "Trading session & killzone enforcement"},
             {"id": 2, "layer_index": "L1", "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
@@ -2603,6 +2668,10 @@ def build_app(
         if signal_generator is not None:
             last = getattr(signal_generator, '_last_layer_status', {}) or {}
             quality = getattr(signal_generator, '_last_quality_breakdown', {}) or {}
+            if (int(quality.get("total", 0) or 0) <= 0) and hasattr(signal_generator, "get_quality_preview"):
+                preview = await asyncio.to_thread(signal_generator.get_quality_preview)
+                if isinstance(preview, dict) and preview.get("components"):
+                    quality = {**quality, **preview}
             components = quality.get("components", {}) or {}
             fallback_scores = {
                 "session_filter": 100 if not (quality.get("rejected_at") == "L1_Session") else 0,
@@ -2619,12 +2688,12 @@ def build_app(
                 raw_status = str(last.get(key, "UNKNOWN") or "UNKNOWN").upper()
                 detail = str(last.get(f"{key}_detail", "") or "")
 
-                if raw_status == "UNKNOWN" and key in fallback_scores:
+                if raw_status in ("UNKNOWN", "PENDING") and key in fallback_scores:
                     raw_status = _score_to_status(fallback_scores.get(key))
                     if not detail:
                         detail = f"score={fallback_scores.get(key, 0)}"
 
-                if key == "risk_gate" and raw_status == "UNKNOWN":
+                if key == "risk_gate" and raw_status in ("UNKNOWN", "PENDING"):
                     snap = risk_manager.get_risk_snapshot() if risk_manager is not None else {}
                     blocked = bool(snap.get("kill_switch_active", False) or snap.get("circuit_breaker_tripped", False))
                     raw_status = "FAIL" if blocked else "PASS"
@@ -2674,12 +2743,14 @@ def build_app(
             else:
                 counts["other"] += 1
 
-        return {
+        response = {
             "layers": layers,
             "total": 9,
             "counts": counts,
             "paper_mode": bool(getattr(signal_generator, "_is_paper_mode", lambda: True)()) if signal_generator is not None else True,
         }
+        _layers_cache["_"] = (time.monotonic(), response)
+        return response
 
     # ── §5 Spec: Session & killzone status ────────────────────────────────
     @app.get("/api/session")
@@ -2752,6 +2823,16 @@ def build_app(
         if signal_generator is not None and hasattr(signal_generator, "configure_agent"):
             return signal_generator.configure_agent(body)
         return {"attached": False, "enabled": False, "mode": "off"}
+
+    @app.post("/api/agent/test")
+    async def api_agent_test() -> dict[str, Any]:
+        """Live-test the configured AI provider with a tiny round-trip prompt."""
+        if signal_generator is None or not hasattr(signal_generator, "_ai_agent") or signal_generator._ai_agent is None:
+            return {"success": False, "reason": "agent_unavailable", "message": "AI agent is not attached."}
+        try:
+            return await signal_generator._ai_agent.test_connection()
+        except Exception as exc:
+            return {"success": False, "reason": "exception", "message": str(exc)[:240]}
 
     @app.post("/api/agent/chat")
     async def api_agent_chat(request: Request) -> dict[str, Any]:
@@ -3103,7 +3184,7 @@ def build_app(
 
         try:
             slicing_cfg = config.get_value("execution", "slicing") or {}
-            reveal_pct = float(((slicing_cfg.get("iceberg") or {}).get("default_reveal_pct", 0.20)))
+            reveal_pct = float((slicing_cfg.get("iceberg") or {}).get("default_reveal_pct", 0.20))
             iceberg["reveal_pct"] = reveal_pct
         except Exception:
             pass
@@ -3533,9 +3614,32 @@ async def run_dashboard(config: Config, app: Any) -> None:
     if not _FASTAPI or app is None:
         return
     api_cfg = config.get_value("monitoring", "dashboard_api") or {}
-    host = api_cfg.get("host", "0.0.0.0")
+    host = api_cfg.get("host", "0.0.0.0")  # noqa: S104  # nosec B104 — auth-gated in live mode
     port = int(api_cfg.get("port", 8000))
-    server_config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    # Pre-bind the listening socket so we can surface a friendly error before
+    # handing it to uvicorn, which otherwise logs OSError internally and
+    # silently returns from serve().
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        sock.close()
+        if exc.errno == errno.EADDRINUSE:
+            logger.critical(
+                "Dashboard port {}:{} is already in use — another bot instance is likely running. "
+                "Stop it (e.g., `pkill -f 'python3 main.py'`) and retry.",
+                host, port,
+            )
+            raise SystemExit(1) from exc
+        raise
+    sock.listen(2048)
+    sock.setblocking(False)
+
+    server_config = uvicorn.Config(app, fd=sock.fileno(), log_level="warning")
     server = uvicorn.Server(server_config)
     logger.info("Dashboard API starting on http://{}:{}", host, port)
-    await server.serve()
+    try:
+        await server.serve()
+    finally:
+        sock.close()
