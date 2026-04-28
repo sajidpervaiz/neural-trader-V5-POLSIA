@@ -12,7 +12,6 @@ Implements:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -127,15 +126,29 @@ class SmartMoneyAnalyzer:
                    for _ in [0]) if n > i + pb else False:
                 swing_lows.append((i, l))
         # Also get from pre-computed columns if available
+        # df.index.get_loc(label) can return int OR slice OR boolean array when
+        # the index isn't unique. The downstream sort() then crashes with
+        # "'<' not supported between instances of 'slice' and 'int'". Use
+        # get_indexer([label]) which always yields an integer position (or -1
+        # for a missing label), then collapse any non-integer fallthrough.
+        def _to_int_pos(label: object) -> int | None:
+            if isinstance(label, int):
+                return label
+            try:
+                pos = int(df.index.get_indexer([label])[0])
+                return pos if pos >= 0 else None
+            except Exception:
+                return None
+
         if "swing_high" in df.columns:
             for i, v in df["swing_high"].dropna().items():
-                idx = df.index.get_loc(i) if not isinstance(i, int) else i
-                if (idx, v) not in swing_highs:
+                idx = _to_int_pos(i)
+                if idx is not None and (idx, v) not in swing_highs:
                     swing_highs.append((idx, v))
         if "swing_low" in df.columns:
             for i, v in df["swing_low"].dropna().items():
-                idx = df.index.get_loc(i) if not isinstance(i, int) else i
-                if (idx, v) not in swing_lows:
+                idx = _to_int_pos(i)
+                if idx is not None and (idx, v) not in swing_lows:
                     swing_lows.append((idx, v))
         swing_highs.sort(key=lambda x: x[0])
         swing_lows.sort(key=lambda x: x[0])
