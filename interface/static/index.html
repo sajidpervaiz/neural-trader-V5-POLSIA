@@ -419,6 +419,57 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
   .hdr-btn,.tab,.tf-btn,.btm-tab,.btn,.close-btn,.panel-hdr{min-height:36px}
   .wl-item{min-height:40px}
 }
+
+/* ── Signal-flow tab + clickable pipeline drawer ─────────────────────── */
+.pp-card{cursor:pointer}
+.pp-card:hover{border-color:var(--blue) !important}
+.pp-card.selected{box-shadow:0 0 0 2px var(--blue) inset}
+.flow-wrap{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,420px);gap:14px}
+@media (max-width:1100px){.flow-wrap{grid-template-columns:1fr}}
+.flow-col{background:var(--bg1);border:1px solid var(--border);border-radius:8px;padding:14px}
+.flow-pane{position:sticky;top:14px;align-self:start;max-height:calc(100vh - 200px);overflow-y:auto}
+.flow-chain{display:flex;flex-direction:column;align-items:stretch;gap:0}
+.flow-node{position:relative;background:var(--bg0);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:6px;padding:10px 12px;cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:10px}
+.flow-node:hover{border-color:var(--blue)}
+.flow-node.selected{box-shadow:0 0 0 2px var(--blue) inset}
+.flow-node.pass{border-left-color:var(--green)}
+.flow-node.soft{border-left-color:var(--orange)}
+.flow-node.fail{border-left-color:var(--red)}
+.flow-node.skip{border-left-color:var(--text3)}
+.flow-node.dim{opacity:.45}
+.flow-node.terminal{background:var(--bg2);font-weight:700}
+.flow-node.terminal.pass{border-color:var(--green);color:var(--green)}
+.flow-node.terminal.fail{border-color:var(--red);color:var(--red)}
+.flow-node-id{font:700 10px 'JetBrains Mono';color:var(--text3);letter-spacing:.05em;min-width:32px}
+.flow-node-name{font:700 12px 'Inter';color:var(--text1);flex:1;min-width:0}
+.flow-node-pill{font:700 10px 'JetBrains Mono';letter-spacing:.04em;padding:2px 6px;border-radius:3px;border:1px solid currentColor}
+.flow-node-pill.pass{color:var(--green)}.flow-node-pill.soft{color:var(--orange)}.flow-node-pill.fail{color:var(--red)}.flow-node-pill.skip{color:var(--text3)}
+.flow-node-score{font:600 10px 'JetBrains Mono';color:var(--text2);min-width:60px;text-align:right}
+.flow-arrow{display:flex;flex-direction:column;align-items:center;color:var(--border);height:20px;line-height:1}
+.flow-arrow.pass{color:var(--green)}
+.flow-arrow.soft{color:var(--orange)}
+.flow-arrow.fail{color:var(--red)}
+.flow-arrow.dim{color:var(--bg3)}
+.flow-arrow svg{width:14px;height:18px}
+.flow-detail h4{font:700 13px 'Inter';color:var(--text1);margin:0 0 4px}
+.flow-detail .meta{font:600 10px 'JetBrains Mono';color:var(--text3);margin-bottom:10px;letter-spacing:.04em}
+.flow-detail .desc{font:11px 'Inter';color:var(--text2);margin-bottom:12px}
+.flow-detail .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;font:11px 'JetBrains Mono';margin-bottom:12px}
+.flow-detail .kv .k{color:var(--text3)}
+.flow-detail .kv .v{color:var(--text1)}
+.flow-detail .section{border-top:1px solid var(--border);padding-top:10px;margin-top:10px}
+.flow-detail .bar{height:6px;background:var(--bg2);border-radius:3px;overflow:hidden;margin:3px 0 8px}
+.flow-detail .bar>span{display:block;height:100%}
+.flow-summary{padding:6px 0}
+.flow-summary .big{font:800 22px 'JetBrains Mono';margin:6px 0}
+
+/* Pipeline drawer (slide-in from right of pipeline panel) */
+.layer-drawer-bd{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:998;opacity:0;pointer-events:none;transition:opacity .18s}
+.layer-drawer-bd.open{opacity:1;pointer-events:auto}
+.layer-drawer{position:fixed;top:0;right:0;width:min(420px,100vw);height:100vh;background:var(--bg1);border-left:1px solid var(--border);z-index:999;transform:translateX(105%);transition:transform .22s ease;overflow-y:auto;padding:16px;box-shadow:-8px 0 24px rgba(0,0,0,.45)}
+.layer-drawer.open{transform:translateX(0)}
+.layer-drawer .close{position:absolute;top:10px;right:10px;background:transparent;border:1px solid var(--border);color:var(--text2);width:26px;height:26px;border-radius:4px;cursor:pointer;font:700 14px sans-serif}
+.layer-drawer .close:hover{color:var(--text1);border-color:var(--text1)}
 </style>
 </head>
 <body>
@@ -460,6 +511,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <button class="tab active" data-tab="chart">📊 Chart</button>
         <button class="tab" data-tab="risk">🛡 ARMS</button>
         <button class="tab" data-tab="pipeline">🔗 Pipeline</button>
+        <button class="tab" data-tab="flow">🔬 Flow</button>
         <button class="tab" data-tab="portfolio">💼 Portfolio</button>
         <button class="tab" data-tab="news">📰 News</button>
         <button class="tab" data-tab="geo">🌍 Geo</button>
@@ -551,6 +603,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: 9-Layer Pipeline -->
       <div class="tab-content" id="tc-pipeline"><div class="panel-body" id="pipelinePanel" style="padding:14px"></div></div>
+
+      <div class="tab-content" id="tc-flow"><div class="panel-body" id="flowPanel" style="padding:14px"></div></div>
 
       <!-- Tab: Portfolio -->
       <div class="tab-content" id="tc-portfolio"><div class="panel-body" id="portfolioPanel" style="padding:14px"></div></div>
@@ -885,6 +939,7 @@ function bindTabs() {
     if (t.dataset.tab === 'chart') setTimeout(resizeChart, 50);
     if (t.dataset.tab === 'risk') loadArms();
     if (t.dataset.tab === 'pipeline') loadPipeline();
+    if (t.dataset.tab === 'flow') loadFlow();
     if (t.dataset.tab === 'portfolio') loadPortfolio();
     if (t.dataset.tab === 'news') loadNews();
     if (t.dataset.tab === 'geo') loadGeopolitical();
@@ -2115,13 +2170,16 @@ function renderArms(d) {
 /* ── 9-Layer Pipeline ── */
 async function loadPipeline() {
   try {
-    const [layers, quality, session, geo] = await Promise.all([
-      (await fetch('/api/layers')).json(),
-      (await fetch('/api/quality')).json(),
-      (await fetch('/api/session')).json(),
-      (await fetch('/api/geopolitical')).json().catch(() => ({available:false})),
-    ]);
-    renderPipeline(layers, quality, session, geo);
+    // Use the shared loader so the drawer can reuse the same ctx (no redundant fetches).
+    const ctx = await loadFlowCtx();
+    renderPipeline(ctx.raw || {layers: ctx.layers}, ctx.quality, ctx.session, ctx.geo);
+    // If drawer was open, refresh its body with the latest snapshot.
+    if (window.__pipelineSelectedId && $('layerDrawer') && $('layerDrawer').classList.contains('open')) {
+      const layer = (ctx.layers||[]).find(l => l.id === window.__pipelineSelectedId);
+      if (layer) $('layerDrawerBody').innerHTML = renderLayerDetail(layer, ctx);
+      const card = document.querySelector('.pp-card[data-layer-id="'+window.__pipelineSelectedId+'"]');
+      if (card) card.classList.add('selected');
+    }
   } catch(e) { $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
 }
 // Previous score map, keyed by layer id — used to compute delta between polls
@@ -2226,7 +2284,7 @@ function renderPipeline(layers, quality, session, geo) {
       barPct = Math.min(100, Math.max(0, score));
     }
 
-    html += '<div class="pp-card ' + kind + '">';
+    html += '<div class="pp-card ' + kind + '" data-layer-id="' + l.id + '" onclick="openLayerDrawer(' + l.id + ')">';
     html += '<div class="pp-card-top">';
     html += '<div class="pp-card-id">';
     html += '<span class="pp-card-icon ' + kind + '">' + _ppIcon(kind) + '</span>';
@@ -3111,6 +3169,245 @@ function toggleSidebar() {
   $('sidebar').classList.toggle('open');
   $('sidebarOverlay').classList.toggle('show');
   setTimeout(resizeChart, 350);
+}
+
+/* ── Signal-Flow tab + Pipeline drawer ─────────────────────────────────
+ * Shared layer-detail rendering used by both:
+ *   - the new "🔬 Flow" tab (right pane)
+ *   - the existing Pipeline tab (slide-in drawer on card click)
+ * Single fetch fanout (loadFlowCtx) drives both views. */
+window.__flowSelectedId = null;       // currently-selected layer id (1..10)
+window.__flowCtx = null;              // last-loaded context bundle
+
+async function loadFlowCtx() {
+  const [layers, quality, session, geo, status] = await Promise.all([
+    fetch('/api/layers').then(r=>r.json()).catch(()=>({layers:[]})),
+    fetch('/api/quality').then(r=>r.json()).catch(()=>({})),
+    fetch('/api/session').then(r=>r.json()).catch(()=>({})),
+    fetch('/api/geopolitical').then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/status').then(r=>r.json()).catch(()=>({})),
+  ]);
+  // Synthesize the L10 (Geopolitical) layer entry the same way the Pipeline tab does.
+  const list = (layers.layers || []).slice();
+  if (geo && geo.available !== false) {
+    const syms = geo.symbols || {};
+    let topSym=null,topAbs=-1,topScore=0;
+    for (const k of Object.keys(syms)) {
+      const sc = Number((syms[k]||{}).score)||0;
+      if (Math.abs(sc) > topAbs) { topAbs=Math.abs(sc); topSym=k; topScore=sc; }
+    }
+    let st='SKIP', detail = (geo.events||0)+' events / '+(geo.polls||0)+' polls';
+    if (topSym !== null) {
+      detail = topSym+' '+(topScore>=0?'+':'')+topScore.toFixed(2)+' · '+(geo.events||0)+' events';
+      if (topAbs >= 0.5) st = 'PASS';
+      else if (topAbs >= 0.1) st = 'SOFT';
+      else st = 'SKIP';
+    }
+    list.push({id:10, layer_index:'L10', name:'Geopolitical',
+      description:'RSS-driven per-symbol news factor',
+      status:st, score: topAbs>=0?topAbs*100:0, threshold:50, detail});
+  }
+  window.__flowCtx = {layers:list, quality, session, geo, status, raw:layers};
+  return window.__flowCtx;
+}
+
+function renderLayerDetail(layer, ctx) {
+  if (!layer) return '<div style="color:var(--text3)">Select a layer to inspect.</div>';
+  const idx = layer.layer_index || ('L'+((layer.id||1)-1));
+  const stRaw = String(layer.status||'SKIP').toUpperCase();
+  const kind = _ppKind(stRaw);
+  const score = (layer.score!==null && layer.score!==undefined) ? Number(layer.score) : null;
+  const thr = (layer.threshold!==null && layer.threshold!==undefined) ? Number(layer.threshold) : null;
+  let h = '<div class="flow-detail">';
+  h += '<div class="meta">'+esc(idx)+' · <span class="flow-node-pill '+kind+'">'+esc(stRaw)+'</span></div>';
+  h += '<h4>'+esc(layer.name||'')+'</h4>';
+  h += '<div class="desc">'+esc(layer.description||'')+'</div>';
+  h += '<div class="kv">';
+  h += '<span class="k">Score</span><span class="v">'+(score===null?'—':_ppFmtNum(score,2))+'</span>';
+  h += '<span class="k">Threshold</span><span class="v">'+(thr===null?'—':_ppFmtNum(thr,2))+'</span>';
+  h += '<span class="k">Detail</span><span class="v">'+esc(layer.detail||layer.description||'—')+'</span>';
+  h += '</div>';
+
+  // Layer-specific extras
+  if (layer.id === 1 && ctx && ctx.session) {
+    const s = ctx.session.active_session;
+    if (s) {
+      h += '<div class="section"><div class="meta">SESSION CONTEXT</div>';
+      h += '<div class="kv">';
+      h += '<span class="k">Active</span><span class="v">'+esc(String(s.name||'').toUpperCase())+'</span>';
+      h += '<span class="k">UTC</span><span class="v">'+esc(s.start)+':00 — '+esc(s.end)+':00</span>';
+      h += '<span class="k">Size mult</span><span class="v">'+esc(String(s.size_mult||'—'))+'x</span>';
+      h += '<span class="k">Killzone</span><span class="v" style="color:'+(ctx.session.in_killzone?'var(--yellow)':'var(--text2)')+'">'+(ctx.session.in_killzone?'ACTIVE':'inactive')+'</span>';
+      h += '<span class="k">Weekend</span><span class="v" style="color:'+(ctx.session.is_weekend?'var(--red)':'var(--text2)')+'">'+(ctx.session.is_weekend?'HALTED':'open')+'</span>';
+      h += '</div></div>';
+    }
+  }
+  if (layer.id === 8 && ctx && ctx.quality) {  // ML-confidence layer surfaces quality components
+    const comps = ctx.quality.components || {};
+    const componentLabels = {htf_trend:'HTF Trend', technical_confluence:'Technical', smc_confluence:'SMC/ICT', volume_flow:'Volume', regime:'Regime', ml_confidence:'ML Model', liquidity_depth:'Liquidity'};
+    if (Object.keys(comps).length) {
+      h += '<div class="section"><div class="meta">QUALITY COMPONENTS</div>';
+      for (const [k,v] of Object.entries(comps)) {
+        const num = Number(v)||0; const pct = Math.min(100, Math.max(0, num));
+        const lbl = componentLabels[k] || k.replace(/_/g,' ');
+        const col = pct>=70?'var(--green)':pct>=40?'var(--yellow)':'var(--orange)';
+        h += '<div style="display:flex;justify-content:space-between;font:600 10px \'JetBrains Mono\'"><span style="color:var(--text2)">'+esc(lbl)+'</span><span style="color:'+col+'">'+Math.round(num)+'</span></div>';
+        h += '<div class="bar"><span style="width:'+pct+'%;background:'+col+'"></span></div>';
+      }
+      h += '</div>';
+    }
+  }
+  if (layer.id === 9 && ctx && ctx.status) {  // Risk-gate layer surfaces kill-switch / equity
+    const st = ctx.status;
+    h += '<div class="section"><div class="meta">RISK SNAPSHOT</div>';
+    h += '<div class="kv">';
+    h += '<span class="k">Equity</span><span class="v">$'+Number(st.equity||0).toFixed(2)+'</span>';
+    h += '<span class="k">Open positions</span><span class="v">'+Number(st.open_positions||0)+'</span>';
+    h += '<span class="k">Daily P&L</span><span class="v">$'+Number(st.daily_pnl||0).toFixed(2)+'</span>';
+    h += '<span class="k">Kill switch</span><span class="v" style="color:'+(st.kill_switch?'var(--red)':'var(--green)')+'">'+(st.kill_switch?'ENGAGED':'clear')+'</span>';
+    h += '</div></div>';
+  }
+  if (layer.id === 10 && ctx && ctx.geo && ctx.geo.available !== false) {
+    const g = ctx.geo;
+    h += '<div class="section"><div class="meta">RSS FEED STATS</div>';
+    h += '<div class="kv">';
+    h += '<span class="k">Polls</span><span class="v">'+(g.polls||0)+'</span>';
+    h += '<span class="k">Articles</span><span class="v">'+(g.articles||0)+'</span>';
+    h += '<span class="k">Scored events</span><span class="v">'+(g.events||0)+'</span>';
+    const errs = g.errors||{}; const errTotal=(errs.dns||0)+(errs.http||0)+(errs.parse||0)+(errs.other||0);
+    h += '<span class="k">Errors</span><span class="v" style="color:'+(errTotal?'var(--orange)':'var(--text2)')+'">'+errTotal+'</span>';
+    h += '</div></div>';
+    const syms = g.symbols||{};
+    if (Object.keys(syms).length) {
+      h += '<div class="section"><div class="meta">PER-SYMBOL SCORES</div>';
+      for (const sym of Object.keys(syms)) {
+        const s = syms[sym]||{}; const sc = Number(s.score)||0;
+        const col = _geoScoreColor(sc); const pct = Math.min(100, Math.abs(sc)*100);
+        h += '<div style="display:flex;justify-content:space-between;font:600 10px \'JetBrains Mono\'"><span style="color:var(--text2)">'+esc(sym)+'</span><span style="color:'+col+'">'+(sc>=0?'+':'')+sc.toFixed(2)+' · '+(s.events||0)+'ev</span></div>';
+        h += '<div class="bar"><span style="width:'+pct+'%;background:'+col+'"></span></div>';
+      }
+      h += '</div>';
+    }
+  }
+
+  h += '</div>';
+  return h;
+}
+
+function renderFlowSummary(ctx) {
+  if (!ctx) return '<div class="flow-summary">Loading…</div>';
+  const list = ctx.layers || [];
+  let pass=0, soft=0, fail=0, skip=0;
+  list.forEach(l => { const k=_ppKind(String(l.status||'SKIP').toUpperCase()); if(k==='pass')pass++;else if(k==='soft')soft++;else if(k==='fail')fail++;else skip++; });
+  const rejected = list.find(l => _ppKind(String(l.status||'SKIP').toUpperCase()) === 'fail');
+  const passGate = !rejected;
+  const qTotal = Number((ctx.quality||{}).total || 0);
+  const banner = passGate ? '✓ PIPELINE OK' : '✕ REJECTED at '+(rejected.layer_index || ('L'+((rejected.id||1)-1)));
+  const col = passGate ? 'var(--green)' : 'var(--red)';
+  let h = '<div class="flow-summary">';
+  h += '<div class="meta">CURRENT STATE</div>';
+  h += '<div class="big" style="color:'+col+'">'+esc(banner)+'</div>';
+  if (rejected) h += '<div class="desc">Reason: '+esc(rejected.detail || rejected.name)+'</div>';
+  h += '<div class="kv">';
+  h += '<span class="k">Layers</span><span class="v">'+pass+' pass · '+soft+' soft · '+fail+' fail · '+skip+' skip</span>';
+  h += '<span class="k">Quality</span><span class="v">'+qTotal+'/100</span>';
+  h += '<span class="k">Mode</span><span class="v">'+((ctx.raw||{}).paper_mode===false?'LIVE':'PAPER')+'</span>';
+  h += '</div>';
+  h += '<div class="desc" style="margin-top:10px;color:var(--text3)">Click a layer node on the left to inspect its score, threshold, and raw decision data.</div>';
+  h += '</div>';
+  return h;
+}
+
+async function loadFlow() {
+  try { await loadFlowCtx(); renderFlow(); }
+  catch(e){ $('flowPanel').innerHTML='<div style="color:var(--text3)">Flow data unavailable</div>'; }
+}
+function _flowArrowSvg() {
+  return '<svg viewBox="0 0 14 18" aria-hidden="true"><path d="M7 0 V14 M2 9 L7 17 L12 9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+function renderFlow() {
+  const ctx = window.__flowCtx; if (!ctx) return;
+  const list = ctx.layers || [];
+  const rejectIdx = list.findIndex(l => _ppKind(String(l.status||'SKIP').toUpperCase()) === 'fail');
+  const passGate = rejectIdx < 0;
+  // Pre-build chain HTML
+  let chain = '<div class="flow-chain">';
+  // Entry node
+  chain += '<div class="flow-node terminal pass" style="cursor:default"><span class="flow-node-id">►</span><span class="flow-node-name">Market Tick</span></div>';
+  chain += '<div class="flow-arrow pass">'+_flowArrowSvg()+'</div>';
+  list.forEach((l, i) => {
+    const stRaw = String(l.status||'SKIP').toUpperCase();
+    const kind = _ppKind(stRaw);
+    const idx = l.layer_index || ('L'+((l.id||1)-1));
+    const dim = (rejectIdx >= 0 && i > rejectIdx) ? ' dim' : '';
+    const sel = (window.__flowSelectedId === l.id) ? ' selected' : '';
+    const score = (l.score!==null && l.score!==undefined) ? Number(l.score) : null;
+    chain += '<div class="flow-node '+kind+dim+sel+'" data-layer-id="'+l.id+'" onclick="flowSelect('+l.id+')">';
+    chain += '<span class="flow-node-id">'+esc(idx)+'</span>';
+    chain += '<span class="flow-node-name">'+esc(l.name||'')+'</span>';
+    chain += '<span class="flow-node-score">'+(score===null?'—':_ppFmtNum(score,1))+'</span>';
+    chain += '<span class="flow-node-pill '+kind+'">'+esc(stRaw)+'</span>';
+    chain += '</div>';
+    // Arrow to next node
+    if (i < list.length - 1) {
+      const arrowKind = (rejectIdx >= 0 && i >= rejectIdx) ? 'dim' : kind;
+      chain += '<div class="flow-arrow '+arrowKind+'">'+_flowArrowSvg()+'</div>';
+    }
+  });
+  // Terminal arrow + node
+  chain += '<div class="flow-arrow '+(passGate?'pass':'fail')+'">'+_flowArrowSvg()+'</div>';
+  if (passGate) {
+    chain += '<div class="flow-node terminal pass" style="cursor:default"><span class="flow-node-id">✓</span><span class="flow-node-name">Signal Emitted</span></div>';
+  } else {
+    const rj = list[rejectIdx];
+    chain += '<div class="flow-node terminal fail" style="cursor:default"><span class="flow-node-id">✕</span><span class="flow-node-name">Rejected at '+(rj.layer_index||('L'+((rj.id||1)-1)))+'</span></div>';
+  }
+  chain += '</div>';
+
+  // Right pane
+  const sel = list.find(l => l.id === window.__flowSelectedId);
+  const pane = sel ? renderLayerDetail(sel, ctx) : renderFlowSummary(ctx);
+
+  let html = '<div class="flow-wrap">';
+  html += '<div class="flow-col">'+chain+'</div>';
+  html += '<div class="flow-col flow-pane" id="flowPane">'+pane+'</div>';
+  html += '</div>';
+  $('flowPanel').innerHTML = html;
+}
+function flowSelect(id) {
+  window.__flowSelectedId = (window.__flowSelectedId === id) ? null : id;
+  renderFlow();
+}
+
+/* ── Pipeline tab drawer ──────────────────────────────────────────────── */
+function _ensureDrawer() {
+  if ($('layerDrawerBd')) return;
+  const bd = document.createElement('div'); bd.id='layerDrawerBd'; bd.className='layer-drawer-bd';
+  bd.onclick = closeLayerDrawer;
+  const dr = document.createElement('div'); dr.id='layerDrawer'; dr.className='layer-drawer';
+  dr.innerHTML = '<button class="close" onclick="closeLayerDrawer()">×</button><div id="layerDrawerBody" style="margin-top:30px"></div>';
+  document.body.appendChild(bd); document.body.appendChild(dr);
+  document.addEventListener('keydown', e => { if (e.key==='Escape') closeLayerDrawer(); });
+}
+function openLayerDrawer(id) {
+  _ensureDrawer();
+  window.__pipelineSelectedId = id;
+  const ctx = window.__flowCtx;
+  if (!ctx) { loadFlowCtx().then(() => openLayerDrawer(id)); return; }
+  const layer = (ctx.layers||[]).find(l => l.id === id);
+  $('layerDrawerBody').innerHTML = renderLayerDetail(layer, ctx);
+  $('layerDrawer').classList.add('open');
+  $('layerDrawerBd').classList.add('open');
+  // Highlight selected card
+  document.querySelectorAll('.pp-card.selected').forEach(c => c.classList.remove('selected'));
+  const card = document.querySelector('.pp-card[data-layer-id="'+id+'"]');
+  if (card) card.classList.add('selected');
+}
+function closeLayerDrawer() {
+  if ($('layerDrawer')) $('layerDrawer').classList.remove('open');
+  if ($('layerDrawerBd')) $('layerDrawerBd').classList.remove('open');
+  window.__pipelineSelectedId = null;
+  document.querySelectorAll('.pp-card.selected').forEach(c => c.classList.remove('selected'));
 }
 </script>
 </body>
