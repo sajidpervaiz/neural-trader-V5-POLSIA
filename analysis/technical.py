@@ -315,6 +315,58 @@ def _adx_di(
     return adx, di_plus, di_minus
 
 
+# ── Neutral defaults for sanitisation (REQ-IND-006/007) ────────────────────
+# Columns whose neutral fill is the mid-band of an oscillator (0–100 scale).
+_FILL_50: frozenset[str] = frozenset({
+    "rsi_14", "rsi_21", "stoch_k", "stoch_d",
+    "mfi_14", "williams_r", "ult_osc",
+})
+# Columns whose neutral fill is the bar's close price (price-tracking lines).
+_FILL_CLOSE: frozenset[str] = frozenset({
+    "ema_9", "ema_12", "ema_21", "ema_26", "ema_50", "ema_55", "ema_200",
+    "sma_20", "sma_50",
+    "vwap",
+    "bb_upper", "bb_mid", "bb_lower",
+    "kc_upper", "kc_mid", "kc_lower",
+    "donchian_upper", "donchian_lower", "donchian_mid",
+    "tenkan_sen", "kijun_sen", "senkou_a", "senkou_b", "chikou_span",
+    "psar", "supertrend",
+})
+# Sparse markers — NaN at non-pivot rows is the contract; downstream code
+# iterates with .dropna(). Do NOT fill these.
+_PRESERVE_NAN: frozenset[str] = frozenset({"swing_high", "swing_low", "_warmup"})
+
+
+def sanitize_indicators(df: "pd.DataFrame") -> "pd.DataFrame":
+    """REQ-IND-006: never emit NaN/Inf from the indicator engine.
+    REQ-IND-007: surface warmup status when an indicator's lookback isn't met.
+
+    Replaces +/-inf with NaN, fills remaining NaN with column-appropriate
+    neutral defaults, and tags rows where any of the key long-lookback
+    indicators is still warming up.
+    """
+    df = df.replace([np.inf, -np.inf], np.nan)
+    key_warmup_cols = [c for c in ("rsi_14", "ema_21", "macd", "atr_14", "ema_200") if c in df.columns]
+    if key_warmup_cols:
+        df["_warmup"] = df[key_warmup_cols].isna().any(axis=1)
+    else:
+        df["_warmup"] = False
+    close = df.get("close")
+    for col in df.columns:
+        if col in _PRESERVE_NAN:
+            continue
+        series = df[col]
+        if not series.isna().any():
+            continue
+        if col in _FILL_50:
+            df[col] = series.fillna(50.0)
+        elif col in _FILL_CLOSE and close is not None:
+            df[col] = series.fillna(close).fillna(0.0)
+        else:
+            df[col] = series.fillna(0.0)
+    return df
+
+
 class TechnicalIndicators:
     def __init__(self) -> None:
         self._cache: dict[str, Any] = {}
@@ -496,4 +548,7 @@ class TechnicalIndicators:
         midpoint = (high + low) / 2.0
         df["awesome_osc"] = _sma(midpoint, 5) - _sma(midpoint, 34)
 
-        return df.dropna(subset=["rsi_14", "ema_21", "macd"])
+        # REQ-IND-006/007: drop the unusable warmup head, then sanitise the
+        # remainder so downstream consumers never see NaN/Inf.
+        df = df.dropna(subset=["rsi_14", "ema_21", "macd"])
+        return sanitize_indicators(df)
