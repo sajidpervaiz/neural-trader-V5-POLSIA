@@ -120,13 +120,17 @@ class RegimeDetector:
         self._confirmation_candles = confirmation_candles
         self._cooldown_candles = cooldown_candles
 
-        # State machine
+        # State machine — REQ-REG-005 hysteresis is enforced via the
+        # confirmation_candles / cooldown_candles fields. The fields below
+        # are read by RegimeDetector.get_hysteresis_snapshot() so the
+        # dashboard can show "regime since N candles" + any pending switch.
         self._current_regime = MarketRegime.UNKNOWN
         self._candles_in_state = 0
         self._pending_regime: MarketRegime | None = None
         self._pending_count = 0
         self._cooldown_remaining = 0
         self._history: deque[MarketRegime] = deque(maxlen=50)
+        self._last_transition_ts: float = 0.0
 
     def _calc_adx_di(
         self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14,
@@ -326,11 +330,31 @@ class RegimeDetector:
             self._pending_count = 0
             self._cooldown_remaining = self._cooldown_candles
             self._history.append(raw_regime)
+            self._last_transition_ts = time.time()
             logger.info("Regime transition: {} → {} (cooldown={})", old.value, raw_regime.value, self._cooldown_candles)
             return self._current_regime
 
         self._candles_in_state += 1
         return self._current_regime
+
+    def get_hysteresis_snapshot(self) -> dict[str, Any]:
+        """REQ-REG-005: expose hysteresis state for dashboard rendering.
+
+        Returns the current regime + how many candles we've held it,
+        any pending regime swap (and how many of the required confirmation
+        candles it has accumulated), and remaining post-transition cooldown.
+        """
+        return {
+            "current_regime": self._current_regime.value,
+            "candles_in_state": int(self._candles_in_state),
+            "pending_regime": (self._pending_regime.value if self._pending_regime is not None else None),
+            "pending_count": int(self._pending_count),
+            "confirmation_required": int(self._confirmation_candles),
+            "cooldown_remaining": int(self._cooldown_remaining),
+            "cooldown_total": int(self._cooldown_candles),
+            "last_transition_ts": float(self._last_transition_ts),
+            "recent_regimes": [r.value for r in list(self._history)[-10:]],
+        }
 
     def detect(self, df: pd.DataFrame) -> RegimeState:
         if len(df) < 30:
