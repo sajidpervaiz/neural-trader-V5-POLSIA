@@ -2886,6 +2886,27 @@ function _geoScoreLabel(s) {
   if (v <= -0.1) return 'SHORT BIAS';
   return 'NEUTRAL';
 }
+function _geoSectionTitle(t) {
+  return '<div style="font:700 11px \'Inter\';color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--border)">'+esc(t)+'</div>';
+}
+function _geoTradingHoursLbl(rule) {
+  if (!rule) return '24/7';
+  const days = (rule.days || []).map(d=>d.toUpperCase()).join('·');
+  return rule.start+'→'+rule.end+' UTC · '+days;
+}
+function _geoTimeAgo(ts) {
+  const diff = (Date.now()/1000) - Number(ts || 0);
+  if (diff < 60) return Math.round(diff)+'s ago';
+  if (diff < 3600) return Math.round(diff/60)+'m ago';
+  if (diff < 86400) return Math.round(diff/3600)+'h ago';
+  return Math.round(diff/86400)+'d ago';
+}
+function _geoDirectionBadge(dir) {
+  const d = Number(dir||0);
+  if (d > 0) return '<span style="font:700 9px \'JetBrains Mono\';color:var(--green);border:1px solid var(--green);padding:1px 5px;border-radius:3px">LONG</span>';
+  if (d < 0) return '<span style="font:700 9px \'JetBrains Mono\';color:var(--red);border:1px solid var(--red);padding:1px 5px;border-radius:3px">SHORT</span>';
+  return '<span style="font:700 9px \'JetBrains Mono\';color:var(--text3);border:1px solid var(--text3);padding:1px 5px;border-radius:3px">NEUT</span>';
+}
 function renderGeopolitical(d) {
   if (!d || d.available === false) {
     const reason = (d && (d.reason || d.error)) || 'feed not configured';
@@ -2894,22 +2915,39 @@ function renderGeopolitical(d) {
   }
   const errs = d.errors || {};
   const errTotal = (errs.dns||0)+(errs.http||0)+(errs.parse||0)+(errs.other||0);
-  let h = '<div class="metrics">';
+  const consts = d.constants || {};
+  let h = '';
+
+  // ── 1. LIVE STATS ───────────────────────────────────────────────────
+  h += _geoSectionTitle('Live Stats');
+  h += '<div class="metrics">';
   h += '<div class="metric"><div class="metric-val">'+(d.polls||0)+'</div><div class="metric-lbl">RSS Polls</div></div>';
   h += '<div class="metric"><div class="metric-val">'+(d.articles||0)+'</div><div class="metric-lbl">Articles</div></div>';
   h += '<div class="metric"><div class="metric-val">'+(d.events||0)+'</div><div class="metric-lbl">Scored Events</div></div>';
   h += '<div class="metric"><div class="metric-val" style="color:'+(errTotal?'var(--orange)':'var(--text2)')+'">'+errTotal+'</div><div class="metric-lbl">Errors</div></div>';
   h += '<div class="metric"><div class="metric-val">'+(d.not_modified||0)+'</div><div class="metric-lbl">304 Not-Mod</div></div>';
+  h += '<div class="metric"><div class="metric-val">'+Math.round(consts.fetch_interval_seconds||600)+'s</div><div class="metric-lbl">Poll Interval</div></div>';
+  h += '<div class="metric"><div class="metric-val">'+(consts.window_hours||6)+'h</div><div class="metric-lbl">Decay Window</div></div>';
+  h += '<div class="metric"><div class="metric-val">'+(consts.min_relevance||30)+'</div><div class="metric-lbl">Min Relevance</div></div>';
   h += '</div>';
+  if (errTotal) {
+    h += '<div style="margin-top:8px;display:flex;gap:14px;font:11px \'JetBrains Mono\';color:var(--text2)">';
+    h += '<span>DNS <b style="color:var(--orange)">'+(errs.dns||0)+'</b></span>';
+    h += '<span>HTTP <b style="color:var(--orange)">'+(errs.http||0)+'</b></span>';
+    h += '<span>Parse <b style="color:var(--orange)">'+(errs.parse||0)+'</b></span>';
+    h += '<span>Other <b style="color:var(--orange)">'+(errs.other||0)+'</b></span>';
+    h += '</div>';
+  }
 
+  // ── 2. PER-SYMBOL SCORES ────────────────────────────────────────────
   const symbols = d.symbols || {};
-  const keys = Object.keys(symbols);
-  h += '<div style="font:600 10px \'Inter\';color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Per-Symbol Scores</div>';
-  if (!keys.length) {
+  const symKeys = Object.keys(symbols);
+  h += _geoSectionTitle('Per-Symbol Scores');
+  if (!symKeys.length) {
     h += '<div style="color:var(--text3)">No symbol scores yet — feed has not received scoreable events.</div>';
   } else {
     h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">';
-    for (const sym of keys) {
+    for (const sym of symKeys) {
       const s = symbols[sym] || {};
       const sc = Number(s.score)||0;
       const evt = Number(s.events)||0;
@@ -2931,16 +2969,117 @@ function renderGeopolitical(d) {
     h += '</div>';
   }
 
-  // Error breakdown
-  if (errTotal) {
-    h += '<div style="font:600 10px \'Inter\';color:var(--text2);text-transform:uppercase;margin:14px 0 6px">Error Breakdown</div>';
-    h += '<div style="display:flex;gap:14px;font:11px \'JetBrains Mono\';color:var(--text2)">';
-    h += '<span>DNS <b style="color:var(--orange)">'+(errs.dns||0)+'</b></span>';
-    h += '<span>HTTP <b style="color:var(--orange)">'+(errs.http||0)+'</b></span>';
-    h += '<span>Parse <b style="color:var(--orange)">'+(errs.parse||0)+'</b></span>';
-    h += '<span>Other <b style="color:var(--orange)">'+(errs.other||0)+'</b></span>';
+  // ── 3. STRATEGY PIPELINE ────────────────────────────────────────────
+  const phases = d.pipeline_phases || [];
+  if (phases.length) {
+    h += _geoSectionTitle('Strategy Pipeline');
+    h += '<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:stretch">';
+    phases.forEach((p,i)=>{
+      const paid = p.kind==='paid';
+      const accent = paid ? 'var(--orange)' : 'var(--cyan)';
+      h += '<div style="flex:1 1 220px;min-width:200px;border:1px solid var(--border);border-left:3px solid '+accent+';border-radius:6px;padding:8px 10px;background:var(--bg2)">';
+      h += '<div style="display:flex;justify-content:space-between;align-items:baseline">';
+      h += '<span style="font:700 11px \'JetBrains Mono\';color:var(--text1)">P'+esc(p.id)+' · '+esc(p.name)+'</span>';
+      h += '<span style="font:600 8px \'JetBrains Mono\';color:'+accent+';text-transform:uppercase">'+esc(p.kind||'')+'</span>';
+      h += '</div>';
+      h += '<div style="margin-top:4px;font:10px \'Inter\';color:var(--text2);line-height:1.35">'+esc(p.summary||'')+'</div>';
+      h += '</div>';
+      if (i < phases.length-1) h += '<div style="display:flex;align-items:center;color:var(--text3);font:700 14px sans-serif">→</div>';
+    });
     h += '</div>';
   }
+
+  // ── 4. RECENT SCORED EVENTS ─────────────────────────────────────────
+  const events = d.recent_events || [];
+  h += _geoSectionTitle('Recent Scored Events ('+events.length+')');
+  if (!events.length) {
+    h += '<div style="color:var(--text3)">No scored events yet — events appear here once a headline passes the keyword relevance gate.</div>';
+  } else {
+    h += '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg2)">';
+    h += '<div style="display:grid;grid-template-columns:60px 90px 60px 1fr 100px 70px;gap:0;padding:6px 10px;font:700 9px \'JetBrains Mono\';color:var(--text3);text-transform:uppercase;border-bottom:1px solid var(--border);background:var(--bg1)">';
+    h += '<span>When</span><span>Symbol</span><span>Dir</span><span>Headline</span><span>Source</span><span style="text-align:right">Rel · Conf</span></div>';
+    events.forEach(ev=>{
+      const symShort = (ev.symbol||'').split('/')[0];
+      h += '<div style="display:grid;grid-template-columns:60px 90px 60px 1fr 100px 70px;gap:0;padding:6px 10px;font:11px \'Inter\';border-bottom:1px solid var(--border);align-items:center">';
+      h += '<span style="font:11px \'JetBrains Mono\';color:var(--text3)">'+esc(_geoTimeAgo(ev.timestamp))+'</span>';
+      h += '<span style="font:600 11px \'JetBrains Mono\';color:var(--text1)">'+esc(symShort)+'</span>';
+      h += '<span>'+_geoDirectionBadge(ev.direction)+'</span>';
+      h += '<span style="color:var(--text1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(ev.title||'')+'">'+esc(ev.title||'')+'</span>';
+      h += '<span style="color:var(--text3);font-size:10px">'+esc(ev.source||'')+'</span>';
+      h += '<span style="text-align:right;font:600 10px \'JetBrains Mono\';color:var(--text2)">'+Number(ev.relevance||0)+'·'+Math.round(Number(ev.confidence||0)*100)+'%</span>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // ── 5. RSS FEED SOURCES ─────────────────────────────────────────────
+  const feeds = d.feeds || [];
+  h += _geoSectionTitle('RSS Feed Sources ('+feeds.length+')');
+  if (!feeds.length) {
+    h += '<div style="color:var(--text3)">No feeds configured.</div>';
+  } else {
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px">';
+    feeds.forEach(f=>{
+      h += '<div style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;background:var(--bg2);display:flex;justify-content:space-between;align-items:center">';
+      h += '<span style="font:600 11px \'JetBrains Mono\';color:var(--text1);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(f.url)+'">'+esc(f.host||f.url)+'</span>';
+      h += '<a href="'+esc(f.url)+'" target="_blank" rel="noopener" style="font:9px \'Inter\';color:var(--blue);text-decoration:none;flex-shrink:0">↗</a>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+
+  // ── 6. MARKET CONFIGURATIONS ────────────────────────────────────────
+  const mc = d.market_configs || {};
+  const mcKeys = Object.keys(mc);
+  if (mcKeys.length) {
+    h += _geoSectionTitle('Market Configurations');
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px">';
+    for (const sym of mcKeys) {
+      const cfg = mc[sym] || {};
+      h += '<div style="border:1px solid var(--border);border-radius:6px;padding:12px;background:var(--bg2)">';
+      // header
+      h += '<div style="display:flex;justify-content:space-between;align-items:baseline">';
+      h += '<span style="font:700 13px \'Inter\';color:var(--text1)">'+esc(cfg.name||sym)+'</span>';
+      h += '<span style="font:600 10px \'JetBrains Mono\';color:var(--text3)">'+esc(sym)+'</span>';
+      h += '</div>';
+      // trading hours + keyword count
+      h += '<div style="display:flex;gap:14px;margin-top:6px;font:10px \'JetBrains Mono\';color:var(--text2)">';
+      h += '<span>Hours: <b style="color:var(--cyan)">'+esc(_geoTradingHoursLbl(cfg.trading_hours))+'</b></span>';
+      h += '<span>Keywords: <b style="color:var(--text1)">'+(cfg.keyword_count||0)+'</b></span>';
+      h += '</div>';
+      // top keywords
+      const tk = cfg.top_keywords || [];
+      if (tk.length) {
+        h += '<div style="margin-top:10px"><div style="font:600 9px \'Inter\';color:var(--text3);text-transform:uppercase;margin-bottom:4px">Top Keywords (by weight)</div>';
+        h += '<div style="display:flex;flex-wrap:wrap;gap:4px">';
+        tk.forEach(k=>{
+          h += '<span style="font:600 10px \'JetBrains Mono\';background:var(--bg1);border:1px solid var(--border);padding:2px 6px;border-radius:3px;color:var(--text2)">'+esc(k.token)+'<span style="color:var(--cyan);margin-left:4px">'+k.weight+'</span></span>';
+        });
+        h += '</div></div>';
+      }
+      // direction tokens
+      const bull = cfg.bullish_tokens || [];
+      const bear = cfg.bearish_tokens || [];
+      if (bull.length || bear.length) {
+        h += '<div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+        h += '<div><div style="font:600 9px \'Inter\';color:var(--green);text-transform:uppercase;margin-bottom:4px">Bullish ('+bull.length+')</div>';
+        h += '<div style="font:10px \'JetBrains Mono\';color:var(--text2);line-height:1.45">'+bull.slice(0,12).map(esc).join(' · ')+(bull.length>12?' …':'')+'</div></div>';
+        h += '<div><div style="font:600 9px \'Inter\';color:var(--red);text-transform:uppercase;margin-bottom:4px">Bearish ('+bear.length+')</div>';
+        h += '<div style="font:10px \'JetBrains Mono\';color:var(--text2);line-height:1.45">'+bear.slice(0,12).map(esc).join(' · ')+(bear.length>12?' …':'')+'</div></div>';
+        h += '</div>';
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+
+  // ── 7. PERFORMANCE METRICS (placeholder — wiring TODO) ──────────────
+  h += _geoSectionTitle('Performance Metrics');
+  h += '<div style="color:var(--text3);font:11px \'Inter\';line-height:1.5">';
+  h += 'Win-rate per market, exit-reason breakdown (TP / SL / BE / FLAT-TIMEOUT / HARD-TIMEOUT), momentum-gate pass-rate, and daily LLM cost are defined in the strategy spec but not yet emitted by the bot. ';
+  h += 'These will appear here once the paper-trade ledger is wired to the dashboard.';
+  h += '</div>';
+
   $('geoPanel').innerHTML = h;
 }
 

@@ -1371,7 +1371,7 @@ def build_app(
             logger.debug("News direct fetch error: {}", exc)
         return {"provider": "unavailable", "items": []}
 
-    # ── /api/geopolitical — Layer 10 RSS scorer snapshot ──────────────────
+    # ── /api/geopolitical — Layer 10 RSS scorer + strategy details ────────
     @app.get("/api/geopolitical")
     async def api_geopolitical() -> dict[str, Any]:
         if geopolitical_feed is None:
@@ -1380,6 +1380,53 @@ def build_app(
             stats = geopolitical_feed.stats()
         except Exception as exc:
             return {"available": False, "error": str(exc)}
+
+        # Strategy module exposes static config used by the dashboard's Geo tab
+        # so the user can verify which keywords/feeds/hours the bot is actually
+        # using, alongside live counters.
+        from urllib.parse import urlparse as _urlparse
+        try:
+            from strategies.geo_political_strategy import (
+                MARKET_CONFIGS as _MC,
+                MIN_RELEVANCE as _MIN_REL,
+                WINDOW_HOURS as _WIN_H,
+                DIRECTION_TOKENS as _DT,
+            )
+        except Exception:
+            _MC, _MIN_REL, _WIN_H, _DT = {}, 30, 6.0, {}
+
+        feeds_meta = []
+        for url in getattr(geopolitical_feed, "_feeds", []) or []:
+            try:
+                host = _urlparse(url).netloc
+            except Exception:
+                host = url
+            feeds_meta.append({"url": url, "host": host})
+
+        market_configs: dict[str, Any] = {}
+        for sym, cfg in _MC.items():
+            kws = cfg.get("keywords", {}) or {}
+            top_kw = sorted(kws.items(), key=lambda kv: kv[1], reverse=True)[:10]
+            dt = (_DT.get(sym) or {}) if _DT else {}
+            bullish = sorted([k for k, v in dt.items() if v > 0])
+            bearish = sorted([k for k, v in dt.items() if v < 0])
+            market_configs[sym] = {
+                "name": cfg.get("name") or sym,
+                "trading_hours": cfg.get("trading_hours"),
+                "keyword_count": len(kws),
+                "top_keywords": [{"token": k, "weight": w} for k, w in top_kw],
+                "bullish_tokens": bullish,
+                "bearish_tokens": bearish,
+            }
+
+        recent_events: list[dict] = []
+        try:
+            scorer = getattr(geopolitical_feed, "_scorer", None)
+            if scorer is not None and hasattr(scorer, "recent_events"):
+                recent_events = scorer.recent_events(limit=20)
+        except Exception as exc:
+            logger.debug("recent_events lookup failed: {}", exc)
+
         return {
             "available": True,
             "polls": stats.get("polls", 0),
@@ -1393,6 +1440,27 @@ def build_app(
             },
             "not_modified": stats.get("not_modified", 0),
             "symbols": stats.get("scorer", {}),
+            "feeds": feeds_meta,
+            "market_configs": market_configs,
+            "constants": {
+                "min_relevance": int(_MIN_REL),
+                "window_hours": float(_WIN_H),
+                "fetch_interval_seconds": float(getattr(geopolitical_feed, "_interval", 600.0)),
+                "max_articles_per_feed": int(getattr(geopolitical_feed, "_max_articles_per_feed", 30)),
+            },
+            "recent_events": recent_events,
+            # Pipeline stages from the strategy spec — surfaced so the UI can
+            # render the canonical phase diagram without hardcoding it.
+            "pipeline_phases": [
+                {"id": "1A", "name": "RSS Fetch", "kind": "free", "summary": "Pull headlines from configured RSS feeds; dedupe by signal_uid"},
+                {"id": "1B", "name": "Keyword Relevance", "kind": "free", "summary": f"Weight-sum match against per-market keywords; drop < {int(_MIN_REL)}"},
+                {"id": "1C", "name": "LLM Sentiment", "kind": "paid", "summary": "Direction LONG/SHORT/SKIP + confidence; drop if conf < 60"},
+                {"id": "GATE", "name": "Quality Gates", "kind": "free", "summary": "Hours filter + duplicate suppression + max-concurrent + 15m momentum"},
+                {"id": "2", "name": "Price Confirmation", "kind": "paid", "summary": "Live ticker + OHLCV → CONFIRM / CONTRADICT / WEAK"},
+                {"id": "3", "name": "Trade Planner", "kind": "paid", "summary": "Per-event SL/TP/timeout plan, clamped to safe rails"},
+                {"id": "EXEC", "name": "Execute", "kind": "free", "summary": "Open paper position, append to ledger, send Telegram alert"},
+                {"id": "MGMT", "name": "Manage", "kind": "free", "summary": "BE @ 50%, trail @ 75%, soft flat-timeout, hard 4h ceiling"},
+            ],
         }
 
     # ── /api/system/data-sources — module source map ──────────────────────
