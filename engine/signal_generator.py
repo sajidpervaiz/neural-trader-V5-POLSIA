@@ -1119,10 +1119,23 @@ class SignalGenerator:
         }
 
     def get_quality_preview(self, symbol: str | None = None) -> dict[str, Any]:
-        """Build a non-trading quality preview from the latest available market snapshot."""
+        """Build a non-trading quality preview from the latest available market snapshot.
+
+        Inner cache TTL is 30s — the dashboard's /api/layers endpoint sits in
+        front with stale-while-revalidate, so this only runs at the slow
+        background-refresh cadence, not per request.
+        """
         exchange_cfg = self.config.get_value("exchanges", "binance") or {}
         configured_symbols = list(exchange_cfg.get("symbols", []))
-        target_symbol = str(symbol or (configured_symbols[0] if configured_symbols else "BTC/USDT:USDT"))
+        cache_key = str(symbol or (configured_symbols[0] if configured_symbols else "BTC/USDT:USDT"))
+        cache = getattr(self, "_quality_preview_cache", None)
+        if cache is None:
+            cache = {}
+            self._quality_preview_cache = cache
+        entry = cache.get(cache_key)
+        if entry is not None and (time.time() - entry[0]) < 30.0:
+            return entry[1]
+        target_symbol = cache_key
 
         try:
             df = self.data_manager.get_dataframe("binance", target_symbol, self._primary_tf)
@@ -1132,7 +1145,7 @@ class SignalGenerator:
             df = None
 
         if df is None or len(df) < 30:
-            return {
+            empty = {
                 "total": 0,
                 "components": {
                     "htf_trend": 0,
@@ -1147,6 +1160,10 @@ class SignalGenerator:
                 "symbol": target_symbol,
                 "reason": "Waiting for enough live candles to evaluate the pipeline.",
             }
+            # Cache the empty response too — otherwise we redo the dataframe
+            # lookup every poll while the bot is still warming up.
+            cache[cache_key] = (time.time(), empty)
+            return empty
 
         now = time.time()
         session_rule = self._get_session_rule()
@@ -1201,7 +1218,7 @@ class SignalGenerator:
             orderbook_depth_ratio=orderbook_depth_ratio,
         )
 
-        return {
+        result = {
             "total": int(total),
             "components": {
                 "htf_trend": int(htf_score_100),
@@ -1217,6 +1234,8 @@ class SignalGenerator:
             "signal_type": signal_type.value,
             "reason": "Live preview from the latest market snapshot.",
         }
+        cache[cache_key] = (time.time(), result)
+        return result
 
     async def chat_with_agent(self, message: str) -> dict[str, Any]:
         """Interactive assistant endpoint for the dashboard AI panel."""

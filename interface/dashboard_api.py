@@ -82,9 +82,22 @@ _market_cache: dict[str, Any] = {"coins": [], "ts": 0.0}  # TTL cache for market
 _exchange_cache: dict[str, tuple[float, Any]] = {}  # key -> (expiry_ts, data)
 _EXCHANGE_CACHE_TTL = 5.0  # seconds
 
-# ── TTL cache for /api/layers (cold get_quality_preview runs full ML+SMC+HTF pipeline) ─
+# ── /api/layers stale-while-revalidate cache ─────────────────────────────
+# Cold get_quality_preview runs the full ML+SMC+HTF pipeline; in degraded
+# environments (DNS timeouts saturating the threadpool) cold builds have been
+# observed taking 30s+. The pattern below guarantees a sub-3s response in all
+# conditions:
+#   • Hit within TTL → return cached payload immediately.
+#   • Hit past TTL but within STALE window → return stale, kick off a
+#     background refresh so the next call is hot.
+#   • Total miss → race the build against COLD_BUDGET. If we win, cache + return.
+#     If we lose, fall back to the placeholder. The build keeps running and
+#     populates the cache for the next caller.
 _layers_cache: dict[str, tuple[float, dict[str, Any]]] = {}
-_LAYERS_CACHE_TTL = 2.5  # seconds; sits under get_quality_preview's 3s inner cache
+_LAYERS_CACHE_TTL = 30.0       # fresh window
+_LAYERS_CACHE_STALE = 600.0    # serve-stale window (10 min)
+_LAYERS_COLD_BUDGET = 3.0      # max we'll block a request waiting for a build
+_layers_refresh_lock: asyncio.Lock | None = None  # lazy-created in api_layers
 
 def _cache_get(key: str) -> Any | None:
     entry = _exchange_cache.get(key)
@@ -2603,13 +2616,88 @@ def build_app(
             return StreamingResponse(_sse_fallback(), media_type="text/event-stream")
 
     # ── §3 Spec: 9-layer confirmation status ──────────────────────────────
+    async def _build_layers_response() -> dict[str, Any]:
+        """Heavy path — runs the full pipeline preview. Called only when
+        the cache is cold or being refreshed; never inline on the request path
+        without a wait_for timeout guarding it."""
+        layers = _build_layers_skeleton()
+        await _populate_layers_status(layers)
+        return _finalize_layers_response(layers)
+
+    async def _layers_background_refresh() -> None:
+        """Fire-and-forget refresh — runs to completion regardless of how long
+        get_quality_preview takes, so the next request gets hot data."""
+        try:
+            response = await _build_layers_response()
+            _layers_cache["_"] = (time.monotonic(), response)
+        except Exception as exc:
+            logger.debug("layers background refresh failed: {}", exc)
+
     @app.get("/api/layers")
     async def api_layers() -> dict[str, Any]:
-        """Return current state of the 9-layer confirmation pipeline."""
+        """Return current state of the 9/10-layer confirmation pipeline.
+
+        Uses stale-while-revalidate so the dashboard never blocks on a slow
+        build. See the cache constants above for the budgets."""
+        global _layers_refresh_lock
+        if _layers_refresh_lock is None:
+            _layers_refresh_lock = asyncio.Lock()
+
         cached = _layers_cache.get("_")
-        if cached and (time.monotonic() - cached[0]) < _LAYERS_CACHE_TTL:
+        now = time.monotonic()
+        # Fresh hit
+        if cached and (now - cached[0]) < _LAYERS_CACHE_TTL:
             return cached[1]
-        layers = [
+        # Stale hit — kick off a refresh in the background, return stale
+        if cached and (now - cached[0]) < _LAYERS_CACHE_STALE:
+            if not _layers_refresh_lock.locked():
+                async def _bg():
+                    async with _layers_refresh_lock:
+                        await _layers_background_refresh()
+                asyncio.create_task(_bg(), name="layers_bg_refresh")
+            stale_payload = dict(cached[1])
+            stale_payload["stale"] = True
+            stale_payload["age_seconds"] = round(now - cached[0], 2)
+            return stale_payload
+        # Total miss — race the build against COLD_BUDGET. If we lose, return
+        # placeholder; the build keeps running via fire-and-forget.
+        if _layers_refresh_lock.locked():
+            # Another caller is already building — wait briefly for them.
+            try:
+                await asyncio.wait_for(_layers_refresh_lock.acquire(), timeout=_LAYERS_COLD_BUDGET)
+                _layers_refresh_lock.release()
+                cached2 = _layers_cache.get("_")
+                if cached2:
+                    return cached2[1]
+            except asyncio.TimeoutError:
+                pass
+            return _layers_placeholder_response("warming up — pipeline build in progress")
+        # We're the first — try to build inline within the budget.
+        async with _layers_refresh_lock:
+            try:
+                response = await asyncio.wait_for(_build_layers_response(), timeout=_LAYERS_COLD_BUDGET)
+                _layers_cache["_"] = (time.monotonic(), response)
+                return response
+            except asyncio.TimeoutError:
+                # Drop the inline wait, but keep building via background task
+                # so the next caller gets hot data.
+                asyncio.create_task(_layers_background_refresh(), name="layers_bg_refresh_fallback")
+                return _layers_placeholder_response("pipeline build exceeded cold budget — refreshing in background")
+
+    _LAYERS_DEFAULT_THRESHOLDS = {
+        "session_filter": 1.0,
+        "htf_trend": 3.0,
+        "technical_confluence": 30.0,
+        "smart_money_concepts": 0.0,
+        "volume_flow": 20.0,
+        "regime_detection": 1.0,
+        "ml_ensemble": 0.5,
+        "signal_quality": 65.0,
+        "risk_gate": 1.0,
+    }
+
+    def _build_layers_skeleton() -> list[dict[str, Any]]:
+        return [
             {"id": 1, "layer_index": "L0", "name": "Session Filter", "description": "Trading session & killzone enforcement"},
             {"id": 2, "layer_index": "L1", "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
             {"id": 3, "layer_index": "L2", "name": "Technical Confluence", "description": "RSI, MACD, BB, EMA alignment"},
@@ -2620,115 +2708,107 @@ def build_app(
             {"id": 8, "layer_index": "L7", "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
             {"id": 9, "layer_index": "L8", "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
         ]
-        default_thresholds = {
-            "session_filter": 1.0,
-            "htf_trend": 3.0,
-            "technical_confluence": 30.0,
-            "smart_money_concepts": 0.0,
-            "volume_flow": 20.0,
-            "regime_detection": 1.0,
-            "ml_ensemble": 0.5,
-            "signal_quality": 65.0,
-            "risk_gate": 1.0,
-        }
 
-        def _score_to_status(score: float | int | None) -> str:
+    def _layers_score_to_status(score: float | int | None) -> str:
+        try:
+            numeric = float(score if score is not None else 0)
+        except (TypeError, ValueError):
+            return "UNKNOWN"
+        if numeric >= 70:
+            return "PASS"
+        if numeric >= 40:
+            return "WEAK"
+        return "FAIL"
+
+    def _layers_parse_score_threshold(detail: str) -> tuple[float | None, float | None]:
+        """Extract numeric score + threshold from detail strings like
+        'score=42<30', 'score=0.82', 'score=BLOCKED'."""
+        import re as _re
+        if not detail:
+            return None, None
+        m = _re.search(r"score\s*=\s*(-?[\d.]+)\s*(?:[<>]=?)?\s*(-?[\d.]+)?", detail)
+        if not m:
+            return None, None
+        try:
+            score = float(m.group(1))
+        except (TypeError, ValueError):
+            score = None
+        thr: float | None = None
+        if m.group(2) is not None:
             try:
-                numeric = float(score if score is not None else 0)
+                thr = float(m.group(2))
             except (TypeError, ValueError):
-                return "UNKNOWN"
-            if numeric >= 70:
-                return "PASS"
-            if numeric >= 40:
-                return "WEAK"
-            return "FAIL"
+                thr = None
+        return score, thr
 
-        def _parse_score_threshold(detail: str) -> tuple[float | None, float | None]:
-            """Extract numeric score and threshold from detail strings like
-            'score=42<30', 'score=0.82', 'score=BLOCKED'."""
-            import re as _re
-            if not detail:
-                return None, None
-            m = _re.search(r"score\s*=\s*(-?[\d.]+)\s*(?:[<>]=?)?\s*(-?[\d.]+)?", detail)
-            if not m:
-                return None, None
-            try:
-                score = float(m.group(1))
-            except (TypeError, ValueError):
-                score = None
-            thr: float | None = None
-            if m.group(2) is not None:
-                try:
-                    thr = float(m.group(2))
-                except (TypeError, ValueError):
-                    thr = None
-            return score, thr
-
-        # Populate layer status from signal_generator if available
-        if signal_generator is not None:
-            last = getattr(signal_generator, '_last_layer_status', {}) or {}
-            quality = getattr(signal_generator, '_last_quality_breakdown', {}) or {}
-            if (int(quality.get("total", 0) or 0) <= 0) and hasattr(signal_generator, "get_quality_preview"):
-                preview = await asyncio.to_thread(signal_generator.get_quality_preview)
-                if isinstance(preview, dict) and preview.get("components"):
-                    quality = {**quality, **preview}
-            components = quality.get("components", {}) or {}
-            fallback_scores = {
-                "session_filter": 100 if not (quality.get("rejected_at") == "L1_Session") else 0,
-                "htf_trend": components.get("htf_alignment", components.get("htf_trend", 0)),
-                "technical_confluence": components.get("technical_confluence", 0),
-                "smart_money_concepts": components.get("smc_confluence", 0),
-                "volume_flow": components.get("volume_flow", 0),
-                "regime_detection": components.get("regime", 0),
-                "ml_ensemble": components.get("ml_confidence", 0),
-                "signal_quality": quality.get("total", 0),
-            }
-            for layer in layers:
-                key = layer["name"].lower().replace(" ", "_")
-                raw_status = str(last.get(key, "UNKNOWN") or "UNKNOWN").upper()
-                detail = str(last.get(f"{key}_detail", "") or "")
-
-                if raw_status in ("UNKNOWN", "PENDING") and key in fallback_scores:
-                    raw_status = _score_to_status(fallback_scores.get(key))
-                    if not detail:
-                        detail = f"score={fallback_scores.get(key, 0)}"
-
-                if key == "risk_gate" and raw_status in ("UNKNOWN", "PENDING"):
-                    snap = risk_manager.get_risk_snapshot() if risk_manager is not None else {}
-                    blocked = bool(snap.get("kill_switch_active", False) or snap.get("circuit_breaker_tripped", False))
-                    raw_status = "FAIL" if blocked else "PASS"
-                    if not detail:
-                        detail = "risk controls ready" if not blocked else "risk controls blocking new trades"
-
-                if raw_status == "BLOCKED":
-                    raw_status = "FAIL"
-                if raw_status == "UNKNOWN" and "score=0" in detail:
-                    raw_status = "FAIL"
-
-                score, thr = _parse_score_threshold(detail)
-                if score is None:
-                    fs = fallback_scores.get(key)
-                    if fs is not None:
-                        try:
-                            score = float(fs)
-                        except (TypeError, ValueError):
-                            score = None
-                if thr is None:
-                    thr = default_thresholds.get(key)
-
-                layer["status"] = raw_status
-                layer["detail"] = detail or "awaiting evaluation"
-                layer["score"] = score
-                layer["threshold"] = thr
-        else:
+    async def _populate_layers_status(layers: list[dict[str, Any]]) -> None:
+        if signal_generator is None:
             for layer in layers:
                 key = layer["name"].lower().replace(" ", "_")
                 layer["status"] = "UNKNOWN"
                 layer["detail"] = "signal generator unavailable"
                 layer["score"] = None
-                layer["threshold"] = default_thresholds.get(key)
+                layer["threshold"] = _LAYERS_DEFAULT_THRESHOLDS.get(key)
+            return
 
-        # Summary counts (PASS / SOFT / FAIL / SKIP)
+        last = getattr(signal_generator, "_last_layer_status", {}) or {}
+        quality = getattr(signal_generator, "_last_quality_breakdown", {}) or {}
+        if (int(quality.get("total", 0) or 0) <= 0) and hasattr(signal_generator, "get_quality_preview"):
+            # Heavy call — only the build path reaches here; the request path
+            # has already gated this with wait_for(_LAYERS_COLD_BUDGET).
+            preview = await asyncio.to_thread(signal_generator.get_quality_preview)
+            if isinstance(preview, dict) and preview.get("components"):
+                quality = {**quality, **preview}
+        components = quality.get("components", {}) or {}
+        fallback_scores = {
+            "session_filter": 100 if not (quality.get("rejected_at") == "L1_Session") else 0,
+            "htf_trend": components.get("htf_alignment", components.get("htf_trend", 0)),
+            "technical_confluence": components.get("technical_confluence", 0),
+            "smart_money_concepts": components.get("smc_confluence", 0),
+            "volume_flow": components.get("volume_flow", 0),
+            "regime_detection": components.get("regime", 0),
+            "ml_ensemble": components.get("ml_confidence", 0),
+            "signal_quality": quality.get("total", 0),
+        }
+        for layer in layers:
+            key = layer["name"].lower().replace(" ", "_")
+            raw_status = str(last.get(key, "UNKNOWN") or "UNKNOWN").upper()
+            detail = str(last.get(f"{key}_detail", "") or "")
+
+            if raw_status in ("UNKNOWN", "PENDING") and key in fallback_scores:
+                raw_status = _layers_score_to_status(fallback_scores.get(key))
+                if not detail:
+                    detail = f"score={fallback_scores.get(key, 0)}"
+
+            if key == "risk_gate" and raw_status in ("UNKNOWN", "PENDING"):
+                snap = risk_manager.get_risk_snapshot() if risk_manager is not None else {}
+                blocked = bool(snap.get("kill_switch_active", False) or snap.get("circuit_breaker_tripped", False))
+                raw_status = "FAIL" if blocked else "PASS"
+                if not detail:
+                    detail = "risk controls ready" if not blocked else "risk controls blocking new trades"
+
+            if raw_status == "BLOCKED":
+                raw_status = "FAIL"
+            if raw_status == "UNKNOWN" and "score=0" in detail:
+                raw_status = "FAIL"
+
+            score, thr = _layers_parse_score_threshold(detail)
+            if score is None:
+                fs = fallback_scores.get(key)
+                if fs is not None:
+                    try:
+                        score = float(fs)
+                    except (TypeError, ValueError):
+                        score = None
+            if thr is None:
+                thr = _LAYERS_DEFAULT_THRESHOLDS.get(key)
+
+            layer["status"] = raw_status
+            layer["detail"] = detail or "awaiting evaluation"
+            layer["score"] = score
+            layer["threshold"] = thr
+
+    def _finalize_layers_response(layers: list[dict[str, Any]]) -> dict[str, Any]:
         counts = {"pass": 0, "soft": 0, "fail": 0, "skip": 0, "other": 0}
         for lay in layers:
             st = str(lay.get("status", "")).upper()
@@ -2742,15 +2822,27 @@ def build_app(
                 counts["skip"] += 1
             else:
                 counts["other"] += 1
-
-        response = {
+        return {
             "layers": layers,
             "total": 9,
             "counts": counts,
             "paper_mode": bool(getattr(signal_generator, "_is_paper_mode", lambda: True)()) if signal_generator is not None else True,
         }
-        _layers_cache["_"] = (time.monotonic(), response)
-        return response
+
+    def _layers_placeholder_response(reason: str) -> dict[str, Any]:
+        """Fallback when no cache exists and the cold build is taking too long.
+        Returns the layer skeleton with PENDING status so the UI still draws."""
+        layers = _build_layers_skeleton()
+        for layer in layers:
+            key = layer["name"].lower().replace(" ", "_")
+            layer["status"] = "PENDING"
+            layer["detail"] = reason
+            layer["score"] = None
+            layer["threshold"] = _LAYERS_DEFAULT_THRESHOLDS.get(key)
+        out = _finalize_layers_response(layers)
+        out["pending"] = True
+        out["reason"] = reason
+        return out
 
     # ── §5 Spec: Session & killzone status ────────────────────────────────
     @app.get("/api/session")
