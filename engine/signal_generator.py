@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -128,33 +127,39 @@ _TRANSITION_SIZE_MULT = 0.50
 _TRANSITION_SL_MULT = 0.50
 
 
+# Trending-regime baseline for the geopolitical factor — used to normalise the
+# regime-specific weight into a multiplier in (0, 2) when computing the L10
+# quality bonus. Bumping a profile's "geopolitical" key above this baseline
+# amplifies geo influence in that regime; keeping it at this baseline is neutral.
+_GEO_BASELINE_REGIME_WEIGHT: float = 0.05
+
 # ── Regime-adaptive weight profiles ──────────────────────────────────────────
 # Each profile sums to 1.0.  Weights shift depending on detected regime so the
 # signal generator emphasises the factors most predictive for that market state.
 _REGIME_WEIGHT_PROFILES: dict[MarketRegime, dict[str, float]] = {
     MarketRegime.STRONG_TREND_UP: {
         "technical": 0.35, "ml": 0.30, "sentiment": 0.10,
-        "macro": 0.05, "news": 0.10, "orderbook": 0.10,
+        "macro": 0.05, "news": 0.05, "orderbook": 0.10, "geopolitical": 0.05,
     },
     MarketRegime.WEAK_TREND_UP: {
         "technical": 0.30, "ml": 0.30, "sentiment": 0.10,
-        "macro": 0.05, "news": 0.15, "orderbook": 0.10,
+        "macro": 0.05, "news": 0.10, "orderbook": 0.10, "geopolitical": 0.05,
     },
     MarketRegime.STRONG_TREND_DOWN: {
         "technical": 0.35, "ml": 0.30, "sentiment": 0.10,
-        "macro": 0.05, "news": 0.10, "orderbook": 0.10,
+        "macro": 0.05, "news": 0.05, "orderbook": 0.10, "geopolitical": 0.05,
     },
     MarketRegime.WEAK_TREND_DOWN: {
         "technical": 0.30, "ml": 0.30, "sentiment": 0.10,
-        "macro": 0.05, "news": 0.15, "orderbook": 0.10,
+        "macro": 0.05, "news": 0.10, "orderbook": 0.10, "geopolitical": 0.05,
     },
     MarketRegime.COMPRESSION: {
         "technical": 0.20, "ml": 0.20, "sentiment": 0.05,
-        "macro": 0.05, "news": 0.10, "orderbook": 0.40,
+        "macro": 0.05, "news": 0.05, "orderbook": 0.35, "geopolitical": 0.10,
     },
     MarketRegime.RANGE_CHOP: {
         "technical": 0.40, "ml": 0.15, "sentiment": 0.05,
-        "macro": 0.05, "news": 0.10, "orderbook": 0.25,
+        "macro": 0.05, "news": 0.05, "orderbook": 0.20, "geopolitical": 0.10,
     },
 }
 
@@ -210,6 +215,7 @@ class TradingSignal:
     mtf_agreement_count: int = 0    # Number of TFs in agreement
     mtf_weighted_score: float = 0.0 # Weighted MTF composite [-1, 1]
     size_multiplier: float = 1.0    # Combined position sizing multiplier
+    geopolitical_score: float = 0.0  # Layer 10: opt-in [-1,1] per-symbol RSS-driven score
 
     @property
     def is_long(self) -> bool:
@@ -245,6 +251,8 @@ class TradingSignal:
             count += 1
         if self.orderbook_score != 0.0:
             count += 1
+        if self.geopolitical_score != 0.0:
+            count += 1
         return count
 
 
@@ -268,7 +276,7 @@ class TechnicalScorer:
         # 1. EMA Stack Alignment (9/21/50/200)
         ema9 = last.get("ema_9", 0); ema21 = last.get("ema_21", 0)
         ema50 = last.get("ema_50", 0); ema200 = last.get("ema_200", 0)
-        if ema9 > ema21 > ema50 > ema200 and ema200 > 0:
+        if ema9 > ema21 > ema50 > ema200 > 0:
             votes.append(1.0); reasons.append("EMA_stack_bullish")
         elif ema9 < ema21 < ema50 < ema200 and ema200 > 0:
             votes.append(-1.0); reasons.append("EMA_stack_bearish")
@@ -676,6 +684,7 @@ class SignalGenerator:
         self._technical_scorer = TechnicalScorer()
         self._news_scorer = NewsScorer()
         self._orderbook_scorer = OrderbookScorer()
+        self._geopolitical_scorer = None  # GeoPoliticalScorer | None — wired via set_geopolitical_scorer()
         self._strategy_selector = StrategySelector()
         self._smc_analyzer = SmartMoneyAnalyzer()
         self._volume_analyzer = VolumeProfileAnalyzer()
@@ -715,6 +724,14 @@ class SignalGenerator:
         # ── Advanced: correlation-aware position tracking ────────────────
         self._open_directions: dict[str, str] = {}  # symbol → last signal direction
 
+        # ── REQ-SIG-010..012: layer-conflict streak tracking ──────────────
+        # When trend / volume / institutional layers have opposing bias the
+        # master score is reduced by _conflict_penalty. If conflict persists
+        # for >= _conflict_max_streak consecutive evaluations on a symbol,
+        # execution is hard-blocked until the conflict resolves.
+        self._conflict_streak: dict[str, int] = {}
+        self._last_conflict_block_reason: dict[str, str] = {}
+
         signals_cfg = config.get_value("signals") or {}
         self._ml_weight = float(signals_cfg.get("ml_weight", 0.25))
         self._tech_weight = float(signals_cfg.get("technical_weight", 0.30))
@@ -722,8 +739,14 @@ class SignalGenerator:
         self._macro_weight = float(signals_cfg.get("macro_weight", 0.10))
         self._news_weight = float(signals_cfg.get("news_weight", 0.15))
         self._orderbook_weight = float(signals_cfg.get("orderbook_weight", 0.10))
+        self._geopolitical_weight = float(signals_cfg.get("geopolitical_weight", 0.0))
         self._min_score = float(signals_cfg.get("min_score_threshold", 0.65))
         self._min_factors = int(signals_cfg.get("min_contributing_factors", 3))
+        # REQ-SIG-011/012 conflict-penalty config: deduction applied when the
+        # trend/volume/institutional layers disagree, plus the streak length
+        # at which we hard-block execution.
+        self._conflict_penalty = int(signals_cfg.get("conflict_penalty", 15))
+        self._conflict_max_streak = int(signals_cfg.get("conflict_max_streak", 3))
         self._primary_tf = signals_cfg.get("primary_timeframe", "15m")
         self._confirmation_tfs: list[str] = list(signals_cfg.get("confirmation_timeframes", ["1h", "4h"]))
         self._htf_threshold = float(signals_cfg.get("htf_threshold", 3.0))
@@ -820,7 +843,7 @@ class SignalGenerator:
             min_quality_score=int(ai_cfg.get("min_quality_score", self._get_quality_threshold())),
             min_risk_reward=float(ai_cfg.get("min_risk_reward", 1.0)),
             provider=str(ai_cfg.get("provider", "local")),
-            model=str(ai_cfg.get("model", "claude-3-5-sonnet-latest")),
+            model=str(ai_cfg.get("model", "claude-sonnet-4-6")),
             api_key=str(ai_cfg.get("api_key", "")),
             timeout_seconds=float(ai_cfg.get("timeout_seconds", 8.0)),
             remote_weight=float(ai_cfg.get("remote_weight", 0.35)),
@@ -1018,6 +1041,18 @@ class SignalGenerator:
             return self._last_smc_signal_per_symbol.get(symbol, {"symbol": symbol, "signal": None})
         return dict(self._last_smc_signal_per_symbol)
 
+    def get_conflict_state(self) -> dict[str, Any]:
+        """Layer-conflict streak snapshot for the dashboard.
+
+        REQ-SIG-010..012: when trend/volume/SMC layers disagree the master
+        score is penalised; persistent disagreement hard-blocks execution."""
+        return {
+            "streak_per_symbol": dict(self._conflict_streak),
+            "blocked_symbols": dict(self._last_conflict_block_reason),
+            "max_streak": int(self._conflict_max_streak),
+            "penalty_per_candle": int(self._conflict_penalty),
+        }
+
     def get_master_score(self, symbol: str | None = None) -> dict[str, Any]:
         """Return the latest V6 master score per symbol (or for a given symbol)."""
         if symbol:
@@ -1135,7 +1170,7 @@ class SignalGenerator:
         entry = cache.get(cache_key)
         if entry is not None and (time.time() - entry[0]) < 30.0:
             return entry[1]
-        target_symbol = cache_key
+        target_symbol = str(symbol or (configured_symbols[0] if configured_symbols else "BTC/USDT:USDT"))
 
         try:
             df = self.data_manager.get_dataframe("binance", target_symbol, self._primary_tf)
@@ -1160,8 +1195,8 @@ class SignalGenerator:
                 "symbol": target_symbol,
                 "reason": "Waiting for enough live candles to evaluate the pipeline.",
             }
-            # Cache the empty response too — otherwise we redo the dataframe
-            # lookup every poll while the bot is still warming up.
+            # Cache the empty response too — otherwise we redo dataframe lookup
+            # every poll while the bot is still warming up.
             cache[cache_key] = (time.time(), empty)
             return empty
 
@@ -1278,7 +1313,7 @@ class SignalGenerator:
         }
         if self._ai_agent is None:
             return {"success": True, "provider": "system", "reply": "AI agent is not attached."}
-        return self._ai_agent.chat(prompt, context=context)
+        return await self._ai_agent.chat(prompt, context=context)
 
     def _collect_training_dataframe(self) -> tuple[pd.DataFrame, list[str]]:
         """Collect numeric historical features for ML training."""
@@ -1416,6 +1451,7 @@ class SignalGenerator:
             "technical": self._tech_weight, "ml": self._ml_weight,
             "sentiment": self._sentiment_weight, "macro": self._macro_weight,
             "news": self._news_weight, "orderbook": self._orderbook_weight,
+            "geopolitical": self._geopolitical_weight,
         }
         if regime and regime in _REGIME_WEIGHT_PROFILES:
             weights = dict(_REGIME_WEIGHT_PROFILES[regime])
@@ -1721,7 +1757,7 @@ class SignalGenerator:
 
     def _get_session_rule(self) -> SessionRule | None:
         """Return the active session rule based on current UTC hour."""
-        utc_hour = datetime.datetime.utcnow().hour
+        utc_hour = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).hour
         for rule in _SESSION_RULES:
             if rule.start_utc <= utc_hour < rule.end_utc:
                 return rule
@@ -1729,7 +1765,7 @@ class SignalGenerator:
 
     def _is_ict_killzone(self) -> bool:
         """Check if current time is within an ICT killzone (§5)."""
-        utc_hour = datetime.datetime.utcnow().hour
+        utc_hour = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).hour
         return any(start <= utc_hour < end for start, end in _ICT_KILLZONES)
 
     def _classify_signal_type(self, smc_state: SMCState, df: pd.DataFrame) -> SignalType:
@@ -1824,6 +1860,7 @@ class SignalGenerator:
         volume_score_100: float = 0.0, regime_allows: bool = True,
         ml_confidence: float = 0.0, orderbook_depth_ratio: float = 0.0,
         killzone_score: float = 0.0,
+        geo_score: float = 0.0, geo_weight: float = 0.0,
     ) -> int:
         """Compute 0-100 quality score — Spec Layer 8.
 
@@ -1878,6 +1915,17 @@ class SignalGenerator:
 
         kz = max(0.0, min(1.0, killzone_score))
         total += kz * 5.0
+
+        # ── L10 Geopolitical alignment bonus/penalty (additive, weight-gated)
+        # Aligned headlines push borderline signals through; opposing headlines
+        # pull them back. No effect when geo_weight=0 (default) or score=0.
+        if geo_weight > 0.0 and geo_score != 0.0:
+            geo_aligned = (
+                (geo_score > 0.0 and direction == "long")
+                or (geo_score < 0.0 and direction == "short")
+            )
+            geo_mag = abs(geo_score) * 100.0 * geo_weight
+            total += geo_mag if geo_aligned else -0.5 * geo_mag
 
         return min(100, max(0, int(total)))
 
@@ -1939,7 +1987,7 @@ class SignalGenerator:
         is_killzone = self._is_ict_killzone()
 
         # Weekend halt (Saturday/Sunday)
-        utc_now = datetime.datetime.utcnow()
+        utc_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         if utc_now.weekday() >= 5:  # 5=Saturday, 6=Sunday
             logger.debug("DIAG {}: weekend — no trade", key)
             self._update_layer_status(l0="BLOCKED")
@@ -1956,6 +2004,11 @@ class SignalGenerator:
         # ═══════════════════════════════════════════════════════════════════
         sentiment = self._sentiment_score if (now - self._sentiment_ts) < self._score_ttl else 0.0
         news_score = self._news_scorer.score()
+        geo_score = (
+            self._geopolitical_scorer.score(candle.symbol)
+            if self._geopolitical_scorer is not None
+            else 0.0
+        )
 
         # ═══════════════════════════════════════════════════════════════════
         # L1: MARKET REGIME CLASSIFICATION
@@ -2042,6 +2095,7 @@ class SignalGenerator:
         direction_score = (
             0.25 * smc_score + 0.25 * tech_score + 0.15 * ml_score
             + 0.10 * flow_score + 0.10 * sentiment
+            + self._geopolitical_weight * geo_score
         )
         if current_regime == MarketRegime.STRONG_TREND_UP:
             direction_score = max(direction_score, 0.15)
@@ -2098,7 +2152,7 @@ class SignalGenerator:
         # Trend group (EMA Stack, SuperTrend, Ichimoku, SAR)
         ema9 = float(last.get("ema_9", 0)); ema21 = float(last.get("ema_21", 0))
         ema50 = float(last.get("ema_50", 0))
-        if ema9 > ema21 > ema50 and ema50 > 0:
+        if ema9 > ema21 > ema50 > 0:
             ema_score = 100
         elif ema21 > ema50:
             ema_score = 60
@@ -2145,7 +2199,7 @@ class SignalGenerator:
         bb_pct = float(last.get("bb_pct", 0.5))
         bb_upper = float(last.get("bb_upper", 0))
         bb_lower = float(last.get("bb_lower", 0))
-        if close_price > bb_upper and bb_upper > 0:
+        if close_price > bb_upper > 0:
             bb_score = 100
         elif bb_upper > 0 and bb_lower > 0 and bb_pct > 0.5:
             bb_score = 60  # Above BB midline
@@ -2159,7 +2213,7 @@ class SignalGenerator:
         kc_upper = float(last.get("kc_upper", 0))
         kc_lower = float(last.get("kc_lower", 0))
         kc_mid = (kc_upper + kc_lower) / 2 if kc_upper > 0 and kc_lower > 0 else 0
-        if close_price > kc_upper and kc_upper > 0:
+        if close_price > kc_upper > 0:
             keltner_score = 100
         elif kc_mid > 0 and close_price > kc_mid:
             keltner_score = 60
@@ -2273,7 +2327,7 @@ class SignalGenerator:
                 l4_smc_points += 10.0  # Sweep without MSS: partial credit
 
         # London/NY overlap (UTC 13-16)
-        utc_hour = datetime.datetime.utcnow().hour
+        utc_hour = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).hour
         if 13 <= utc_hour <= 16:
             l4_smc_points += 20.0
 
@@ -2467,6 +2521,17 @@ class SignalGenerator:
                 kz_score = float(self._session_filter.killzone_score())
             except Exception:
                 kz_score = 0.0
+        # Effective geo weight = configured weight × regime-specific multiplier.
+        # Trending regimes sit at _GEO_BASELINE_REGIME_WEIGHT (neutral 1.0×);
+        # mean-reverting regimes (compression/chop) double it (2.0×) so geo
+        # influence is muted when tech leads and amplified when fundamentals do.
+        regime_weights = self._get_regime_weights(current_regime)
+        regime_geo_w = regime_weights.get("geopolitical", 0.0)
+        effective_geo_weight = (
+            self._geopolitical_weight * (regime_geo_w / _GEO_BASELINE_REGIME_WEIGHT)
+            if regime_geo_w else 0.0
+        )
+
         quality_score = self._compute_quality_score(
             htf_score=htf_weighted_score, signal_type=signal_type,
             vol_ratio=vol_ratio, smc_state=smc_state, vol_flow=vol_flow,
@@ -2479,6 +2544,7 @@ class SignalGenerator:
             ml_confidence=float(l7_ml_score),
             orderbook_depth_ratio=orderbook_depth_ratio,
             killzone_score=kz_score,
+            geo_score=geo_score, geo_weight=effective_geo_weight,
         )
 
         # ── SMC Strategy Selector (ICT modules) ───────────────────────────
@@ -2548,6 +2614,45 @@ class SignalGenerator:
             "regime_class": regime_class,
             "signal_type": signal_type.value,
         }
+
+        # ── REQ-SIG-010..012: layer-conflict detection ───────────────────
+        # Bias of trend (HTF), volume, and institutional (SMC) layers — each
+        # is +1 (bullish) / -1 (bearish) / 0 (neutral) based on whether the
+        # 0–100 score sits above or below the mid-band.
+        def _bias(sc: float, neutral_band: float = 5.0) -> int:
+            mid = 50.0
+            if sc >= mid + neutral_band:
+                return 1
+            if sc <= mid - neutral_band:
+                return -1
+            return 0
+        biases = [_bias(l2_htf_score), _bias(l5_vol_score), _bias(l4_smc_score)]
+        nonzero = [b for b in biases if b != 0]
+        in_conflict = len(set(nonzero)) > 1  # at least one bullish AND one bearish
+        if in_conflict:
+            self._conflict_streak[candle.symbol] = self._conflict_streak.get(candle.symbol, 0) + 1
+            penalty = int(self._conflict_penalty)
+            quality_score = max(0, int(quality_score) - penalty)
+            self._last_layer_status["signal_quality_detail"] = (
+                f"conflict streak={self._conflict_streak[candle.symbol]} penalty=-{penalty}"
+            )
+            streak = self._conflict_streak[candle.symbol]
+            if streak >= self._conflict_max_streak:
+                reason = f"conflict_streak={streak}>={self._conflict_max_streak}"
+                self._last_conflict_block_reason[candle.symbol] = reason
+                logger.info(
+                    "DIAG {}: persistent layer conflict — execution blocked ({})",
+                    key, reason,
+                )
+                self._last_layer_status["signal_quality"] = "FAIL"
+                self._last_layer_status["signal_quality_detail"] = f"conflict_block streak={streak}"
+                self._last_layer_status["risk_gate"] = "FAIL"
+                self._last_layer_status["risk_gate_detail"] = f"conflict_block streak={streak}"
+                return
+        else:
+            # Conflict resolved — reset streak and clear the block reason.
+            self._conflict_streak[candle.symbol] = 0
+            self._last_conflict_block_reason.pop(candle.symbol, None)
 
         # HARD GATE: Quality score >= 65 (spec), relaxed to 30 for paper mode
         quality_threshold = self._get_quality_threshold()
@@ -2744,13 +2849,14 @@ class SignalGenerator:
             "technical": tech_score, "ml": ml_score, "sentiment": sentiment,
             "macro": macro, "news": news_score, "orderbook": ob_score,
             "smc": smc_score, "volume_flow": flow_score,
+            "geopolitical": geo_score,
         }
         active_factors = sum(
             1 for v in tmp_scores.values()
             if abs(v) >= self._min_factor_magnitude and (v * proposed_sign) > 0
         )
 
-        weights = self._get_regime_weights(current_regime)
+        weights = regime_weights  # already computed above for L10 geo scaling
 
         effective_size = max(0.10, session_size_mult * mtf_size_mult * transition_mult * quality_size_boost * max(regime_size, 0.25))
 
@@ -2766,6 +2872,7 @@ class SignalGenerator:
             macro_score=macro,
             news_score=news_score,
             orderbook_score=ob_score,
+            geopolitical_score=geo_score,
             regime=regime_state.regime.value if regime_state else MarketRegime.UNKNOWN.value,
             regime_confidence=regime_state.confidence if regime_state else 0.0,
             price=price,
@@ -2839,7 +2946,7 @@ class SignalGenerator:
             },
         )
 
-        agent_decision = self._ai_agent.review_signal(signal) if self._ai_agent is not None else None
+        agent_decision = await self._ai_agent.review_signal(signal) if self._ai_agent is not None else None
         if agent_decision is not None:
             signal.metadata["ai_agent"] = agent_decision.to_dict()
             if not agent_decision.approved:
@@ -2943,6 +3050,18 @@ class SignalGenerator:
             return
         self._news_scorer.ingest(sent, ts)
 
+    async def _handle_geopolitical_event(self, payload: Any) -> None:
+        """No-op observer for GEOPOLITICAL_EVENT — the feed already ingested
+        the event into the scorer directly. This handler exists only so the
+        SignalGenerator participates in the event-bus contract; future audit
+        or dashboard consumers can subscribe without needing a feed reference.
+        """
+        return
+
+    def set_geopolitical_scorer(self, scorer: Any) -> None:
+        """Inject a GeoPoliticalScorer instance and register paper-mode aliases."""
+        self._geopolitical_scorer = scorer
+
     async def _handle_orderbook_update(self, payload: Any) -> None:
         """Consume ORDERBOOK_UPDATE events — {bids: [(p,q),...], asks: [(p,q),...]}."""
         symbol = None
@@ -2970,15 +3089,17 @@ class SignalGenerator:
         self.event_bus.subscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.subscribe("NEWS_SENTIMENT", self._handle_news_sentiment)
         self.event_bus.subscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
+        self.event_bus.subscribe("GEOPOLITICAL_EVENT", self._handle_geopolitical_event)
         if self._ml_bootstrap_task is None or self._ml_bootstrap_task.done():
             self._ml_bootstrap_task = asyncio.create_task(self._bootstrap_ml_model_loop())
         logger.info(
             "SignalGenerator started (primary_tf={}, auto_trading={}, "
-            "weights: tech={:.0%} ml={:.0%} sent={:.0%} macro={:.0%} news={:.0%} ob={:.0%}, "
+            "weights: tech={:.0%} ml={:.0%} sent={:.0%} macro={:.0%} news={:.0%} ob={:.0%} geo={:.0%}, "
             "min_factors={})",
             self._primary_tf, self._auto_trading_enabled,
             self._tech_weight, self._ml_weight, self._sentiment_weight,
             self._macro_weight, self._news_weight, self._orderbook_weight,
+            self._geopolitical_weight,
             self._min_factors,
         )
         while self._running:
@@ -2993,3 +3114,4 @@ class SignalGenerator:
         self.event_bus.unsubscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.unsubscribe("NEWS_SENTIMENT", self._handle_news_sentiment)
         self.event_bus.unsubscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
+        self.event_bus.unsubscribe("GEOPOLITICAL_EVENT", self._handle_geopolitical_event)
