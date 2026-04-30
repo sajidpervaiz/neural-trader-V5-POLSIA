@@ -156,6 +156,7 @@ def build_app(
     executors: list[Any] | None = None,
     user_stream: Any = None,
     reconciliation_result: Any = None,
+    periodic_reconciler: Any = None,
     sqlite_store: Any = None,
     metrics: Any = None,
     geopolitical_feed: Any = None,
@@ -1475,11 +1476,26 @@ def build_app(
             "signals": {"source": "6_factor_composite" if signal_generator else "unavailable"},
         }
 
-    # ── /api/reconciliation/status — startup reconciliation state ─────────
+    # ── /api/reconciliation/status — startup + periodic reconciliation ────
     @app.get("/api/reconciliation/status")
     async def api_reconciliation_status() -> dict[str, Any]:
+        # Periodic snapshot — populated by PeriodicReconciler.run() loop.
+        periodic_payload: dict[str, Any] = {"available": False}
+        if periodic_reconciler is not None:
+            last = getattr(periodic_reconciler, "last_result", None) or {}
+            periodic_payload = {
+                "available": True,
+                "ran": bool(last.get("ran", False)),
+                "ts": float(last.get("ts", 0.0) or 0.0),
+                "interval_seconds": float(last.get("interval_seconds", 300.0) or 300.0),
+                "exchange_position_count": int(last.get("exchange_position_count", 0)),
+                "internal_position_count": int(last.get("internal_position_count", 0)),
+                "mismatches": list(last.get("mismatches", []) or []),
+                "safe_mode_triggered": bool(last.get("safe_mode_triggered", False)),
+            }
+
         if reconciliation_result is None:
-            return {"available": False, "safe_mode": False}
+            return {"available": False, "safe_mode": False, "periodic": periodic_payload}
         return {
             "available": True,
             "reconciliation_id": getattr(reconciliation_result, "reconciliation_id", ""),
@@ -1493,6 +1509,7 @@ def build_app(
             "actions_taken": list(reconciliation_result.actions_taken),
             "balance": reconciliation_result.balance,
             "leverage_settings": getattr(reconciliation_result, "leverage_settings", {}),
+            "periodic": periodic_payload,
         }
 
     # ── /api/user-stream/status — user data stream health ─────────────────

@@ -604,3 +604,111 @@ class StartupReconciler:
                     logger.warning("No order_placer — cannot place SL/TP for {}", symbol)
             elif not has_tp:
                 logger.warning("Position {} has SL but no TP — acceptable", symbol)
+
+
+# ── REQ-POS-004 / REQ-FS-007: periodic in-flight reconciliation ─────────────
+# StartupReconciler is one-shot and rebuilds state — too destructive to run
+# while the bot is live. PeriodicReconciler does a *lightweight* diff between
+# exchange truth and in-memory state, triggers SafeMode on mismatch, and
+# stores the latest result snapshot for the dashboard.
+
+class PeriodicReconciler:
+    """Lightweight position/balance diff, runs on a fixed schedule."""
+
+    def __init__(
+        self,
+        config: Config,
+        risk_manager: RiskManager,
+        client: Any,
+        interval_seconds: float = 300.0,
+        tolerance_qty: float = 1e-6,
+    ) -> None:
+        self.config = config
+        self.risk_manager = risk_manager
+        self._client = client
+        self._interval = float(interval_seconds)
+        self._tolerance = float(tolerance_qty)
+        self._running = False
+        self.last_check_ts: float = 0.0
+        self.last_result: dict[str, Any] = {
+            "ran": False,
+            "ts": 0.0,
+            "interval_seconds": self._interval,
+            "exchange_position_count": 0,
+            "internal_position_count": 0,
+            "mismatches": [],
+            "safe_mode_triggered": False,
+        }
+
+    async def _check_once(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "ran": True,
+            "ts": time.time(),
+            "interval_seconds": self._interval,
+            "exchange_position_count": 0,
+            "internal_position_count": 0,
+            "mismatches": [],
+            "safe_mode_triggered": False,
+        }
+        if self._client is None:
+            result["mismatches"].append("no_client_configured")
+            return result
+        try:
+            ex_positions_raw = await self._client.fetch_positions()
+        except Exception as exc:
+            result["mismatches"].append(f"fetch_positions_failed: {type(exc).__name__}: {exc}")
+            return result
+        ex_positions = {
+            p["symbol"]: float(p.get("contracts", 0.0) or 0.0)
+            for p in (ex_positions_raw or [])
+            if abs(float(p.get("contracts", 0.0) or 0.0)) > 0
+        }
+        internal: dict[str, float] = {}
+        for sym, pos in (getattr(self.risk_manager, "positions", {}) or {}).items():
+            qty = abs(float(getattr(pos, "size", 0.0) or 0.0))
+            if qty > 0:
+                internal[sym] = qty
+        result["exchange_position_count"] = len(ex_positions)
+        result["internal_position_count"] = len(internal)
+
+        # Diff per symbol
+        for sym, ex_qty in ex_positions.items():
+            int_qty = internal.get(sym, 0.0)
+            if abs(int_qty - ex_qty) > self._tolerance:
+                result["mismatches"].append(f"{sym}: exchange={ex_qty} internal={int_qty}")
+        for sym, int_qty in internal.items():
+            if sym not in ex_positions:
+                result["mismatches"].append(f"{sym}: internal={int_qty} exchange=missing")
+
+        if result["mismatches"]:
+            try:
+                from core.safe_mode import SafeModeReason
+                self.risk_manager.safe_mode.activate(
+                    SafeModeReason.EXCHANGE_API_TIMEOUT,
+                    detail=f"periodic_reconciliation_mismatch: {result['mismatches'][:3]}",
+                )
+                result["safe_mode_triggered"] = True
+            except Exception as exc:
+                logger.error("Failed to trip SafeMode on reconciliation mismatch: {}", exc)
+        return result
+
+    async def run(self) -> None:
+        """Loop forever, sleeping `interval_seconds` between checks."""
+        import asyncio
+        self._running = True
+        logger.info("PeriodicReconciler started (interval={}s)", self._interval)
+        while self._running:
+            try:
+                self.last_result = await self._check_once()
+                self.last_check_ts = self.last_result["ts"]
+                if self.last_result["mismatches"]:
+                    logger.warning(
+                        "Periodic reconciliation mismatches: {}",
+                        self.last_result["mismatches"][:5],
+                    )
+            except Exception as exc:
+                logger.exception("PeriodicReconciler iteration failed: {}", exc)
+            await asyncio.sleep(self._interval)
+
+    def stop(self) -> None:
+        self._running = False

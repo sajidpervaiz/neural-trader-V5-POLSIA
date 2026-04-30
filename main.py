@@ -34,7 +34,7 @@ from execution.order_manager import OrderManager
 from execution.exchange_factory import create_all_executors, create_variational_executor
 from execution.smart_order_router import SmartOrderRouter
 from execution.startup_validation import StartupValidator, ValidationError
-from execution.reconciliation import StartupReconciler
+from execution.reconciliation import StartupReconciler, PeriodicReconciler
 
 from storage.db_handler import DBHandler
 from storage.cache import Cache
@@ -249,6 +249,20 @@ async def main() -> None:
                 )
             logger.info("Reconciliation result: {}", recon_result)
 
+    # REQ-POS-004 / REQ-FS-007: lightweight periodic re-check during the run.
+    # Distinct from StartupReconciler — it just diffs exchange vs internal
+    # positions every 5 min and trips SafeMode on mismatch (no state rebuild).
+    periodic_reconciler: PeriodicReconciler | None = None
+    if client:
+        recon_cfg = config.get_value("monitoring", "reconciliation") or {}
+        periodic_reconciler = PeriodicReconciler(
+            config=config,
+            risk_manager=risk_mgr,
+            client=client,
+            interval_seconds=float(recon_cfg.get("interval_seconds", 300.0)),
+        )
+        components["periodic_reconciler"] = periodic_reconciler
+
     app = build_app(
         config, event_bus, risk_mgr, data_manager, order_mgr, db, cache, signal_gen,
         news_feed=news_feed,
@@ -260,6 +274,7 @@ async def main() -> None:
         reconciliation_result=recon_result,
         sqlite_store=sqlite_store,
         metrics=metrics,
+        periodic_reconciler=periodic_reconciler,
     )
 
     if app is not None:
@@ -404,6 +419,9 @@ async def main() -> None:
 
     if model_retrainer is not None:
         tasks.append(asyncio.create_task(model_retrainer.run(), name="model_retrainer"))
+
+    if periodic_reconciler is not None:
+        tasks.append(asyncio.create_task(periodic_reconciler.run(), name="periodic_reconciler"))
 
     for executor in executors:
         tasks.append(asyncio.create_task(executor.run(), name=f"exec_{executor.exchange_id}"))
