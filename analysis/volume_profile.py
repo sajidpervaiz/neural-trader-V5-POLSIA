@@ -44,6 +44,12 @@ class VolumeFlowState:
     # V6.0 additions
     lvn_levels: list[float] = field(default_factory=list)
     hvn_levels: list[float] = field(default_factory=list)
+    # REQ-IND-017: aggressor inference quality flags. cvd_degraded=True when
+    # the close-position proxy was inconclusive (mostly doji-like bars in the
+    # window) or when no real bid/ask aggressor data was available.
+    cvd_degraded: bool = False
+    cvd_inference_method: str = "close_position_proxy"
+    cvd_ambiguous_pct: float = 0.0     # share of lookback bars with close near mid
 
 
 class VolumeProfileAnalyzer:
@@ -179,29 +185,40 @@ class VolumeProfileAnalyzer:
 
     # ── Volume Delta (approximate from OHLCV) ────────────────────────────
     @staticmethod
-    def _compute_delta(df: pd.DataFrame, lookback: int = 50) -> tuple[float, str]:
-        """Approximate volume delta from candle direction."""
+    def _compute_delta(df: pd.DataFrame, lookback: int = 50) -> tuple[float, str, float]:
+        """Approximate volume delta from candle direction.
+
+        REQ-IND-017: also returns the share of bars whose close fell near the
+        bar midpoint (|close_pos − 0.5| < 0.15) — these are doji-like and
+        produce a low-confidence aggressor inference. Caller uses this to
+        flag the CVD output as degraded.
+        """
         seg = df.tail(lookback)
         delta = 0.0
+        ambiguous = 0
+        total = 0
         for _, row in seg.iterrows():
             vol = row.get("volume", 0.0)
             close = row["close"]
             open_ = row["open"]
             high = row["high"]
             low = row["low"]
-            # Estimate buy/sell ratio from wick analysis
             bar_range = high - low if high > low else 1.0
             close_pos = (close - low) / bar_range  # 0..1, 1 = closed at high
             buy_pct = close_pos
             delta += vol * (2 * buy_pct - 1)
+            total += 1
+            if abs(close_pos - 0.5) < 0.15:
+                ambiguous += 1
 
+        ambiguous_pct = (ambiguous / total) if total else 0.0
         if delta > 0:
             trend = "accumulating"
         elif delta < 0:
             trend = "distributing"
         else:
             trend = "neutral"
-        return delta, trend
+        return delta, trend, ambiguous_pct
 
     # ── Composite analysis ────────────────────────────────────────────────
     def analyze(self, df: pd.DataFrame) -> VolumeFlowState:
@@ -274,14 +291,19 @@ class VolumeProfileAnalyzer:
             score -= 0.15
             reasons.append("VWAP_falling")
 
-        # Volume delta
-        delta, delta_trend = self._compute_delta(df)
+        # Volume delta — proxied from candle close-position; flag degraded
+        # when most bars in the window are doji-like (REQ-IND-017).
+        delta, delta_trend, ambiguous_pct = self._compute_delta(df)
         state.volume_delta = delta
         state.delta_trend = delta_trend
-        if delta_trend == "accumulating":
+        state.cvd_ambiguous_pct = float(ambiguous_pct)
+        state.cvd_degraded = bool(ambiguous_pct >= 0.50)
+        if state.cvd_degraded:
+            reasons.append(f"cvd_degraded({int(ambiguous_pct * 100)}%_ambiguous)")
+        if delta_trend == "accumulating" and not state.cvd_degraded:
             score += 0.15
             reasons.append("delta_accumulating")
-        elif delta_trend == "distributing":
+        elif delta_trend == "distributing" and not state.cvd_degraded:
             score -= 0.15
             reasons.append("delta_distributing")
 
