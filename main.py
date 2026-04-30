@@ -252,16 +252,18 @@ async def main() -> None:
     # REQ-POS-004 / REQ-FS-007: lightweight periodic re-check during the run.
     # Distinct from StartupReconciler — it just diffs exchange vs internal
     # positions every 5 min and trips SafeMode on mismatch (no state rebuild).
+    # `client` is only defined inside the live-mode init block above; paper
+    # mode never gets a real exchange client and there's nothing to reconcile.
     periodic_reconciler: PeriodicReconciler | None = None
-    if client:
+    _maybe_client = locals().get("client")
+    if _maybe_client:
         recon_cfg = config.get_value("monitoring", "reconciliation") or {}
         periodic_reconciler = PeriodicReconciler(
             config=config,
             risk_manager=risk_mgr,
-            client=client,
+            client=_maybe_client,
             interval_seconds=float(recon_cfg.get("interval_seconds", 300.0)),
         )
-        components["periodic_reconciler"] = periodic_reconciler
 
     app = build_app(
         config, event_bus, risk_mgr, data_manager, order_mgr, db, cache, signal_gen,
