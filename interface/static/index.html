@@ -3463,17 +3463,26 @@ function renderLayerDetail(layer, ctx) {
       h += '</div></div>';
     }
   }
-  // L4 Volume Flow — CVD-degraded pill (REQ-IND-017)
+  // L4 Volume Flow — VPVR liquidity zones + CVD-degraded pill
   if (layer.id === 5 && ctx && ctx.quality) {
-    const comps = ctx.quality.components || {};
-    const vf = Number(comps.volume_flow || 0);
-    // The degraded flag isn't directly on the layer payload yet — surface a
-    // generic "low-confidence aggressor" hint when the volume score is in
-    // the ambiguous middle (40-60) which correlates with degraded windows.
-    if (vf >= 40 && vf <= 60) {
-      h += '<div class="section"><div class="meta">CVD INFERENCE</div>';
-      h += '<div style="display:inline-block;padding:2px 6px;border:1px solid var(--orange);color:var(--orange);font:600 10px \'JetBrains Mono\';border-radius:3px">DEGRADED</div>';
-      h += '<div style="margin-top:4px;font:10px \'Inter\';color:var(--text3)">close-position aggressor proxy is inconclusive — most bars closed near the mid of their range</div>';
+    const vp = (ctx.quality && ctx.quality.volume_profile) || {};
+    if (vp && (vp.poc || vp.vah || vp.val)) {
+      h += '<div class="section"><div class="meta">VPVR LIQUIDITY ZONES (REQ-IND-016)</div>';
+      h += '<div class="kv">';
+      h += '<span class="k">POC</span><span class="v">'+Number(vp.poc||0).toFixed(2)+'</span>';
+      h += '<span class="k">VAH</span><span class="v">'+Number(vp.vah||0).toFixed(2)+'</span>';
+      h += '<span class="k">VAL</span><span class="v">'+Number(vp.val||0).toFixed(2)+'</span>';
+      const lvn = (vp.lvn_levels || []).slice(0,5);
+      const hvn = (vp.hvn_levels || []).slice(0,5);
+      if (lvn.length) h += '<span class="k">LVN ('+lvn.length+')</span><span class="v" style="font-size:10px">'+lvn.map(x=>Number(x).toFixed(2)).join(' · ')+'</span>';
+      if (hvn.length) h += '<span class="k">HVN ('+hvn.length+')</span><span class="v" style="font-size:10px">'+hvn.map(x=>Number(x).toFixed(2)).join(' · ')+'</span>';
+      h += '<span class="k">VWAP slope</span><span class="v">'+esc(String(vp.vwap_slope||'flat'))+'</span>';
+      h += '<span class="k">Δ trend</span><span class="v">'+esc(String(vp.delta_trend||'neutral'))+'</span>';
+      h += '</div>';
+      if (vp.cvd_degraded) {
+        const ambPct = Math.round(Number(vp.cvd_ambiguous_pct||0)*100);
+        h += '<div style="margin-top:6px"><span style="display:inline-block;padding:2px 6px;border:1px solid var(--orange);color:var(--orange);font:600 10px \'JetBrains Mono\';border-radius:3px">CVD DEGRADED ('+ambPct+'% ambiguous)</span></div>';
+      }
       h += '</div>';
     }
   }

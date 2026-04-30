@@ -620,6 +620,10 @@ class OrderbookScorer:
         self._last_imbalance: float = 0.0
         self._last_imbalance_by_symbol: dict[str, float] = {}
         self._last_depth_ratio_by_symbol: dict[str, float] = {}
+        # REQ-EXE-005 / REQ-IND-019: retain the raw book per symbol so the
+        # slippage estimator can walk it without re-fetching from the feed.
+        self._last_bids_by_symbol: dict[str, list[tuple[float, float]]] = {}
+        self._last_asks_by_symbol: dict[str, list[tuple[float, float]]] = {}
 
     def update(
         self,
@@ -647,8 +651,19 @@ class OrderbookScorer:
                     sum(price * qty for price, qty in asks)
                 )
                 self._last_depth_ratio_by_symbol[symbol] = total_notional / min_depth_usd
+            # Retain raw book for the slippage estimator (capped at 50 levels
+            # per side to keep the snapshot light).
+            self._last_bids_by_symbol[symbol] = [(float(p), float(q)) for p, q in (bids or [])][:50]
+            self._last_asks_by_symbol[symbol] = [(float(p), float(q)) for p, q in (asks or [])][:50]
 
         return imbalance
+
+    def book_for(self, symbol: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Latest cached (bids, asks) for the symbol — empty lists if never seen."""
+        return (
+            list(self._last_bids_by_symbol.get(symbol, [])),
+            list(self._last_asks_by_symbol.get(symbol, [])),
+        )
 
     def score(self, symbol: str | None = None) -> float:
         if symbol is not None:
@@ -2646,6 +2661,18 @@ class SignalGenerator:
             "session": session_rule.name if session_rule else "none",
             "regime_class": regime_class,
             "signal_type": signal_type.value,
+            # REQ-IND-016: VPVR liquidity zones surfaced for the dashboard.
+            "volume_profile": {
+                "poc": float(getattr(vol_flow, "poc_price", 0.0) or 0.0),
+                "vah": float(getattr(vol_flow, "value_area_high", 0.0) or 0.0),
+                "val": float(getattr(vol_flow, "value_area_low", 0.0) or 0.0),
+                "lvn_levels": list(getattr(vol_flow, "lvn_levels", []) or []),
+                "hvn_levels": list(getattr(vol_flow, "hvn_levels", []) or []),
+                "vwap_slope": str(getattr(vol_flow, "vwap_slope", "flat") or "flat"),
+                "delta_trend": str(getattr(vol_flow, "delta_trend", "neutral") or "neutral"),
+                "cvd_degraded": bool(getattr(vol_flow, "cvd_degraded", False)),
+                "cvd_ambiguous_pct": float(getattr(vol_flow, "cvd_ambiguous_pct", 0.0) or 0.0),
+            },
         }
 
         # ── REQ-SIG-010..012: layer-conflict detection ───────────────────

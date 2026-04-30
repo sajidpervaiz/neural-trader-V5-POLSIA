@@ -691,6 +691,115 @@ def build_app(
             "total_trades": total_trades,
         }
 
+    # ── /api/charts — REQ-IND-018..020: candles + aligned indicator series ─
+    # Returns the chart-registry view per (symbol, timeframe): bar series,
+    # indicator overlays aligned to the same index, and metadata. Lookback
+    # capped to 500 bars to keep the payload reasonable.
+    _CHART_OVERLAY_KEYS = (
+        "ema_9", "ema_21", "ema_50", "ema_55", "ema_200",
+        "sma_20", "sma_50",
+        "vwap",
+        "bb_upper", "bb_mid", "bb_lower",
+        "kc_upper", "kc_mid", "kc_lower",
+        "donchian_upper", "donchian_lower", "donchian_mid",
+        "supertrend",
+        "psar",
+        "tenkan_sen", "kijun_sen", "senkou_a", "senkou_b",
+    )
+    _CHART_OSCILLATOR_KEYS = (
+        "rsi_14", "rsi_21",
+        "macd", "macd_signal", "macd_hist",
+        "stoch_k", "stoch_d",
+        "atr_14", "atr_pct",
+        "adx", "plus_di", "minus_di",
+        "mfi_14", "cci_20", "williams_r",
+        "obv",
+        "vortex_diff", "awesome_osc",
+    )
+
+    @app.get("/api/charts/{symbol:path}/{timeframe}")
+    async def api_charts(symbol: str, timeframe: str, lookback: int = 200) -> dict[str, Any]:
+        try:
+            symbol = _validate_symbol(symbol)
+            timeframe = _validate_timeframe(timeframe)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        lookback = max(20, min(int(lookback), 500))
+
+        df = None
+        sym_used = symbol
+        if data_manager is not None:
+            clean = symbol.replace("/", "").replace(":USDT", "").upper()
+            base = clean.replace("USDT", "") if clean.endswith("USDT") else clean
+            for sym_try in (f"{base}/USDT:USDT", symbol, f"{base}/USDT", clean):
+                df = data_manager.get_dataframe("binance", sym_try, timeframe)
+                if df is not None and len(df) > 0:
+                    sym_used = sym_try
+                    break
+            else:
+                df = None
+
+        if df is None or len(df) == 0:
+            return {
+                "available": False,
+                "symbol": symbol, "timeframe": timeframe,
+                "reason": "no live dataframe — try /api/candles for historical fallback",
+            }
+
+        df = df.tail(lookback)
+
+        def _series(col: str) -> list[float | None]:
+            if col not in df.columns:
+                return []
+            out: list[float | None] = []
+            for v in df[col].tolist():
+                try:
+                    fv = float(v)
+                    out.append(fv if fv == fv else None)  # NaN → None
+                except Exception:
+                    out.append(None)
+            return out
+
+        timestamps = [
+            (idx.isoformat() if hasattr(idx, "isoformat") else str(idx))
+            for idx in df.index
+        ]
+        candles = []
+        for idx, row in df.iterrows():
+            candles.append({
+                "time": idx.isoformat() if hasattr(idx, "isoformat") else str(idx),
+                "open": float(row.get("open", 0) or 0),
+                "high": float(row.get("high", 0) or 0),
+                "low": float(row.get("low", 0) or 0),
+                "close": float(row.get("close", 0) or 0),
+                "volume": float(row.get("volume", 0) or 0),
+            })
+        overlays = {k: _series(k) for k in _CHART_OVERLAY_KEYS if k in df.columns}
+        oscillators = {k: _series(k) for k in _CHART_OSCILLATOR_KEYS if k in df.columns}
+        # Sparse pivot markers — keep NaN preserved as None (caller filters).
+        pivots = {
+            "swing_high": _series("swing_high"),
+            "swing_low": _series("swing_low"),
+        }
+        warmup_count = int(df["_warmup"].sum()) if "_warmup" in df.columns else 0
+
+        return {
+            "available": True,
+            "symbol": sym_used,
+            "timeframe": timeframe,
+            "bars": len(df),
+            "warmup_bars": warmup_count,
+            "timestamps": timestamps,
+            "candles": candles,
+            "overlays": overlays,
+            "oscillators": oscillators,
+            "pivots": pivots,
+            "metadata": {
+                "overlay_keys": list(overlays.keys()),
+                "oscillator_keys": list(oscillators.keys()),
+            },
+        }
+
     # ── /api/candles — OHLCV data for chart ───────────────────────────────
     _candle_cache: dict[str, Any] = {"key": "", "ts": 0.0, "candles": []}
 
@@ -1518,6 +1627,44 @@ def build_app(
             "balance": reconciliation_result.balance,
             "leverage_settings": getattr(reconciliation_result, "leverage_settings", {}),
             "periodic": periodic_payload,
+        }
+
+    # ── /api/slippage — pre-trade fill estimator (REQ-EXE-005) ────────────
+    @app.get("/api/slippage")
+    async def api_slippage(
+        symbol: str = Query("BTC/USDT:USDT"),
+        side: str = Query("buy"),
+        qty: float = Query(0.01),
+    ) -> dict[str, Any]:
+        """Walk the latest cached order book to estimate the average fill
+        price + slippage for a target qty. Returns 0-bps when no book is
+        cached (the bot couldn't make a marketable decision in that case)."""
+        from analysis.slippage import estimate_fill
+        try:
+            symbol = _validate_symbol(symbol)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        if signal_generator is None or not hasattr(signal_generator, "_orderbook_scorer"):
+            return {"available": False, "reason": "orderbook_scorer not wired"}
+        scorer = signal_generator._orderbook_scorer
+        bids, asks = scorer.book_for(symbol)
+        # Try alias variants for the cache key.
+        if not bids and not asks:
+            clean = symbol.replace("/", "").replace(":USDT", "").upper()
+            base = clean.replace("USDT", "") if clean.endswith("USDT") else clean
+            for sym_try in (f"{base}/USDT:USDT", f"{base}/USDT", clean):
+                bids, asks = scorer.book_for(sym_try)
+                if bids or asks:
+                    symbol = sym_try
+                    break
+        if not bids and not asks:
+            return {"available": False, "symbol": symbol, "reason": "no cached book"}
+        est = estimate_fill(side, qty, bids, asks)
+        return {
+            "available": True,
+            "symbol": symbol,
+            "book": {"bid_levels": len(bids), "ask_levels": len(asks)},
+            **est.to_dict(),
         }
 
     # ── /api/state — operational FSM snapshot (REQ-STATE-001..012) ────────
