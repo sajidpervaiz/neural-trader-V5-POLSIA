@@ -189,11 +189,23 @@ class Metrics:
         if len(self._order_latency_samples) > self._max_samples:
             self._order_latency_samples = self._order_latency_samples[-self._max_samples:]
 
+    @staticmethod
+    def _percentile_ms(values: list[float], pct: float) -> float:
+        """Safe percentile in ms — handles 0/1-element arrays without IndexError."""
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return round(values[0] * 1000, 1)
+        s = sorted(values)
+        # Nearest-rank method, clamped to last index.
+        idx = min(len(s) - 1, max(0, int(round(pct / 100.0 * (len(s) - 1)))))
+        return round(s[idx] * 1000, 1)
+
     def get_latency_stats(self) -> dict[str, Any]:
-        """Return current latency statistics for the /api/latency endpoint."""
+        """REQ-MON-002: per-bucket latency stats with p50/p95/p99 percentiles."""
         import statistics
         result: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
-        # Feed lag stats per exchange
+
         by_exchange: dict[str, list[float]] = {}
         for ex, lag in self._feed_lag_samples:
             by_exchange.setdefault(ex, []).append(lag)
@@ -201,11 +213,12 @@ class Metrics:
             result["feed_lag"][ex] = {
                 "count": len(lags),
                 "avg_ms": round(statistics.mean(lags) * 1000, 1) if lags else 0,
-                "p50_ms": round(statistics.median(lags) * 1000, 1) if lags else 0,
-                "p95_ms": round(sorted(lags)[int(len(lags) * 0.95)] * 1000, 1) if len(lags) > 1 else 0,
+                "p50_ms": self._percentile_ms(lags, 50),
+                "p95_ms": self._percentile_ms(lags, 95),
+                "p99_ms": self._percentile_ms(lags, 99),
                 "max_ms": round(max(lags) * 1000, 1) if lags else 0,
             }
-        # Order latency stats
+
         by_type: dict[str, list[float]] = {}
         for ex, otype, lat in self._order_latency_samples:
             key = f"{ex}_{otype}"
@@ -214,10 +227,32 @@ class Metrics:
             result["order_latency"][key] = {
                 "count": len(lats),
                 "avg_ms": round(statistics.mean(lats) * 1000, 0) if lats else 0,
-                "p50_ms": round(statistics.median(lats) * 1000, 0) if lats else 0,
+                "p50_ms": self._percentile_ms(lats, 50),
+                "p95_ms": self._percentile_ms(lats, 95),
+                "p99_ms": self._percentile_ms(lats, 99),
                 "max_ms": round(max(lats) * 1000, 0) if lats else 0,
             }
         return result
+
+    def get_latency_percentiles(self) -> dict[str, Any]:
+        """Compact percentiles-only payload for the dashboard chip strip."""
+        full = self.get_latency_stats()
+        compact: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
+        for ex, stats in full["feed_lag"].items():
+            compact["feed_lag"][ex] = {
+                "p50_ms": stats["p50_ms"],
+                "p95_ms": stats["p95_ms"],
+                "p99_ms": stats["p99_ms"],
+                "count": stats["count"],
+            }
+        for key, stats in full["order_latency"].items():
+            compact["order_latency"][key] = {
+                "p50_ms": stats["p50_ms"],
+                "p95_ms": stats["p95_ms"],
+                "p99_ms": stats["p99_ms"],
+                "count": stats["count"],
+            }
+        return compact
 
     async def _handle_signal(self, payload: Any) -> None:
         signal = payload

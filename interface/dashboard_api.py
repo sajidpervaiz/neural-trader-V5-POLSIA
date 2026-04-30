@@ -1033,11 +1033,18 @@ def build_app(
     # ── /api/latency — live latency statistics ────────────────────────────
     @app.get("/api/latency")
     async def api_latency() -> dict[str, Any]:
-        """Return current latency statistics: feed lag, order execution times."""
+        """REQ-MON-002: latency stats with p50/p95/p99 percentiles."""
         stats: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
         if metrics and hasattr(metrics, "get_latency_stats"):
             stats = metrics.get_latency_stats()
         return stats
+
+    @app.get("/api/latency/percentiles")
+    async def api_latency_percentiles() -> dict[str, Any]:
+        """Compact p50/p95/p99 payload for the dashboard chip strip."""
+        if metrics and hasattr(metrics, "get_latency_percentiles"):
+            return metrics.get_latency_percentiles()
+        return {"feed_lag": {}, "order_latency": {}}
 
     # ── /api/trade-history — closed trades + realized PnL ─────────────────
     @app.get("/api/trade-history")
