@@ -892,6 +892,39 @@ class SignalGenerator:
         """Return the active quality gate for the current runtime mode."""
         return 30 if self._is_paper_mode() else 65
 
+    # ── REQ-SIG-009: Master-Score band thresholds ────────────────────────
+    # Default cutoffs match the SRS spec exactly; each is config-overridable
+    # under signals.master_score_bands.{strong,normal,no_trade}.
+    _DEFAULT_MASTER_BANDS = {"strong": 85, "normal": 70, "no_trade": 30}
+
+    def _master_score_bands(self) -> dict[str, int]:
+        cfg = (self.config.get_value("signals", "master_score_bands") or {})
+        return {
+            "strong": int(cfg.get("strong", self._DEFAULT_MASTER_BANDS["strong"])),
+            "normal": int(cfg.get("normal", self._DEFAULT_MASTER_BANDS["normal"])),
+            "no_trade": int(cfg.get("no_trade", self._DEFAULT_MASTER_BANDS["no_trade"])),
+        }
+
+    def classify_master_score(self, score: float | int) -> str:
+        """REQ-SIG-009: classify a 0–100 score into one of the four spec bands.
+
+        Returns one of: 'STRONG' (>= strong), 'NORMAL' (>= normal),
+        'NO_TRADE' (>= no_trade), 'OPPOSITE' (< no_trade — dominant bias is
+        the inverse of the proposed direction).
+        """
+        try:
+            sc = float(score)
+        except (TypeError, ValueError):
+            return "NO_TRADE"
+        bands = self._master_score_bands()
+        if sc >= bands["strong"]:
+            return "STRONG"
+        if sc >= bands["normal"]:
+            return "NORMAL"
+        if sc >= bands["no_trade"]:
+            return "NO_TRADE"
+        return "OPPOSITE"
+
     def _get_technical_threshold(self) -> int:
         """Return the technical confluence threshold for the active mode."""
         return 30 if self._is_paper_mode() else 65

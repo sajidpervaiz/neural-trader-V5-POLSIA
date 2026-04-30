@@ -3116,6 +3116,11 @@ def build_app(
                     preview = signal_generator.get_quality_preview()
                     if isinstance(preview, dict) and (int(preview.get("total", 0) or 0) > 0 or preview.get("reason")):
                         payload = {**payload, **preview}
+                # REQ-SIG-009: classify the master score into spec bands so the
+                # dashboard can render the 4-band gradient.
+                if hasattr(signal_generator, "_master_score_bands") and hasattr(signal_generator, "classify_master_score"):
+                    payload["bands"] = signal_generator._master_score_bands()
+                    payload["band"] = signal_generator.classify_master_score(payload.get("total", 0) or 0)
                 return payload
         return {
             "total": 0,
