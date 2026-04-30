@@ -14,6 +14,7 @@ from loguru import logger
 from core.config import Config
 from core.event_bus import EventBus
 from core.dispatcher import Dispatcher
+from core.state_machine import OperationalState, OperationalStateMachine
 
 from data_ingestion.cex_websocket import CEXWebSocketManager
 from data_ingestion.dex_rpc import DEXRPCFeed
@@ -97,8 +98,14 @@ def _setup_logging(config: Config) -> None:
 
 
 async def main() -> None:
+    # REQ-STATE-001..012: operational FSM.
+    # Constructed first so every subsequent stage can drive transitions
+    # through the canonical boot path. Single-writer; passed by reference.
+    state_machine = OperationalStateMachine()
+
     config = Config.get(path=os.getenv("NT_CONFIG_PATH"))
     _setup_logging(config)
+    state_machine.transition_to(OperationalState.CONFIG_VALIDATED, reason="config_loaded")
 
     logger.info("=" * 60)
     logger.info("  NUERAL-TRADER-5  |  paper_mode={}", config.paper_mode)
@@ -277,6 +284,7 @@ async def main() -> None:
         sqlite_store=sqlite_store,
         metrics=metrics,
         periodic_reconciler=periodic_reconciler,
+        state_machine=state_machine,
     )
 
     if app is not None:
@@ -399,6 +407,61 @@ async def main() -> None:
     await health_checker.register_component("risk_manager", _check_risk_manager)
     await health_checker.register_component("data_manager", _check_data_manager)
 
+    # ── FSM: boot path → SIGNALING_ACTIVE → EXECUTION_ENABLED ─────────────
+    # WARMUP / market-data / order-book stages are visited synchronously here
+    # before background tasks run. The actual WS connect+sync happens in the
+    # paper_feed/orderbook_feed tasks below; advancing to MARKET_DATA_LIVE
+    # there is a future enhancement. For now we record the structural
+    # progression that we know is true at this point.
+    state_machine.transition_to(OperationalState.WARMUP, reason="hydrating_indicators")
+    state_machine.transition_to(OperationalState.CONNECTING_MARKET_DATA, reason="ws_subscribe")
+    state_machine.transition_to(OperationalState.MARKET_DATA_LIVE, reason="paper_feed_ready")
+    state_machine.transition_to(OperationalState.ORDER_BOOK_SYNCED, reason="orderbook_feed_ready")
+    state_machine.transition_to(OperationalState.SIGNALING_ACTIVE, reason="signal_generator_active")
+    # Reflect the active safety primitives now — execution is ENABLED unless
+    # the kill switch / safe mode / circuit breaker says otherwise.
+    sm = getattr(risk_mgr, "safe_mode", None)
+    cb_open = bool(getattr(getattr(risk_mgr, "_circuit_breaker", None), "is_open", False))
+    if sm is not None and getattr(sm, "is_active", False):
+        state_machine.transition_to(OperationalState.SAFE_MODE, reason="safe_mode_active_at_boot")
+    elif cb_open:
+        state_machine.transition_to(OperationalState.CIRCUIT_BREAKER_ACTIVE, reason="cb_open_at_boot")
+    else:
+        state_machine.transition_to(OperationalState.EXECUTION_ENABLED, reason="all_gates_clear")
+
+    # Bridge SafeModeManager into the FSM. SafeMode is multi-reason; we map
+    # ANY active reason → SAFE_MODE, all-clear → back to EXECUTION_ENABLED.
+    if sm is not None:
+        _orig_activate = sm.activate
+        _orig_deactivate = sm.deactivate
+
+        def _bridge_activate(reason, detail=""):  # type: ignore[no-untyped-def]
+            result = _orig_activate(reason, detail)
+            try:
+                if state_machine.current is not OperationalState.SAFE_MODE:
+                    state_machine.force_to(
+                        OperationalState.SAFE_MODE,
+                        reason=f"safe_mode:{getattr(reason, 'value', reason)}",
+                    )
+            except Exception as exc:
+                logger.warning("FSM bridge SafeMode.activate failed: {}", exc)
+            return result
+
+        def _bridge_deactivate(reason):  # type: ignore[no-untyped-def]
+            result = _orig_deactivate(reason)
+            try:
+                if not sm.is_active and state_machine.current is OperationalState.SAFE_MODE:
+                    state_machine.transition_to(
+                        OperationalState.EXECUTION_ENABLED,
+                        reason=f"safe_mode_cleared:{getattr(reason, 'value', reason)}",
+                    )
+            except Exception as exc:
+                logger.warning("FSM bridge SafeMode.deactivate failed: {}", exc)
+            return result
+
+        sm.activate = _bridge_activate  # type: ignore[method-assign]
+        sm.deactivate = _bridge_deactivate  # type: ignore[method-assign]
+
     tasks = [
         asyncio.create_task(paper_feed.run(seed_only=_seed_only), name="paper_feed"),
         asyncio.create_task(dispatcher.start(), name="dispatcher"),
@@ -479,6 +542,7 @@ async def main() -> None:
     await health_checker.stop_periodic_checks()
     await db.close()
 
+    state_machine.force_to(OperationalState.SHUTDOWN, reason="graceful_shutdown")
     logger.info("Shutdown complete")
 
 

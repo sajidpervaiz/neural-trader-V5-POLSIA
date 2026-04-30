@@ -2197,12 +2197,25 @@ function _srsTimeAgo(ts) {
   if (diff < 3600) return Math.round(diff/60)+'m';
   return Math.round(diff/3600)+'h';
 }
+function _fsmStateColor(state) {
+  if (!state) return 'var(--text3)';
+  if (state === 'execution_enabled' || state === 'in_position') return 'var(--green)';
+  if (state === 'safe_mode' || state === 'circuit_breaker_active' || state === 'manual_kill_active') return 'var(--red)';
+  if (state === 'shutdown') return 'var(--text3)';
+  return 'var(--yellow)';  // boot states
+}
 function _srsRibbonHtml(ctx) {
   const q = (ctx && ctx.quality) || {};
   const band = q.band || 'NO_TRADE';
   const total = Number(q.total || 0);
   const bands = q.bands || {strong:85, normal:70, no_trade:30};
   const bandCol = _srsBandColor(band);
+  // FSM state — single source of truth
+  const fsm = (ctx && ctx.fsm) || {};
+  const fsmState = fsm.current || 'unknown';
+  const fsmCol = _fsmStateColor(fsmState);
+  const fsmTradeReady = !!fsm.is_trade_ready;
+  const fsmSecs = Math.max(0, Number(fsm.seconds_in_state || 0));
   // Conflict block (live-state from /api/quality.detail or future endpoint)
   // We surface it via _last_layer_status.signal_quality_detail when present.
   const layers = (ctx.raw && ctx.raw.layers) || ctx.layers || [];
@@ -2228,6 +2241,11 @@ function _srsRibbonHtml(ctx) {
 
   let h = '<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px 10px;margin-bottom:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);font:11px \'JetBrains Mono\'">';
   h += '<span style="font:700 10px \'Inter\';color:var(--text3);text-transform:uppercase;letter-spacing:.06em">SRS</span>';
+  // FSM operational state pill
+  if (fsm && fsm.available !== false) {
+    const fsmLbl = String(fsmState).toUpperCase().replace(/_/g, ' ');
+    h += '<span title="seconds_in_state='+fsmSecs.toFixed(0)+'  trade_ready='+fsmTradeReady+'" style="border:1px solid '+fsmCol+';color:'+fsmCol+';padding:2px 6px;border-radius:3px;font-weight:700">FSM '+esc(fsmLbl)+'</span>';
+  }
   h += '<span style="border:1px solid '+bandCol+';color:'+bandCol+';padding:2px 6px;border-radius:3px;font-weight:700">'+esc(band)+' '+total+'</span>';
   h += '<span style="color:var(--text3)">85·70·30 → '+bands.strong+'·'+bands.normal+'·'+bands.no_trade+'</span>';
   if (warmup) h += '<span style="border:1px solid var(--yellow);color:var(--yellow);padding:2px 6px;border-radius:3px">WARMUP</span>';
@@ -3380,7 +3398,7 @@ window.__flowSelectedId = null;       // currently-selected layer id (1..10)
 window.__flowCtx = null;              // last-loaded context bundle
 
 async function loadFlowCtx() {
-  const [layers, quality, session, geo, status, recon, latency] = await Promise.all([
+  const [layers, quality, session, geo, status, recon, latency, fsm] = await Promise.all([
     fetch('/api/layers').then(r=>r.json()).catch(()=>({layers:[]})),
     fetch('/api/quality').then(r=>r.json()).catch(()=>({})),
     fetch('/api/session').then(r=>r.json()).catch(()=>({})),
@@ -3388,6 +3406,7 @@ async function loadFlowCtx() {
     fetch('/api/status').then(r=>r.json()).catch(()=>({})),
     fetch('/api/reconciliation/status').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/latency/percentiles').then(r=>r.json()).catch(()=>({feed_lag:{},order_latency:{}})),
+    fetch('/api/state').then(r=>r.json()).catch(()=>({available:false})),
   ]);
   // Synthesize the L10 (Geopolitical) layer entry the same way the Pipeline tab does.
   const list = (layers.layers || []).slice();
@@ -3409,7 +3428,7 @@ async function loadFlowCtx() {
       description:'RSS-driven per-symbol news factor',
       status:st, score: topAbs>=0?topAbs*100:0, threshold:50, detail});
   }
-  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, raw:layers};
+  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, fsm, raw:layers};
   return window.__flowCtx;
 }
 
@@ -3530,6 +3549,35 @@ function renderFlowSummary(ctx) {
   h += '<span class="k">Mode</span><span class="v">'+((ctx.raw||{}).paper_mode===false?'LIVE':'PAPER')+'</span>';
   h += '</div>';
   h += '<div class="desc" style="margin-top:10px;color:var(--text3)">Click a layer node on the left to inspect its score, threshold, and raw decision data.</div>';
+
+  // Operational FSM block — current state + last 8 transitions
+  const fsm = (ctx && ctx.fsm) || {};
+  if (fsm && fsm.available !== false) {
+    const stCol = _fsmStateColor(fsm.current);
+    const fsmLbl = String(fsm.current || 'unknown').toUpperCase().replace(/_/g, ' ');
+    h += '<div class="section"><div class="meta">OPERATIONAL FSM</div>';
+    h += '<div style="display:flex;gap:8px;align-items:center">';
+    h += '<span style="border:1px solid '+stCol+';color:'+stCol+';padding:3px 8px;border-radius:3px;font:700 11px \'JetBrains Mono\'">'+esc(fsmLbl)+'</span>';
+    h += '<span style="font:10px \'JetBrains Mono\';color:var(--text3)">'+Math.max(0, Number(fsm.seconds_in_state||0)).toFixed(0)+'s in state</span>';
+    h += '<span style="font:10px \'JetBrains Mono\';color:'+(fsm.is_trade_ready?'var(--green)':'var(--text3)')+'">'+(fsm.is_trade_ready?'TRADE READY':'NOT TRADE READY')+'</span>';
+    h += '</div>';
+    const hist = (fsm.history || []).slice(-8);
+    if (hist.length) {
+      h += '<div style="margin-top:8px;font:10px \'JetBrains Mono\';color:var(--text3)">Recent transitions</div>';
+      h += '<div style="margin-top:4px;display:flex;flex-direction:column;gap:2px">';
+      hist.slice().reverse().forEach(t => {
+        h += '<div style="display:flex;gap:6px;font:10px \'JetBrains Mono\';color:var(--text2)">';
+        h += '<span style="color:var(--text3);min-width:46px">'+esc(_geoTimeAgo(t.timestamp))+'</span>';
+        h += '<span style="color:var(--text3)">'+esc(String(t.from||'').toUpperCase())+'</span>';
+        h += '<span style="color:var(--text3)">→</span>';
+        h += '<span style="color:var(--text1)">'+esc(String(t.to||'').toUpperCase())+'</span>';
+        h += '<span style="color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(t.reason||'')+'">'+esc(t.reason||'')+'</span>';
+        h += '</div>';
+      });
+      h += '</div>';
+    }
+    h += '</div>';
+  }
   h += '</div>';
   return h;
 }

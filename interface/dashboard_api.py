@@ -157,6 +157,7 @@ def build_app(
     user_stream: Any = None,
     reconciliation_result: Any = None,
     periodic_reconciler: Any = None,
+    state_machine: Any = None,
     sqlite_store: Any = None,
     metrics: Any = None,
     geopolitical_feed: Any = None,
@@ -1518,6 +1519,17 @@ def build_app(
             "leverage_settings": getattr(reconciliation_result, "leverage_settings", {}),
             "periodic": periodic_payload,
         }
+
+    # ── /api/state — operational FSM snapshot (REQ-STATE-001..012) ────────
+    @app.get("/api/state")
+    async def api_state() -> dict[str, Any]:
+        """Return the current operational state, allowed-next states, and
+        recent transition history. Single source of truth for "are we
+        cleared to trade right now?"."""
+        if state_machine is None:
+            return {"available": False, "current": "unknown"}
+        snap = state_machine.snapshot()
+        return {"available": True, **snap}
 
     # ── /api/user-stream/status — user data stream health ─────────────────
     @app.get("/api/user-stream/status")
