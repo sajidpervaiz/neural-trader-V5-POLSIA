@@ -112,3 +112,20 @@ class EventBus:
         if self._background_tasks:
             await asyncio.gather(*self._background_tasks, return_exceptions=True)
         logger.info("EventBus stopped")
+
+    def stats(self) -> dict[str, Any]:
+        """REQ-ARC-003 / REQ-MON-001: backpressure observability."""
+        capacity = int(self._queue.maxsize) if self._queue.maxsize > 0 else 0
+        size = int(self._queue.qsize())
+        pct = (size / capacity * 100.0) if capacity > 0 else 0.0
+        return {
+            "queue_size": size,
+            "queue_capacity": capacity,
+            "queue_pct": round(pct, 1),
+            "dropped_count": int(self._dropped_count),
+            "backpressure_warned": bool(self._backpressure_warned),
+            "subscribed_topics": len(self._handlers),
+            "subscriber_counts": {topic: len(hs) for topic, hs in self._handlers.items()},
+            "background_tasks": len(self._background_tasks),
+            "running": bool(self._running),
+        }

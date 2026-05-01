@@ -1689,6 +1689,14 @@ def build_app(
             return {"available": False}
         return {"available": True, **uptime_tracker.snapshot()}
 
+    # ── /api/eventbus/stats — backpressure metrics (REQ-ARC-003) ──────────
+    @app.get("/api/eventbus/stats")
+    async def api_eventbus_stats() -> dict[str, Any]:
+        """Queue size, capacity %, dropped event count, subscriber counts."""
+        if event_bus is None or not hasattr(event_bus, "stats"):
+            return {"available": False}
+        return {"available": True, **event_bus.stats()}
+
     # ── /api/trace/{cid} — REQ-TR-001 end-to-end audit chain ──────────────
     @app.get("/api/trace/{correlation_id}")
     async def api_trace(correlation_id: str) -> dict[str, Any]:
