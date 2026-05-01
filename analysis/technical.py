@@ -284,6 +284,126 @@ def _obv(close: pd.Series, volume: pd.Series) -> pd.Series:
     return (direction * volume).cumsum()
 
 
+def _wma(series: pd.Series, period: int) -> pd.Series:
+    """Weighted Moving Average (linear weighting, newest bar heaviest)."""
+    weights = np.arange(1, period + 1, dtype=float)
+    weights_sum = weights.sum()
+    return series.rolling(period).apply(
+        lambda x: float(np.dot(x, weights) / weights_sum), raw=True,
+    )
+
+
+def _vwma(close: pd.Series, volume: pd.Series, period: int = 20) -> pd.Series:
+    """Volume-Weighted Moving Average. VWMA above SMA = buying pressure."""
+    pv = close * volume
+    return pv.rolling(period, min_periods=1).sum() / volume.rolling(period, min_periods=1).sum().replace(0, np.nan)
+
+
+def _hma(series: pd.Series, period: int = 20) -> pd.Series:
+    """Hull Moving Average. HMA = WMA(2*WMA(n/2) − WMA(n), sqrt(n))."""
+    half = max(2, int(period / 2))
+    sqrt_n = max(2, int(np.sqrt(period)))
+    raw = 2 * _wma(series, half) - _wma(series, period)
+    return _wma(raw, sqrt_n)
+
+
+def _alma(series: pd.Series, period: int = 20, offset: float = 0.85, sigma: float = 6.0) -> pd.Series:
+    """Arnaud Legoux Moving Average. Gaussian-weighted, low lag."""
+    if period < 2:
+        return series.copy()
+    m = offset * (period - 1)
+    s = period / float(sigma)
+    weights = np.exp(-((np.arange(period) - m) ** 2) / (2 * s ** 2))
+    weights = weights / weights.sum()
+    return series.rolling(period).apply(
+        lambda x: float(np.dot(x, weights)), raw=True,
+    )
+
+
+def _roc(close: pd.Series, period: int = 10) -> pd.Series:
+    """Rate of Change as percent: (close − close[N]) / close[N] * 100."""
+    return close.pct_change(period) * 100.0
+
+
+def _stoch_rsi(close: pd.Series, period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> tuple[pd.Series, pd.Series]:
+    """Stochastic RSI on a 0..100 scale. Returns (%K, %D)."""
+    rsi = _rsi(close, period)
+    rsi_min = rsi.rolling(period).min()
+    rsi_max = rsi.rolling(period).max()
+    raw_k = (rsi - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan) * 100.0
+    k = raw_k.rolling(smooth_k).mean()
+    d = k.rolling(smooth_d).mean()
+    return k, d
+
+
+def _vw_macd(
+    close: pd.Series, volume: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Volume-weighted MACD. Same shape as MACD; uses VWMA legs."""
+    fast_leg = _vwma(close, volume, fast)
+    slow_leg = _vwma(close, volume, slow)
+    macd_line = fast_leg - slow_leg
+    signal_line = _ema(macd_line, signal)
+    return macd_line, signal_line, macd_line - signal_line
+
+
+def _vpt(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """Volume-Price Trend. Cumulative volume * pct-change-of-price."""
+    pct = close.pct_change().fillna(0.0)
+    return (volume * pct).cumsum()
+
+
+def _nvi(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """Negative Volume Index — tracks price moves on lower-volume bars."""
+    nvi = pd.Series(1000.0, index=close.index)
+    pct = close.pct_change().fillna(0.0)
+    vol_diff = volume.diff().fillna(0.0)
+    for i in range(1, len(close)):
+        if vol_diff.iat[i] < 0:
+            nvi.iat[i] = nvi.iat[i - 1] * (1.0 + pct.iat[i])
+        else:
+            nvi.iat[i] = nvi.iat[i - 1]
+    return nvi
+
+
+def _pvi(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """Positive Volume Index — tracks price moves on higher-volume bars."""
+    pvi = pd.Series(1000.0, index=close.index)
+    pct = close.pct_change().fillna(0.0)
+    vol_diff = volume.diff().fillna(0.0)
+    for i in range(1, len(close)):
+        if vol_diff.iat[i] > 0:
+            pvi.iat[i] = pvi.iat[i - 1] * (1.0 + pct.iat[i])
+        else:
+            pvi.iat[i] = pvi.iat[i - 1]
+    return pvi
+
+
+def _accelerator_oscillator(high: pd.Series, low: pd.Series) -> pd.Series:
+    """Bill Williams Accelerator. AC = AO − SMA(AO, 5)."""
+    median = (high + low) / 2.0
+    ao = _sma(median, 5) - _sma(median, 34)
+    return ao - _sma(ao, 5)
+
+
+def _rvi(
+    open_: pd.Series, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 10,
+) -> tuple[pd.Series, pd.Series]:
+    """Relative Vigor Index — close-open momentum vs high-low range.
+
+    Returns (RVI line, Signal line). Both ~[-1, +1] after settling.
+    """
+    co = close - open_
+    hl = (high - low).replace(0, np.nan)
+    # Symmetric weighted numerator/denominator (1, 2, 2, 1) per the original formula.
+    weights = np.array([1.0, 2.0, 2.0, 1.0])
+    num = co.rolling(4).apply(lambda x: float(np.dot(x, weights)), raw=True)
+    den = hl.rolling(4).apply(lambda x: float(np.dot(x, weights)), raw=True)
+    rvi = (num / den).rolling(period).mean()
+    signal = rvi.rolling(4).apply(lambda x: float(np.dot(x, weights) / weights.sum()), raw=True)
+    return rvi, signal
+
+
 def _adx_di(
     high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
@@ -320,6 +440,7 @@ def _adx_di(
 _FILL_50: frozenset[str] = frozenset({
     "rsi_14", "rsi_21", "stoch_k", "stoch_d",
     "mfi_14", "williams_r", "ult_osc",
+    "stoch_rsi_k", "stoch_rsi_d",
 })
 # Columns whose neutral fill is the bar's close price (price-tracking lines).
 _FILL_CLOSE: frozenset[str] = frozenset({
@@ -331,6 +452,7 @@ _FILL_CLOSE: frozenset[str] = frozenset({
     "donchian_upper", "donchian_lower", "donchian_mid",
     "tenkan_sen", "kijun_sen", "senkou_a", "senkou_b", "chikou_span",
     "psar", "supertrend",
+    "vwma_20", "hma_20", "alma_20",
 })
 # Sparse markers — NaN at non-pivot rows is the contract; downstream code
 # iterates with .dropna(). Do NOT fill these.
@@ -547,6 +669,33 @@ class TechnicalIndicators:
         # ── §3 Spec: Awesome Oscillator ──────────────────────────────────
         midpoint = (high + low) / 2.0
         df["awesome_osc"] = _sma(midpoint, 5) - _sma(midpoint, 34)
+
+        # ── Reference-spec indicators ────────────────────────────────────
+        # Volume-weighted, hull, ALMA moving averages (low-lag alternatives).
+        df["vwma_20"] = _vwma(close, volume, 20)
+        df["hma_20"] = _hma(close, 20)
+        df["alma_20"] = _alma(close, 20)
+        # Rate of Change (percentage momentum).
+        df["roc_10"] = _roc(close, 10)
+        df["roc_20"] = _roc(close, 20)
+        # Stochastic RSI (%K, %D both on 0..100 scale).
+        stoch_rsi_k, stoch_rsi_d = _stoch_rsi(close, 14, 3, 3)
+        df["stoch_rsi_k"] = stoch_rsi_k
+        df["stoch_rsi_d"] = stoch_rsi_d
+        # Volume-weighted MACD.
+        vw_m, vw_s, vw_h = _vw_macd(close, volume)
+        df["vw_macd"] = vw_m
+        df["vw_macd_signal"] = vw_s
+        df["vw_macd_hist"] = vw_h
+        # Volume Price Trend / NVI / PVI (accumulation-distribution family).
+        df["vpt"] = _vpt(close, volume)
+        df["nvi"] = _nvi(close, volume)
+        df["pvi"] = _pvi(close, volume)
+        # Accelerator Oscillator and Relative Vigor Index.
+        df["accelerator_osc"] = _accelerator_oscillator(high, low)
+        rvi_line, rvi_signal = _rvi(df["open"], high, low, close, 10)
+        df["rvi"] = rvi_line
+        df["rvi_signal"] = rvi_signal
 
         # REQ-IND-006/007: drop the unusable warmup head, then sanitise the
         # remainder so downstream consumers never see NaN/Inf.

@@ -700,6 +700,7 @@ def build_app(
     _CHART_OVERLAY_KEYS = (
         "ema_9", "ema_21", "ema_50", "ema_55", "ema_200",
         "sma_20", "sma_50",
+        "vwma_20", "hma_20", "alma_20",
         "vwap",
         "bb_upper", "bb_mid", "bb_lower",
         "kc_upper", "kc_mid", "kc_lower",
@@ -710,13 +711,18 @@ def build_app(
     )
     _CHART_OSCILLATOR_KEYS = (
         "rsi_14", "rsi_21",
+        "stoch_rsi_k", "stoch_rsi_d",
         "macd", "macd_signal", "macd_hist",
+        "vw_macd", "vw_macd_signal", "vw_macd_hist",
         "stoch_k", "stoch_d",
         "atr_14", "atr_pct",
         "adx", "plus_di", "minus_di",
         "mfi_14", "cci_20", "williams_r",
         "obv",
-        "vortex_diff", "awesome_osc",
+        "vpt", "nvi", "pvi",
+        "vortex_diff", "awesome_osc", "accelerator_osc",
+        "rvi", "rvi_signal",
+        "roc_10", "roc_20",
     )
 
     @app.get("/api/charts/{symbol:path}/{timeframe}")
@@ -1629,6 +1635,84 @@ def build_app(
             "balance": reconciliation_result.balance,
             "leverage_settings": getattr(reconciliation_result, "leverage_settings", {}),
             "periodic": periodic_payload,
+        }
+
+    # ── /api/levels/{symbol}/{tf} — pivots + Fibonacci retracement ───────
+    @app.get("/api/levels/{symbol:path}/{timeframe}")
+    async def api_levels(symbol: str, timeframe: str, fib_lookback: int = 100) -> dict[str, Any]:
+        """Classic floor pivots (from prior bar) + Fibonacci retracement
+        (from the highest high / lowest low of the last `fib_lookback` bars)."""
+        from analysis.pivot_levels import pivots_from_df, fib_from_df, nearest_level
+        try:
+            symbol = _validate_symbol(symbol)
+            timeframe = _validate_timeframe(timeframe)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        df = None
+        if data_manager is not None:
+            clean = symbol.replace("/", "").replace(":USDT", "").upper()
+            base = clean.replace("USDT", "") if clean.endswith("USDT") else clean
+            for sym_try in (f"{base}/USDT:USDT", symbol, f"{base}/USDT", clean):
+                df = data_manager.get_dataframe("binance", sym_try, timeframe)
+                if df is not None and len(df) > 0:
+                    break
+            else:
+                df = None
+        if df is None or len(df) < 3:
+            return {"available": False, "symbol": symbol, "timeframe": timeframe}
+        pivots = pivots_from_df(df) or {}
+        fib = fib_from_df(df, lookback=max(2, int(fib_lookback))) or {}
+        last_close = float(df["close"].iloc[-1]) if "close" in df.columns else 0.0
+        return {
+            "available": True,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "last_close": last_close,
+            "pivots": pivots,
+            "fibonacci": fib,
+            "nearest_pivot": nearest_level(last_close, pivots) if pivots else None,
+            "nearest_fib": nearest_level(last_close, fib) if fib else None,
+        }
+
+    # ── /api/patterns/{symbol}/{tf} — candlestick pattern recognition ────
+    @app.get("/api/patterns/{symbol:path}/{timeframe}")
+    async def api_patterns(symbol: str, timeframe: str, lookback: int = 50) -> dict[str, Any]:
+        """Run the 14 candlestick detectors over the last `lookback` bars and
+        return per-bar pattern hits + a composite score (sum of pattern signs)."""
+        from analysis.candlestick_patterns import detect_patterns
+        try:
+            symbol = _validate_symbol(symbol)
+            timeframe = _validate_timeframe(timeframe)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"detail": str(exc)})
+        lookback = max(5, min(int(lookback), 200))
+        df = None
+        if data_manager is not None:
+            clean = symbol.replace("/", "").replace(":USDT", "").upper()
+            base = clean.replace("USDT", "") if clean.endswith("USDT") else clean
+            for sym_try in (f"{base}/USDT:USDT", symbol, f"{base}/USDT", clean):
+                df = data_manager.get_dataframe("binance", sym_try, timeframe)
+                if df is not None and len(df) > 0:
+                    break
+            else:
+                df = None
+        if df is None or len(df) < 5:
+            return {"available": False, "symbol": symbol, "timeframe": timeframe}
+        df = df.tail(lookback)
+        patterns_df, composite = detect_patterns(df["open"], df["high"], df["low"], df["close"])
+        # Latest-bar hits + counts over the window.
+        latest = patterns_df.iloc[-1].to_dict()
+        latest_hits = {k: int(v) for k, v in latest.items() if v != 0}
+        window_counts = {col: int((patterns_df[col] != 0).sum()) for col in patterns_df.columns}
+        return {
+            "available": True,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "bars": len(df),
+            "latest_hits": latest_hits,
+            "latest_composite": int(composite.iloc[-1]) if len(composite) else 0,
+            "window_counts": window_counts,
+            "composite_series": [int(x) for x in composite.tolist()],
         }
 
     # ── /api/slippage — pre-trade fill estimator (REQ-EXE-005) ────────────
