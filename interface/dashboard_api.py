@@ -160,6 +160,7 @@ def build_app(
     state_machine: Any = None,
     uptime_tracker: Any = None,
     sqlite_store: Any = None,
+    audit_repo: Any = None,
     metrics: Any = None,
     geopolitical_feed: Any = None,
 ) -> Any:
@@ -1687,6 +1688,44 @@ def build_app(
         if uptime_tracker is None:
             return {"available": False}
         return {"available": True, **uptime_tracker.snapshot()}
+
+    # ── /api/trace/{cid} — REQ-TR-001 end-to-end audit chain ──────────────
+    @app.get("/api/trace/{correlation_id}")
+    async def api_trace(correlation_id: str) -> dict[str, Any]:
+        """Walk every audit table for rows tagged with this correlation_id.
+        Returns {signals, risk_blocks, orders, fills, user_stream_events,
+        pnl_snapshots, reconciliation_events} so the dashboard can render
+        the full decision → fill → PnL chain for a single signal."""
+        if not correlation_id:
+            return {"available": False, "reason": "missing correlation_id"}
+        if audit_repo is None:
+            return {"available": False, "reason": "audit_repo not configured (DB unavailable)"}
+        try:
+            trace = await audit_repo.load_trace_by_correlation_id(correlation_id)
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}
+        # Surface counts for quick rendering.
+        counts = {k: len(v) for k, v in trace.items()}
+        total = sum(counts.values())
+        # Convert datetime keys to ISO strings for JSON serialisation.
+        def _norm(rows: list[dict]) -> list[dict]:
+            out: list[dict] = []
+            for row in rows:
+                clean = {}
+                for k, v in row.items():
+                    if hasattr(v, "isoformat"):
+                        clean[k] = v.isoformat()
+                    else:
+                        clean[k] = v
+                out.append(clean)
+            return out
+        return {
+            "available": True,
+            "correlation_id": correlation_id,
+            "total_rows": total,
+            "counts": counts,
+            "trace": {k: _norm(v) for k, v in trace.items()},
+        }
 
     # ── /api/user-stream/status — user data stream health ─────────────────
     @app.get("/api/user-stream/status")

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import traceback
 from typing import Any
 
 from loguru import logger
@@ -341,6 +340,46 @@ class AuditRepository:
         except Exception as exc:
             logger.error("load_latest_equity failed: {}", exc)
             return None
+
+    async def load_trace_by_correlation_id(self, correlation_id: str) -> dict[str, list[dict]]:
+        """REQ-TR-001: assemble the end-to-end audit trail for a correlation_id.
+
+        Returns a dict keyed by audit table with the rows that share the
+        given correlation_id. Empty lists per key when no rows exist.
+        """
+        empty = {
+            "signals": [],
+            "risk_blocks": [],
+            "orders": [],
+            "fills": [],
+            "user_stream_events": [],
+            "pnl_snapshots": [],
+            "reconciliation_events": [],
+        }
+        if self._pool is None or not correlation_id:
+            return empty
+        cid = str(correlation_id)
+        result = dict(empty)
+        queries = {
+            "signals": "SELECT * FROM signal_events WHERE correlation_id = $1 ORDER BY time ASC",
+            "risk_blocks": "SELECT * FROM risk_blocks WHERE correlation_id = $1 ORDER BY time ASC",
+            "orders": "SELECT * FROM orders WHERE correlation_id = $1 ORDER BY time ASC",
+            "fills": "SELECT * FROM fills WHERE correlation_id = $1 ORDER BY time ASC",
+            "user_stream_events": "SELECT * FROM user_stream_events WHERE correlation_id = $1 ORDER BY time ASC",
+            "pnl_snapshots": "SELECT * FROM pnl_snapshots WHERE correlation_id = $1 ORDER BY time ASC",
+            "reconciliation_events": "SELECT * FROM reconciliation_events WHERE correlation_id = $1 ORDER BY time ASC",
+        }
+        try:
+            async with self._pool.acquire() as conn:
+                for key, sql in queries.items():
+                    try:
+                        rows = await conn.fetch(sql, cid)
+                        result[key] = [dict(r) for r in rows]
+                    except Exception as exc:
+                        logger.debug("load_trace[{}] failed: {}", key, exc)
+        except Exception as exc:
+            logger.error("load_trace_by_correlation_id pool acquire failed: {}", exc)
+        return result
 
     async def load_recent_signals(self, limit: int = 50) -> list[dict]:
         """Load recent signal events for dashboard / state rebuild."""

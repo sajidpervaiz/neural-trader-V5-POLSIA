@@ -284,6 +284,7 @@ async def main() -> None:
         user_stream=user_stream,
         reconciliation_result=recon_result,
         sqlite_store=sqlite_store,
+        audit_repo=audit_repo,
         metrics=metrics,
         periodic_reconciler=periodic_reconciler,
         state_machine=state_machine,
