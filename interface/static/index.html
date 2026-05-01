@@ -2250,6 +2250,23 @@ function _srsRibbonHtml(ctx) {
   h += '<span style="color:var(--text3)">85·70·30 → '+bands.strong+'·'+bands.normal+'·'+bands.no_trade+'</span>';
   if (warmup) h += '<span style="border:1px solid var(--yellow);color:var(--yellow);padding:2px 6px;border-radius:3px">WARMUP</span>';
   if (conflictText) h += '<span style="border:1px solid var(--red);color:var(--red);padding:2px 6px;border-radius:3px;font-weight:700">CONFLICT BLOCK</span>';
+  // Uptime / burn-in chip
+  const up = (ctx && ctx.uptime) || {};
+  if (up.available !== false && up.burn_in) {
+    const days = Number(up.burn_in.days || 0);
+    const passed = !!up.burn_in.ac001_passed;
+    const upCol = passed ? 'var(--green)' : (days >= 1 ? 'var(--cyan)' : 'var(--text2)');
+    const crashes = (up.history && up.history.crashes) || 0;
+    h += '<span title="AC-001 (7-day no-crash) burn-in" style="color:'+upCol+'">UP '+days.toFixed(2)+'d'+(crashes?' · '+crashes+'×crashed':'')+'</span>';
+  }
+  // EventBus queue / drops chip
+  const eb = (ctx && ctx.ebstats) || {};
+  if (eb.available !== false && eb.queue_capacity) {
+    const ebPct = Number(eb.queue_pct || 0);
+    const ebCol = ebPct > 80 ? 'var(--red)' : ebPct > 50 ? 'var(--yellow)' : 'var(--text2)';
+    const drops = Number(eb.dropped_count || 0);
+    h += '<span title="EventBus queue + dropped events" style="color:'+ebCol+'">Q '+ebPct.toFixed(0)+'%'+(drops?' · '+drops+' dropped':'')+'</span>';
+  }
   h += '<span style="color:var(--text2);margin-left:auto">recon '+(reconMismatch>0?'⚠ '+reconMismatch+' mismatch':'OK')+' · '+esc(reconAge)+' ago</span>';
   h += '<span style="color:var(--text2)">p95 '+p95.toFixed(0)+'ms</span>';
   h += '</div>';
@@ -3398,7 +3415,7 @@ window.__flowSelectedId = null;       // currently-selected layer id (1..10)
 window.__flowCtx = null;              // last-loaded context bundle
 
 async function loadFlowCtx() {
-  const [layers, quality, session, geo, status, recon, latency, fsm] = await Promise.all([
+  const [layers, quality, session, geo, status, recon, latency, fsm, uptime, ebstats] = await Promise.all([
     fetch('/api/layers').then(r=>r.json()).catch(()=>({layers:[]})),
     fetch('/api/quality').then(r=>r.json()).catch(()=>({})),
     fetch('/api/session').then(r=>r.json()).catch(()=>({})),
@@ -3407,6 +3424,8 @@ async function loadFlowCtx() {
     fetch('/api/reconciliation/status').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/latency/percentiles').then(r=>r.json()).catch(()=>({feed_lag:{},order_latency:{}})),
     fetch('/api/state').then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/uptime').then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/eventbus/stats').then(r=>r.json()).catch(()=>({available:false})),
   ]);
   // Synthesize the L10 (Geopolitical) layer entry the same way the Pipeline tab does.
   const list = (layers.layers || []).slice();
@@ -3428,7 +3447,7 @@ async function loadFlowCtx() {
       description:'RSS-driven per-symbol news factor',
       status:st, score: topAbs>=0?topAbs*100:0, threshold:50, detail});
   }
-  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, fsm, raw:layers};
+  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, raw:layers};
   return window.__flowCtx;
 }
 
