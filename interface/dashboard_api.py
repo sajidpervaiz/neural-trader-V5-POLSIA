@@ -158,6 +158,7 @@ def build_app(
     reconciliation_result: Any = None,
     periodic_reconciler: Any = None,
     state_machine: Any = None,
+    uptime_tracker: Any = None,
     sqlite_store: Any = None,
     metrics: Any = None,
     geopolitical_feed: Any = None,
@@ -1677,6 +1678,15 @@ def build_app(
             return {"available": False, "current": "unknown"}
         snap = state_machine.snapshot()
         return {"available": True, **snap}
+
+    # ── /api/uptime — burn-in / AC-001 progress ───────────────────────────
+    @app.get("/api/uptime")
+    async def api_uptime() -> dict[str, Any]:
+        """Return current session uptime, crash count, and AC-001 (7-day
+        no-crash) burn-in progress."""
+        if uptime_tracker is None:
+            return {"available": False}
+        return {"available": True, **uptime_tracker.snapshot()}
 
     # ── /api/user-stream/status — user data stream health ─────────────────
     @app.get("/api/user-stream/status")

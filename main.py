@@ -48,6 +48,7 @@ from storage.sqlite_store import SQLiteStore
 from monitoring.metrics import Metrics
 from monitoring.health_checks import HealthChecker
 from monitoring.alert_manager import build_alert_manager_from_config, AlertDispatcher
+from monitoring.uptime_tracker import UptimeTracker
 
 from interface.dashboard_api import build_app, run_dashboard
 from interface.telegram_bot import TelegramNotifier
@@ -130,6 +131,7 @@ async def main() -> None:
     sqlite_store = SQLiteStore()
     metrics = Metrics(config, event_bus)
     health_checker = HealthChecker(check_interval=30)
+    uptime_tracker = UptimeTracker(paper_mode=config.paper_mode)
     alert_manager = build_alert_manager_from_config(config)
     alert_dispatcher = AlertDispatcher(event_bus, alert_manager)
 
@@ -285,6 +287,7 @@ async def main() -> None:
         metrics=metrics,
         periodic_reconciler=periodic_reconciler,
         state_machine=state_machine,
+        uptime_tracker=uptime_tracker,
     )
 
     if app is not None:
@@ -485,6 +488,8 @@ async def main() -> None:
     if model_retrainer is not None:
         tasks.append(asyncio.create_task(model_retrainer.run(), name="model_retrainer"))
 
+    tasks.append(asyncio.create_task(uptime_tracker.run(), name="uptime_tracker"))
+
     if periodic_reconciler is not None:
         tasks.append(asyncio.create_task(periodic_reconciler.run(), name="periodic_reconciler"))
 
@@ -542,6 +547,7 @@ async def main() -> None:
     await health_checker.stop_periodic_checks()
     await db.close()
 
+    uptime_tracker.stop(clean=True)
     state_machine.force_to(OperationalState.SHUTDOWN, reason="graceful_shutdown")
     logger.info("Shutdown complete")
 
