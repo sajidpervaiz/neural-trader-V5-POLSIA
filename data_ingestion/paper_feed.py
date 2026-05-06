@@ -1,23 +1,32 @@
 """Paper-mode market data feed.
 
-Polls Binance public klines API (no auth) and emits CANDLE events
-into the EventBus so the full signal → trade pipeline works without
-live websocket connections or API keys.
+Streams Binance public kline data over WebSocket (combined-stream) and emits
+CANDLE events into the EventBus. Falls back to REST polling if the WebSocket
+fails (or when websockets package is unavailable).
 """
 from __future__ import annotations
 
 import asyncio
-import time
+import json
 from typing import Any
 
 import httpx
 from loguru import logger
+
+try:
+    import websockets
+    _WS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    websockets = None  # type: ignore[assignment]
+    _WS_AVAILABLE = False
 
 from core.event_bus import EventBus
 from data_ingestion.normalizer import Candle
 
 # Binance futures public klines endpoint (no auth needed)
 KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+# Combined-stream WebSocket: one connection for many symbol/timeframe pairs
+WS_BASE = "wss://fstream.binance.com/stream"
 
 TF_MAP = {
     "1m": ("1m", 60),
@@ -39,16 +48,19 @@ class PaperFeed:
         timeframes: list[str] | None = None,
         poll_interval: float = 30.0,
         data_manager: Any = None,
+        use_websocket: bool = True,
     ) -> None:
         self.event_bus = event_bus
         self.symbols = symbols or ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
         self.timeframes = timeframes or ["1m", "15m", "1h", "4h"]
         self.poll_interval = poll_interval
         self._data_manager = data_manager
+        self._use_websocket = use_websocket and _WS_AVAILABLE
         self._running = False
         self._seeding_complete = False
         self._client: httpx.AsyncClient | None = None
         self._last_candle_time: dict[str, int] = {}
+        self._ws_reconnect_delay = 5.0
 
     def _binance_symbol(self, sym: str) -> str:
         """Normalize symbol to Binance format: BTC/USDT:USDT -> BTCUSDT"""
@@ -158,9 +170,73 @@ class PaperFeed:
                      total, len(self.symbols), len(self.timeframes))
         self._seeding_complete = True
 
+    def _build_ws_url(self) -> str:
+        """Build a combined-stream URL with one kline stream per symbol×timeframe."""
+        streams = []
+        for sym in self.symbols:
+            bsym = self._binance_symbol(sym).lower()
+            for tf in self.timeframes:
+                binance_tf = TF_MAP.get(tf, (tf, 60))[0]
+                streams.append(f"{bsym}@kline_{binance_tf}")
+        return f"{WS_BASE}?streams={'/'.join(streams)}"
+
+    def _parse_kline_message(self, message: dict) -> Candle | None:
+        """Parse a Binance combined-stream kline payload into a Candle."""
+        data = message.get("data") or {}
+        kline = data.get("k") or {}
+        if not kline.get("x"):  # only emit closed candles to avoid lookahead
+            return None
+        binance_sym = (data.get("s") or "").upper()
+        if not binance_sym:
+            return None
+        # Map binance interval back to internal timeframe
+        binance_tf = kline.get("i", "")
+        tf = next((k for k, v in TF_MAP.items() if v[0] == binance_tf), binance_tf)
+        return Candle(
+            exchange="binance",
+            symbol=self._internal_symbol(binance_sym),
+            timeframe=tf,
+            timestamp=int(kline.get("t", 0)) // 1000,
+            open=float(kline.get("o", 0)),
+            high=float(kline.get("h", 0)),
+            low=float(kline.get("l", 0)),
+            close=float(kline.get("c", 0)),
+            volume=float(kline.get("v", 0)),
+            num_trades=int(kline.get("n", 0)),
+        )
+
+    async def _ws_loop(self) -> None:
+        """WebSocket consumer loop with auto-reconnect."""
+        url = self._build_ws_url()
+        logger.info("PaperFeed: connecting WebSocket to {} streams", len(self.symbols) * len(self.timeframes))
+        while self._running:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+                    logger.info("PaperFeed: WebSocket connected")
+                    async for raw in ws:
+                        if not self._running:
+                            break
+                        try:
+                            message = json.loads(raw)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        candle = self._parse_kline_message(message)
+                        if candle is None:
+                            continue
+                        await self.event_bus.publish("CANDLE", candle)
+                        key = f"{self._binance_symbol(candle.symbol)}:{candle.timeframe}"
+                        self._last_candle_time[key] = candle.timestamp
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("PaperFeed WS error, reconnecting in {}s: {}", self._ws_reconnect_delay, exc)
+                await asyncio.sleep(self._ws_reconnect_delay)
+
     async def run(self, seed_only: bool = False) -> None:
-        """Main loop: seed history, then poll for new candles.
-        
+        """Main loop: seed history, then stream live candles.
+
+        Uses WebSocket when available, falls back to REST polling otherwise.
+
         Args:
             seed_only: If True, seed history and return (used in live mode where WS provides data).
         """
@@ -169,15 +245,20 @@ class PaperFeed:
         try:
             await self.seed_history()
             if seed_only:
-                logger.info("PaperFeed: seed-only mode — polling disabled (live WS provides data)")
+                logger.info("PaperFeed: seed-only mode — streaming disabled (live WS provides data)")
                 return
-            logger.info("PaperFeed started — polling every {}s for {}", 
-                        self.poll_interval, self.symbols)
-            while self._running:
-                await asyncio.sleep(self.poll_interval)
-                count = await self._poll_once()
-                if count > 0:
-                    logger.debug("PaperFeed: emitted {} new candles", count)
+            if self._use_websocket:
+                logger.info("PaperFeed started — WebSocket streaming for {} symbols × {} timeframes",
+                            len(self.symbols), len(self.timeframes))
+                await self._ws_loop()
+            else:
+                logger.info("PaperFeed started — REST polling every {}s for {}",
+                            self.poll_interval, self.symbols)
+                while self._running:
+                    await asyncio.sleep(self.poll_interval)
+                    count = await self._poll_once()
+                    if count > 0:
+                        logger.debug("PaperFeed: emitted {} new candles", count)
         except asyncio.CancelledError:
             pass
         finally:

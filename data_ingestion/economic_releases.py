@@ -2,8 +2,7 @@
 Economic Releases with BLS API for CPI/PPI/NFP, consensus deviation scoring.
 """
 
-import asyncio
-from typing import Dict, List, Optional
+from typing import List, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
@@ -145,7 +144,7 @@ class EconomicReleases:
 
                     self.releases.append(release)
 
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError):
                     continue
 
     def _map_series_to_indicator(self, series_id: str) -> Optional[IndicatorType]:

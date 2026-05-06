@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from collections import deque
-from typing import Any, Callable, Coroutine
+from typing import Any
 
 import orjson
 import websockets
@@ -12,7 +12,7 @@ from loguru import logger
 
 from core.config import Config
 from core.event_bus import EventBus
-from data_ingestion.normalizer import Normalizer, Tick
+from data_ingestion.normalizer import Normalizer
 from data_ingestion.validators import TickValidator
 
 

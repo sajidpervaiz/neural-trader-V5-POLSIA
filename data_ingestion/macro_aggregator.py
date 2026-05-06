@@ -3,6 +3,7 @@ Macro Aggregator with unified macro publisher and regime classification.
 """
 
 import asyncio
+import inspect
 from typing import Dict, List, Optional
 from collections import deque
 from dataclasses import dataclass
@@ -10,8 +11,8 @@ from datetime import datetime
 from enum import Enum
 from loguru import logger
 
-from data_ingestion.fed_calendar import FedCalendar, FedEvent, FedEventType
-from data_ingestion.economic_releases import EconomicReleases, EconomicRelease, IndicatorType
+from data_ingestion.fed_calendar import FedCalendar, FedEventType
+from data_ingestion.economic_releases import EconomicReleases
 
 
 class MarketRegime(Enum):
@@ -81,7 +82,7 @@ class MacroAggregator:
 
         for callback in self._subscribers:
             try:
-                if asyncio.iscoroutinefunction(callback):
+                if inspect.iscoroutinefunction(callback):
                     await callback(signal)
                 else:
                     callback(signal)
