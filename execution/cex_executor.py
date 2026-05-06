@@ -14,7 +14,7 @@ from core.safe_mode import SafeModeReason
 from engine.signal_generator import TradingSignal
 from execution.order_manager import OrderManager
 from execution.rate_limiter import RateLimiter
-from execution.risk_manager import RiskManager, Position
+from execution.risk_manager import RiskManager
 from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrderFallbackRequired
 
 
@@ -226,6 +226,31 @@ class CEXExecutor:
 
             fill_price = float(order.get("average", order.get("price", signal.price)))
             filled_qty = float(order.get("filled", amount))
+
+            if signal.price > 0 and fill_price > 0:
+                slippage_bps = ((fill_price - signal.price) / signal.price) * 10_000
+                slip_against = slippage_bps if signal.direction == "long" else -slippage_bps
+                if abs(slip_against) >= 5.0:
+                    logger.warning(
+                        "Slippage {} {}: expected {:.2f} got {:.2f} ({:+.1f}bps against)",
+                        signal.symbol, signal.direction, signal.price, fill_price, slip_against,
+                    )
+                else:
+                    logger.debug(
+                        "Slippage {} {}: {:+.1f}bps", signal.symbol, signal.direction, slip_against,
+                    )
+                try:
+                    await self.event_bus.publish("SLIPPAGE_OBSERVED", {
+                        "symbol": signal.symbol,
+                        "direction": signal.direction,
+                        "expected_price": signal.price,
+                        "fill_price": fill_price,
+                        "slippage_bps": slippage_bps,
+                        "slippage_against_bps": slip_against,
+                        "timestamp": int(time.time()),
+                    })
+                except Exception:
+                    pass
 
             result = OrderResult(
                 order_id=order.get("id", ""),

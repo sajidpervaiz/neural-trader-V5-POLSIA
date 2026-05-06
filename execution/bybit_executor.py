@@ -6,7 +6,7 @@ and enhanced risk management.
 import asyncio
 import time
 from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 import ccxt.async_support as ccxt
 from loguru import logger

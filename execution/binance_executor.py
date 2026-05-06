@@ -4,13 +4,11 @@ Imbalance Detection, and Advanced Order Management.
 """
 
 import asyncio
-import json
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import ccxt.async_support as ccxt
-import numpy as np
 from loguru import logger
 from core.circuit_breaker import CircuitBreaker, CircuitState
 from core.idempotency import IdempotencyManager

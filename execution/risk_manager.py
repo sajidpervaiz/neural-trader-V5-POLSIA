@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +11,7 @@ from loguru import logger
 
 from core.config import Config
 from core.event_bus import EventBus
-from core.safe_mode import SafeModeManager, SafeModeReason
+from core.safe_mode import SafeModeManager
 from engine.signal_generator import TradingSignal
 
 
@@ -42,12 +42,10 @@ class Position:
         self.current_price = price
         if self.is_long:
             self.pnl_pct = (price - self.entry_price) / self.entry_price
-            if price > self.highest_since_entry:
-                self.highest_since_entry = price
+            self.highest_since_entry = max(self.highest_since_entry, price)
         else:
             self.pnl_pct = (self.entry_price - price) / self.entry_price
-            if price < self.lowest_since_entry:
-                self.lowest_since_entry = price
+            self.lowest_since_entry = min(self.lowest_since_entry, price)
         self.pnl = self.pnl_pct * self.size * self.entry_price
 
     @property
@@ -76,8 +74,7 @@ class CircuitBreaker:
 
     def record_pnl(self, pnl_pct: float, equity: float) -> bool:
         self._daily_loss += min(0, pnl_pct)
-        if equity > self._peak_equity:
-            self._peak_equity = equity
+        self._peak_equity = max(self._peak_equity, equity)
         drawdown = (self._peak_equity - equity) / self._peak_equity if self._peak_equity > 0 else 0.0
         if abs(self._daily_loss) >= self._max_daily_loss:
             self._tripped = True
@@ -1229,12 +1226,31 @@ class RiskManager:
             self.record_return(pos.pnl_pct)
             self._record_loss_for_period(pos.pnl_pct)
             self.record_trade_result(pos.pnl_pct > 0)
+            was_tripped = self._circuit_breaker.tripped
             self._circuit_breaker.record_pnl(pos.pnl_pct, self._equity)
             self._last_trade_time[symbol] = time.time()
             logger.info(
                 "Position closed: {}/{} pnl={:.2f} ({:.2%}) equity={:.2f} held={:.0f}s",
                 exchange, symbol, pnl_dollar, pos.pnl_pct, self._equity, pos.hold_seconds,
             )
+            if not was_tripped and self._circuit_breaker.tripped:
+                logger.critical(
+                    "🛑 CIRCUIT BREAKER TRIPPED: {} — auto-closing remaining {} positions",
+                    self._circuit_breaker.trip_reason, len(self._positions),
+                )
+                self._killed = True
+                try:
+                    asyncio.create_task(self._auto_close_on_trip())
+                except RuntimeError:
+                    pass
+                try:
+                    await self.event_bus.publish("CIRCUIT_BREAKER_TRIPPED", {
+                        "reason": self._circuit_breaker.trip_reason,
+                        "equity": self._equity,
+                        "timestamp": time.time(),
+                    })
+                except Exception:
+                    pass
             # Persist to SQLite
             db_id = getattr(pos, '_db_id', None)
             if self._sqlite_store and db_id:
@@ -1292,6 +1308,41 @@ class RiskManager:
                     pos.trailing_stop = new_trail
 
         return None
+
+    # ── Auto-trip handler ────────────────────────────────────────────────
+    async def _auto_close_on_trip(self) -> None:
+        """Background close-all triggered by circuit breaker trip.
+
+        Runs OUTSIDE the lock held by close_position() to avoid deadlock —
+        activate_kill_switch acquires the same lock.
+        """
+        try:
+            closed = await self.activate_kill_switch()
+            try:
+                await self.event_bus.publish("KILL_SWITCH_ACTIVATED", {
+                    "trigger": "circuit_breaker",
+                    "positions_closed": len(closed),
+                    "reason": self._circuit_breaker.trip_reason,
+                })
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error("auto_close_on_trip failed: {}", exc)
+
+    # ── Daily reset (midnight UTC) ────────────────────────────────────────
+    def reset_daily_losses(self) -> None:
+        """Reset daily loss counter and clear daily-loss circuit-breaker trip.
+
+        Drawdown-based trips are NOT reset — only daily-loss trips.
+        Designed to be called at 00:00 UTC by a scheduler.
+        """
+        self._circuit_breaker.reset_daily()
+        if self._circuit_breaker.tripped and self._circuit_breaker.trip_reason.startswith("daily_loss"):
+            self._circuit_breaker.clear_if_reason(self._circuit_breaker.trip_reason)
+            self._killed = False
+            logger.warning("Daily-loss reset at UTC midnight — circuit breaker cleared, kill switch released")
+        else:
+            logger.info("Daily-loss counter reset at UTC midnight")
 
     # ── Kill switch ───────────────────────────────────────────────────────
     async def activate_kill_switch(self) -> list[Position]:

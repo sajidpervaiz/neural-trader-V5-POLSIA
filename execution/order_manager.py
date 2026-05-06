@@ -277,7 +277,7 @@ class OrderManager:
             return
         if os.path.exists(self._audit_log_path):
             try:
-                with open(self._audit_log_path, "r") as f:
+                with open(self._audit_log_path) as f:
                     self.audit_log = [json.loads(line) for line in f]
             except Exception as e:
                 logger.error(f"Failed to load audit log: {e}")
@@ -309,7 +309,7 @@ class OrderManager:
             return
         if os.path.exists(self._order_state_path):
             try:
-                with open(self._order_state_path, "r") as f:
+                with open(self._order_state_path) as f:
                     state = json.load(f)
                 self.orders = {k: self._dict_to_order(v) for k, v in state.get("orders", {}).items()}
                 self.client_order_map = {k: self.orders[k] for k in state.get("client_order_map", []) if k in self.orders}
@@ -460,7 +460,7 @@ class OrderManager:
             # Use caller-provided client order ID when supplied; otherwise generate one.
             if not client_order_id:
                 client_order_id = self.generate_client_order_id(exchange, symbol, side)
-            
+
             # Check idempotency
             if self.idempotency.check_and_set(client_order_id):
                 cached_order = self.client_order_map.get(client_order_id)
@@ -512,14 +512,14 @@ class OrderManager:
             logger.info(
                 f"Order created: {client_order_id} {side.value} {quantity} {symbol} @ {price}"
             )
-            
+
             return True, order, "created"
 
     def _check_self_trade(self, exchange: str, symbol: str, side: OrderSide) -> Optional[str]:
         """Check for self-trade risk"""
         open_orders = [
             o for o in self.orders.values()
-            if o.venue == exchange 
+            if o.venue == exchange
             and o.symbol == symbol
             and o.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
         ]
@@ -547,7 +547,7 @@ class OrderManager:
             order.exchange_order_id = exchange_order_id
             order.status = OrderStatus.SUBMITTED
             order.submitted_at = int(time.time() * 1000)
-            
+
             self.exchange_order_map[(order.venue, exchange_order_id)] = order
             self._record_audit("ORDER_SUBMITTED", order)
             logger.debug(f"Order {client_order_id} submitted")
@@ -585,10 +585,10 @@ class OrderManager:
             order.fills.append(fill)
             order.cumulative_quantity += quantity
             order.total_fee += fee
-            
+
             total_value = sum(f.quantity * f.price for f in order.fills)
             order.average_fill_price = total_value / order.cumulative_quantity if order.cumulative_quantity > 0 else 0.0
-            
+
             if abs(order.cumulative_quantity - order.quantity) < 1e-8:
                 order.status = OrderStatus.FILLED
                 order.filled_at = fill.timestamp

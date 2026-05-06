@@ -2,11 +2,9 @@
 OKX V5 CEX Executor with V5 depth books, funding arbitrage, portfolio margin support.
 """
 
-import asyncio
 import time
 from typing import Dict, List, Optional
 from dataclasses import dataclass
-from enum import Enum
 import ccxt.async_support as ccxt
 from loguru import logger
 from execution.binance_executor import OrderSide, OrderType, TimeInForce, OrderbookSnapshot, L2DepthLevel
