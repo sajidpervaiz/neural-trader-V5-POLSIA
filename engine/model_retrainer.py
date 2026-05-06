@@ -21,7 +21,7 @@ import pandas as pd
 from loguru import logger
 
 if TYPE_CHECKING:
-    from engine.signal_generator import MLScorer
+    pass
 
 # ── Feature engineering (mirrors scripts/train_model.py) ─────────────────────
 
@@ -357,7 +357,7 @@ class ModelRetrainer:
         import time as _time
         t0 = _time.time()
         try:
-            from engine.learning.features import engineer_features, FEATURE_COLS
+            from engine.learning.features import engineer_features
             feat_df = await asyncio.get_event_loop().run_in_executor(
                 None, engineer_features, df
             )

@@ -24,9 +24,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from loguru import logger
 
-from engine.volume_profile import layer5_volume_score, compute_vpfr
+from engine.volume_profile import layer5_volume_score
 
 
 # ── Result types ───────────────────────────────────────────────────────────────
@@ -194,7 +193,7 @@ def layer2_structure_gate(df: pd.DataFrame, direction: str) -> LayerResult:
 
     if not struct_ok:
         return LayerResult(2, "Structure Gate", True, True, 60.0,
-                           f"in_fib_zone but no bos/choch signal (partial pass)")
+                           "in_fib_zone but no bos/choch signal (partial pass)")
 
     reason = []
     if direction == "long" and bos_bull > 0:

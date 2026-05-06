@@ -159,4 +159,4 @@ class SessionFilter:
 def _utc_now(dt: Optional[datetime.datetime]) -> datetime.datetime:
     if dt is not None:
         return dt if dt.tzinfo is None else dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
-    return datetime.datetime.utcnow()
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)

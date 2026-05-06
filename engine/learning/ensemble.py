@@ -22,17 +22,36 @@ Design philosophy (20-year perspective):
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import pickle
 import time
 import warnings
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from loguru import logger
+
+_BUNDLE_MAGIC = b"NTV5ENS1"
+_SIG_LEN = 32  # sha256
+
+def _bundle_key() -> bytes:
+    """Return the HMAC key used to sign/verify ensemble pickle bundles.
+
+    Source order: env MODEL_HMAC_KEY, env NEURALTRADER_SECRET, else a
+    deterministic per-host fallback. The fallback still prevents
+    drive-by supply-chain swaps but is weaker than an ops-provisioned key.
+    """
+    for var in ("MODEL_HMAC_KEY", "NEURALTRADER_SECRET"):
+        val = os.environ.get(var)
+        if val:
+            return val.encode("utf-8")
+    host = os.uname().nodename if hasattr(os, "uname") else "localhost"
+    return hashlib.sha256(f"ntv5-ensemble-{host}".encode()).digest()
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -430,19 +449,38 @@ class RegimeAwareEnsemble:
 
     # ── Persistence ──────────────────────────────────────────────────────────
     def save(self, path: str | Path) -> None:
+        """Serialize with an HMAC prefix so tampered/swapped bundles fail to load.
+
+        Bundle layout: MAGIC(8) || sha256-HMAC(32) || pickle-payload
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        blob = pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
+        sig = hmac.new(_bundle_key(), blob, hashlib.sha256).digest()
         tmp = path.with_suffix(".tmp")
         with open(tmp, "wb") as f:
-            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.write(_BUNDLE_MAGIC + sig + blob)
         tmp.rename(path)
-        logger.info("Ensemble saved → {}", path)
+        logger.info("Ensemble saved → {} (signed)", path)
 
     @classmethod
     def load(cls, path: str | Path) -> "RegimeAwareEnsemble":
-        with open(path, "rb") as f:
-            obj = pickle.load(f)
-        logger.info("Ensemble loaded ← {}", path)
+        data = Path(path).read_bytes()
+        if not data.startswith(_BUNDLE_MAGIC):
+            raise ValueError(
+                f"Ensemble bundle at {path} is unsigned or legacy format — "
+                "refusing to unpickle. Re-train or migrate with a signed save()."
+            )
+        head = len(_BUNDLE_MAGIC)
+        sig, blob = data[head:head + _SIG_LEN], data[head + _SIG_LEN:]
+        expected = hmac.new(_bundle_key(), blob, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError(
+                f"Ensemble bundle at {path} failed HMAC verification — "
+                "refusing to load potentially tampered weights."
+            )
+        obj = pickle.loads(blob)  # nosec B301 — HMAC-verified above
+        logger.info("Ensemble loaded ← {} (verified)", path)
         return obj
 
     # ── Status ───────────────────────────────────────────────────────────────

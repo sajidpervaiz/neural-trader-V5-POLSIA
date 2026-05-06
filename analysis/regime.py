@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -338,7 +338,7 @@ class RegimeDetector:
         return self._current_regime
 
     def get_hysteresis_snapshot(self) -> dict[str, Any]:
-        """REQ-REG-005: expose hysteresis state for dashboard rendering.
+        """REQ-REG-005: expose the hysteresis state for dashboard rendering.
 
         Returns the current regime + how many candles we've held it,
         any pending regime swap (and how many of the required confirmation

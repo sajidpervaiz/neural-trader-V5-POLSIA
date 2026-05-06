@@ -9,7 +9,7 @@ Tier 4: < $30M (excluded)
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
@@ -171,7 +171,7 @@ class PairRegistry:
                 actions[symbol] = f"demoted:{','.join(reasons)}"
             elif not demote and old_tier.value > new_tier.value:
                 info.promoted_from = old_tier
-                actions[symbol] = f"promoted:volume"
+                actions[symbol] = "promoted:volume"
 
             if new_tier != old_tier:
                 info.tier = new_tier

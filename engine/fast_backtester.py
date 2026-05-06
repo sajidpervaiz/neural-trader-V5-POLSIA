@@ -134,11 +134,9 @@ class FastBacktester:
         signals: pd.Series,
         symbol: str = "UNKNOWN",
     ) -> BacktestResult:
-        if _RUST_AVAILABLE:
-            try:
-                return self._run_rust(df, signals, symbol)
-            except Exception as exc:
-                logger.debug("Rust backtester error (falling back): {}", exc)
+        # Python path is feature-complete (latency, SL/TP, trades, equity_curve).
+        # Rust path is a coarse approximation and returns a degraded result, so
+        # only use it when the caller explicitly opts in via _run_rust().
         return self._run_python(df, signals, symbol)
 
     def _run_python(
@@ -378,8 +376,7 @@ class MonteCarloSimulator:
 
             for pnl_pct in shuffled:
                 equity *= (1.0 + pnl_pct)
-                if equity > peak:
-                    peak = equity
+                peak = max(peak, equity)
                 dd = (peak - equity) / peak if peak > 0 else 0.0
                 max_dd = max(max_dd, dd)
 

@@ -4,7 +4,7 @@ Signal Validator with OOS validation, paper tracking, decay detection.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from collections import deque
