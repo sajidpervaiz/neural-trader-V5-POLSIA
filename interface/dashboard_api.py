@@ -2908,11 +2908,26 @@ def build_app(
             if passphrase:
                 params["password"] = str(passphrase)
         client = cls(params)
-        if testnet and hasattr(client, "set_sandbox_mode"):
+        if testnet:
+            # CCXT removed set_sandbox_mode for binance futures (announcement #92).
+            # Use the same pattern as cex_executor: swap fapi/dapi entries from
+            # urls['test'] into urls['api']. Falls back to set_sandbox_mode for
+            # other venues that still support it.
             try:
-                client.set_sandbox_mode(True)
-            except Exception:
-                pass
+                test_urls = client.urls.get("test", {}) if isinstance(getattr(client, "urls", {}), dict) else {}
+                api_urls = client.urls.get("api", {}) if isinstance(getattr(client, "urls", {}), dict) else {}
+                swapped = 0
+                for k, v in test_urls.items():
+                    if k.startswith(("fapi", "dapi")) and k in api_urls:
+                        api_urls[k] = v
+                        swapped += 1
+                if swapped == 0 and hasattr(client, "set_sandbox_mode"):
+                    client.set_sandbox_mode(True)
+            except Exception as exc:
+                logger.debug("test-keys: testnet URL swap failed: {}", exc)
+                if hasattr(client, "set_sandbox_mode"):
+                    try: client.set_sandbox_mode(True)
+                    except Exception: pass
 
         balances_summary: list[dict[str, Any]] = []
         try:

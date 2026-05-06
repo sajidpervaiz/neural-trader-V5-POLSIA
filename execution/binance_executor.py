@@ -101,7 +101,20 @@ class BinanceExecutor:
         })
 
         if testnet:
-            self.exchange.set_sandbox_mode(True)
+            # CCXT removed set_sandbox_mode for binance futures (announcement #92).
+            # Override fapi* URLs directly so REST hits testnet.binancefuture.com.
+            try:
+                api_urls = self.exchange.urls.get('api') or {}
+                for k, v in list(api_urls.items()):
+                    if isinstance(v, str) and 'fapi.binance.com' in v:
+                        api_urls[k] = v.replace('https://fapi.binance.com', 'https://testnet.binancefuture.com')
+                self.exchange.urls['api'] = api_urls
+            except Exception:
+                # legacy CCXT path — fall through to set_sandbox_mode if URL override fails
+                try:
+                    self.exchange.set_sandbox_mode(True)
+                except Exception:
+                    pass
 
         self.paper_trading = enable_paper_trading
 
