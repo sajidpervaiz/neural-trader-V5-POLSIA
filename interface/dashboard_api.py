@@ -2874,6 +2874,18 @@ def build_app(
         api_key = str(body.get("api_key") or "").strip()
         api_secret = str(body.get("api_secret") or "").strip()
         testnet = bool(body.get("testnet", False))
+        # `type` selects the CCXT product line. For Binance "demo account" keys
+        # (testnet.binancefuture.com) this MUST be "future" — those keys do
+        # not exist on spot testnet and will return -2015 if probed there.
+        # Default to whatever the venue's settings.yaml says, falling back
+        # to "future" for binance/bybit/okx since that's what this bot trades.
+        body_type = str(body.get("type") or body.get("market") or "").lower().strip()
+        if not body_type:
+            try:
+                cfg_type = str((config.get_value("exchanges", venue) or {}).get("type", "") or "").lower()
+            except Exception:
+                cfg_type = ""
+            body_type = cfg_type or ("future" if venue in {"binance", "bybit", "okx"} else "spot")
 
         if not api_key or not api_secret:
             return {"success": False, "error": "api_key and api_secret required"}
@@ -2887,7 +2899,10 @@ def build_app(
         if cls is None:
             return {"success": False, "error": f"unknown venue: {venue}"}
 
-        params: dict[str, Any] = {"apiKey": api_key, "secret": api_secret, "enableRateLimit": True}
+        params: dict[str, Any] = {
+            "apiKey": api_key, "secret": api_secret, "enableRateLimit": True,
+            "options": {"defaultType": "future" if body_type in {"future", "futures", "perp", "swap"} else body_type or "spot"},
+        }
         if venue == "okx":
             passphrase = body.get("passphrase") or body.get("api_password") or ""
             if passphrase:
