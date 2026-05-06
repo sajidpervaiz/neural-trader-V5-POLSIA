@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -904,7 +905,17 @@ class SignalGenerator:
         return bool(self.config.get_value("system", "paper_mode", default=getattr(self.config, "paper_mode", True)))
 
     def _get_quality_threshold(self) -> int:
-        """Return the active quality gate for the current runtime mode."""
+        """Return the active quality gate for the current runtime mode.
+
+        Env override `NT_QUALITY_THRESHOLD` wins over the mode default when set
+        to a parseable integer (used for tuning; raise back to 65 for live).
+        """
+        env_override = os.getenv("NT_QUALITY_THRESHOLD")
+        if env_override:
+            try:
+                return int(env_override)
+            except ValueError:
+                pass
         return 30 if self._is_paper_mode() else 65
 
     # ── REQ-SIG-009: Master-Score band thresholds ────────────────────────
@@ -2736,6 +2747,31 @@ class SignalGenerator:
         prop_sign = 1.0 if proposed_direction == "long" else -1.0
         funding_bonus = int(round(fund_div * prop_sign * 5))  # favor when funding aligned w/ direction
         quality_score = max(0, min(100, int(quality_score) + funding_bonus))
+
+        # ── Candlestick pattern confluence (REQ-IND extension, opt-in) ─────
+        # Gated by signals.pattern_confluence_enabled (default off). When on,
+        # the latest-bar pattern composite (sum of bullish - bearish hits) is
+        # capped at ±3 and applied at signals.pattern_confluence_weight points
+        # per unit, aligned with the proposed direction. Stored on the quality
+        # breakdown so the dashboard can render the contribution.
+        signals_cfg_local = self.config.get_value("signals") or {}
+        if bool(signals_cfg_local.get("pattern_confluence_enabled", False)):
+            try:
+                from analysis.candlestick_patterns import detect_patterns
+                _, comp_series = detect_patterns(df["open"], df["high"], df["low"], df["close"])
+                pat_comp = int(comp_series.iloc[-1]) if len(comp_series) else 0
+                pat_comp_clamped = max(-3, min(3, pat_comp))
+                pat_weight = float(signals_cfg_local.get("pattern_confluence_weight", 2.0))
+                pattern_bonus = int(round(pat_comp_clamped * prop_sign * pat_weight))
+                quality_score = max(0, min(100, int(quality_score) + pattern_bonus))
+                self._last_quality_breakdown["pattern_confluence"] = {
+                    "composite": pat_comp,
+                    "clamped": pat_comp_clamped,
+                    "bonus_applied": pattern_bonus,
+                    "weight_per_unit": pat_weight,
+                }
+            except Exception as exc:
+                logger.debug("Pattern confluence error: {}", exc)
 
         # Quality ≥ 90 → +25% size boost (spec)
         quality_size_boost = 1.25 if quality_score >= 90 else 1.0
