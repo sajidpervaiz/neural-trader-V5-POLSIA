@@ -53,7 +53,7 @@ def _make_ohlcv(n: int = 500, seed: int = 42, start_price: float = 50_000.0) -> 
         "open": open_, "high": high, "low": low, "close": close, "volume": volume,
     }, index=idx)
     # Simple ATR proxy for backtest use
-    tr = np.maximum(high - low, np.abs(high - open_), np.abs(low - open_))
+    tr = np.maximum.reduce([high - low, np.abs(high - open_), np.abs(low - open_)])
     df["atr_14"] = pd.Series(tr, index=idx).rolling(14).mean().fillna(pd.Series(close * 0.005, index=idx))
     # Add features needed by TechnicalScorer
     df["rsi_14"] = 50.0 + rng.normal(0, 8, n)

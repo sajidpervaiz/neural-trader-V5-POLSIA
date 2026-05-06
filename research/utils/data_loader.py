@@ -76,13 +76,14 @@ def load_candles(
         idx += 1
 
     where = " AND ".join(conditions)
+    # nosec B608 — `where` built from hardcoded "col = $N" fragments; limit int-coerced; values bound via $N
     sql = f"""
     SELECT time, open, high, low, close, volume, num_trades
     FROM candles
     WHERE {where}
     ORDER BY time DESC
-    LIMIT {limit}
-    """
+    LIMIT {int(limit)}
+    """  # nosec B608
     rows = _run(_async_query(sql, *params))
     if not rows:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "num_trades"])
@@ -109,13 +110,14 @@ def load_funding_rates(
         params.append(symbol)
         idx += 1
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    # nosec B608 — `where` built from hardcoded "col = $N" fragments; limit int-coerced; values bound via $N
     sql = f"""
     SELECT time, exchange, symbol, funding_rate, predicted_rate
     FROM funding_rates
     {where}
     ORDER BY time DESC
-    LIMIT {limit}
-    """
+    LIMIT {int(limit)}
+    """  # nosec B608
     rows = _run(_async_query(sql, *params))
     if not rows:
         return pd.DataFrame(columns=["time", "exchange", "symbol", "funding_rate", "predicted_rate"])
@@ -140,13 +142,14 @@ def load_open_interest(
         params.append(symbol)
         idx += 1
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    # nosec B608 — `where` built from hardcoded "col = $N" fragments; limit int-coerced; values bound via $N
     sql = f"""
     SELECT time, exchange, symbol, oi_usd, oi_contracts, oi_change_24h
     FROM open_interest
     {where}
     ORDER BY time DESC
-    LIMIT {limit}
-    """
+    LIMIT {int(limit)}
+    """  # nosec B608
     rows = _run(_async_query(sql, *params))
     if not rows:
         return pd.DataFrame(columns=["time", "exchange", "symbol", "oi_usd", "oi_contracts", "oi_change_24h"])

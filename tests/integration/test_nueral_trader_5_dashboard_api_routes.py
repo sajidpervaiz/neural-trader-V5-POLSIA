@@ -838,7 +838,7 @@ def test_positions_routes_are_manager_backed(api_context: dict) -> None:
         take_profit=3060.0,
         timestamp=1700000000,
     )
-    asyncio.get_event_loop().run_until_complete(risk_mgr.open_position(signal, size=1500.0))
+    asyncio.run(risk_mgr.open_position(signal, size=1500.0))
 
     list_resp = client.get("/positions/")
     assert list_resp.status_code == 200

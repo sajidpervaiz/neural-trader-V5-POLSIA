@@ -100,7 +100,23 @@ def _make_config(**overrides: Any) -> MagicMock:
         "stop_loss_pct": 0.015,
     }
     risk.update(overrides)
-    cfg.get_value = lambda key: risk if key == "risk" else {}
+
+    def _get_value(*args, **kwargs):
+        default = kwargs.get("default")
+        if not args:
+            return default
+        if args[0] == "risk" and len(args) == 1:
+            return risk
+        if args[0] == "system" and len(args) >= 2 and args[1] == "paper_mode":
+            return True
+        if len(args) == 1:
+            return {} if default is None else default
+        # multi-key lookup (section, key)
+        section = risk if args[0] == "risk" else {}
+        return section.get(args[1], default) if len(args) >= 2 else default
+
+    cfg.get_value = _get_value
+    cfg.paper_mode = True
     return cfg
 
 

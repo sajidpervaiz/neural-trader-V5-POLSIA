@@ -218,7 +218,7 @@ def train(df: pd.DataFrame, output_dir: Path) -> None:
 
     print(f"\n[ok] Model saved to {model_path}")
     print(f"[ok] Features saved to {features_path}")
-    print(f"\nAdd this to your .env or environment:")
+    print("\nAdd this to your .env or environment:")
     print(f"  ML_MODEL_SHA256={sha256}")
     print(f"\nValidation AUC: {model.best_score['valid_0']['auc']:.4f}")
 

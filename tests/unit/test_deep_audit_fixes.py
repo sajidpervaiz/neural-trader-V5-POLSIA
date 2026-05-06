@@ -192,7 +192,10 @@ class TestDbHandlerTimezoneAware:
     def test_datetime_utcnow_is_naive(self):
         """Confirm the old pattern was indeed broken."""
         import datetime
-        dt = datetime.datetime.utcnow()
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            dt = datetime.datetime.utcnow()
         assert dt.tzinfo is None  # This is why we fixed it
 
 

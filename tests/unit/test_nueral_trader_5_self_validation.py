@@ -183,8 +183,8 @@ class TestOpsReconnection:
         async def run():
             bus._queue.put_nowait(("TEST", "data"))
             await asyncio.sleep(0.1)
-        
-        asyncio.get_event_loop().run_until_complete(run())
+
+        asyncio.run(run())
 
 
 # ── 3. Risk Test: 10 Consecutive Losses → Daily Loss Halt ───────────────────
@@ -221,11 +221,13 @@ class TestRiskDailyLossHalt:
             f"Daily loss: {rm._circuit_breaker._daily_loss:.4f}"
         )
 
-        # Verify new signals are blocked
+        # Verify new signals are blocked. Daily-loss trip auto-engages the
+        # kill switch (production-safe pattern), which checks first; either
+        # rejection reason indicates trading is halted.
         signal = _make_signal(symbol="BLOCKED/USDT:USDT")
         approved, reason, _ = rm.approve_signal(signal)
         assert not approved
-        assert "circuit_breaker" in reason
+        assert ("circuit_breaker" in reason) or ("kill_switch" in reason)
 
     def test_drawdown_limit_blocks_trading(self):
         """Equity drawdown beyond threshold blocks new trades."""

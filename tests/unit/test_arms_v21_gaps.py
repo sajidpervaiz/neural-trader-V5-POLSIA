@@ -699,7 +699,7 @@ class TestCorrelationGroups:
 
     def test_unaffiliated_symbol(self):
         rm = self._make_rm()
-        assert rm._get_correlation_group("SOL/USDT") is None
+        assert rm._get_correlation_group("XRP/USDT") is None
 
     def test_group_exposure_limit(self):
         rm = self._make_rm()

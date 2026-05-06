@@ -554,6 +554,10 @@ class TestCEXExecutorEntryToSLTP:
         executor._running = True
         executor._rate_limiter = AsyncMock()
         executor._rate_limiter.acquire = AsyncMock()
+        executor._maker_first = True
+        executor._post_only = False
+        executor._iceberg_threshold_usd = 0.0
+        executor._iceberg_chunks = 1
 
         # Mock ccxt client
         mock_client = AsyncMock()

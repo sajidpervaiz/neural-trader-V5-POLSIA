@@ -504,7 +504,7 @@ class TestAIAgentAttachment:
         assert status["enabled"] is True
         assert status["mode"] == "full"
 
-    def test_ai_agent_rejects_weak_signal(self):
+    async def test_ai_agent_rejects_weak_signal(self):
         from engine.ai_agent import TradingAIAgent
 
         agent = TradingAIAgent(enabled=True, mode="full", min_confidence=0.55)
@@ -514,7 +514,7 @@ class TestAIAgentAttachment:
         signal.ml_score = 0.05
         signal.metadata = {"risk_reward": 0.8, "volume_flow_score": 10, "smc_score": 5}
 
-        decision = agent.review_signal(signal)
+        decision = await agent.review_signal(signal)
 
         assert decision.action == "reject"
         assert decision.approved is False
@@ -555,7 +555,7 @@ class TestAIAgentAttachment:
         assert status["api_configured"] is True
         assert status["remote_enabled"] is True
 
-    def test_ai_agent_claude_falls_back_to_local_on_error(self):
+    async def test_ai_agent_claude_falls_back_to_local_on_error(self):
         from engine.ai_agent import TradingAIAgent
 
         agent = TradingAIAgent(
@@ -565,7 +565,7 @@ class TestAIAgentAttachment:
             api_key="test-key",
         )
 
-        def _boom(*args, **kwargs):
+        async def _boom(*args, **kwargs):
             raise RuntimeError("anthropic unavailable")
 
         agent._review_with_claude = _boom
@@ -576,18 +576,18 @@ class TestAIAgentAttachment:
         signal.ml_score = 0.05
         signal.metadata = {"risk_reward": 0.8, "volume_flow_score": 10, "smc_score": 5}
 
-        decision = agent.review_signal(signal)
+        decision = await agent.review_signal(signal)
         status = agent.get_status()
 
         assert decision.approved is False
         assert status["last_decision_source"] == "local"
 
-    def test_ai_agent_chat_local_response(self):
+    async def test_ai_agent_chat_local_response(self):
         from engine.ai_agent import TradingAIAgent
 
         agent = TradingAIAgent(enabled=True, mode="full", provider="local")
 
-        result = agent.chat("should I keep auto trading on?", context={"auto_trading_enabled": True, "open_positions": 1})
+        result = await agent.chat("should I keep auto trading on?", context={"auto_trading_enabled": True, "open_positions": 1})
 
         assert result["success"] is True
         assert result["provider"] == "local"

@@ -501,9 +501,7 @@ class TestIteration1FixesBatch2:
         ]
 
         import asyncio
-        asyncio.get_event_loop().run_until_complete(
-            reconciler._ensure_protective_orders(result)
-        )
+        asyncio.run(reconciler._ensure_protective_orders(result))
 
         assert "BTCUSDT" in order_placer._protective
         prot = order_placer._protective["BTCUSDT"]

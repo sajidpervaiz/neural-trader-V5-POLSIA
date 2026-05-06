@@ -50,7 +50,7 @@ def parameter_sweep(
             result = bt.run(df, signals)
             row = {**params, **result.to_dict()}
             results.append(row)
-        except Exception as e:
+        except Exception:
             pass
     if not results:
         return pd.DataFrame()
