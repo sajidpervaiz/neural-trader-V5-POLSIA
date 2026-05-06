@@ -106,6 +106,14 @@ class Dispatcher:
                             task.get_name(),
                             exc,
                         )
+                        try:
+                            self.event_bus.publish_nowait("COMPONENT_ERROR", {
+                                "component": task.get_name(),
+                                "error": repr(exc)[:500],
+                                "error_type": type(exc).__name__,
+                            })
+                        except Exception:
+                            pass
                         fatal_error = exc
                         break
 

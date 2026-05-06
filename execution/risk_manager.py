@@ -881,6 +881,25 @@ class RiskManager:
                 return False, f"liquidation_risk (SL={signal.stop_loss:.2f} >= est_liq={est_liq:.2f})"
         return True, ""
 
+    def _publish_risk_decision(self, signal: TradingSignal, *, approved: bool, reason: str, size: float) -> None:
+        """Emit RISK_DECISION (always) + RISK_BLOCK (when rejected) for the audit log."""
+        try:
+            payload = {
+                "exchange": getattr(signal, "exchange", ""),
+                "symbol": getattr(signal, "symbol", ""),
+                "direction": getattr(signal, "direction", ""),
+                "score": float(getattr(signal, "score", 0.0) or 0.0),
+                "approved": bool(approved),
+                "reason": str(reason or ""),
+                "size_usd": float(size or 0.0),
+                "ts": time.time(),
+            }
+            self.event_bus.publish_nowait("RISK_DECISION", payload)
+            if not approved:
+                self.event_bus.publish_nowait("RISK_BLOCK", payload)
+        except Exception as exc:
+            logger.debug("RISK_DECISION publish failed: {}", exc)
+
     def update_funding_rate(self, symbol: str, rate: float) -> None:
         """Update current funding rate for a symbol (in decimal, e.g., 0.0001)."""
         self._current_funding_rates[symbol] = rate
@@ -1106,9 +1125,12 @@ class RiskManager:
             cutoff = now - self._order_window_seconds
             self._recent_order_times = [t for t in self._recent_order_times if t > cutoff]
             if len(self._recent_order_times) >= self._max_orders_per_window:
-                return False, f"portfolio_rate_limit ({self._max_orders_per_window} orders in {self._order_window_seconds}s)", 0.0, None
+                reason = f"portfolio_rate_limit ({self._max_orders_per_window} orders in {self._order_window_seconds}s)"
+                self._publish_risk_decision(signal, approved=False, reason=reason, size=0.0)
+                return False, reason, 0.0, None
 
             approved, reason, size = self.approve_signal(signal)
+            self._publish_risk_decision(signal, approved=approved, reason=reason, size=size)
             if not approved:
                 return False, reason, 0.0, None
             # Open position inline (already holding lock, skip open_position's lock)
@@ -1269,6 +1291,18 @@ class RiskManager:
             })
             if len(self._closed_trades) > 500:
                 self._closed_trades = self._closed_trades[-500:]
+            try:
+                self.event_bus.publish_nowait("PNL_UPDATE", {
+                    "exchange": exchange, "symbol": symbol, "direction": pos.direction,
+                    "entry_price": pos.entry_price, "exit_price": exit_price,
+                    "size": pos.size, "pnl_usd": round(pnl_dollar, 4),
+                    "pnl_pct": round(pos.pnl_pct, 6),
+                    "hold_seconds": pos.hold_seconds,
+                    "equity_after": round(self._equity, 2),
+                    "ts": time.time(),
+                })
+            except Exception as exc:
+                logger.debug("PNL_UPDATE publish failed: {}", exc)
             return pos
 
     # ── Trailing stop / breakeven / time exit ─────────────────────────────
@@ -1650,8 +1684,25 @@ class RiskManager:
         self._running = True
         self.event_bus.subscribe("TICK", self._handle_tick)
         logger.info("RiskManager started — equity={:.2f}, sizing={}", self._equity, self._sizing_method)
+        snapshot_interval = 60.0
+        last_snapshot = 0.0
         while self._running:
             await asyncio.sleep(5)
+            now = time.time()
+            if now - last_snapshot >= snapshot_interval:
+                last_snapshot = now
+                try:
+                    unrealized = sum(p.pnl for p in self._positions.values())
+                    self.event_bus.publish_nowait("EQUITY_SNAPSHOT", {
+                        "equity": round(self._equity, 2),
+                        "open_positions": len(self._positions),
+                        "unrealized_pnl": round(unrealized, 4),
+                        "circuit_breaker_tripped": bool(self._circuit_breaker.tripped),
+                        "killed": bool(self._killed),
+                        "ts": now,
+                    })
+                except Exception as exc:
+                    logger.debug("EQUITY_SNAPSHOT publish failed: {}", exc)
 
     async def stop(self) -> None:
         self._running = False
