@@ -2908,11 +2908,24 @@ def build_app(
             if passphrase:
                 params["password"] = str(passphrase)
         client = cls(params)
-        if testnet:
+        # Sandbox mode: two distinct binance environments — opt in via the request body.
+        #   demo=true       → demo.binance.com keys, REST at demo-fapi.binance.com  ← CCXT announcement #92 path
+        #   testnet=true    → testnet.binancefuture.com keys, classic urls['test']  ← deprecated for futures but still works
+        # If neither, talks to mainnet.
+        demo = bool(body.get("demo", False))
+        if venue == "binance" and demo:
+            try:
+                api_urls = client.urls.get("api", {}) if isinstance(getattr(client, "urls", {}), dict) else {}
+                for k, v in list(api_urls.items()):
+                    if isinstance(v, str) and "://fapi.binance.com" in v:
+                        api_urls[k] = v.replace("://fapi.binance.com", "://demo-fapi.binance.com")
+                client.urls["api"] = api_urls
+            except Exception as exc:
+                logger.debug("test-keys: demo URL swap failed: {}", exc)
+        elif testnet:
             # CCXT removed set_sandbox_mode for binance futures (announcement #92).
-            # Use the same pattern as cex_executor: swap fapi/dapi entries from
-            # urls['test'] into urls['api']. Falls back to set_sandbox_mode for
-            # other venues that still support it.
+            # Swap fapi/dapi entries from urls['test'] into urls['api']. Falls
+            # back to set_sandbox_mode for other venues that still support it.
             try:
                 test_urls = client.urls.get("test", {}) if isinstance(getattr(client, "urls", {}), dict) else {}
                 api_urls = client.urls.get("api", {}) if isinstance(getattr(client, "urls", {}), dict) else {}

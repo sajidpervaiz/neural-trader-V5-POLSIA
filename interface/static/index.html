@@ -3357,7 +3357,7 @@ async function saveSettings(){
         if(!k||k==='****'||!s||s==='****') continue;
         toast('info','Validating '+v.toUpperCase()+(useTestnet?' demo':'')+' keys…');
         try{
-          const pf=await(await fetch('/api/config/test-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venue:v,api_key:k,api_secret:s,testnet:useTestnet})})).json();
+          const pf=await(await fetch('/api/config/test-keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({venue:v,api_key:k,api_secret:s,demo:useTestnet,testnet:false})})).json();
           if(pf.success){
             passed={venue:v,balances:pf.balances||[],count:pf.balance_count||0};
             toast('success',v.toUpperCase()+(useTestnet?' demo ':' ')+'keys valid — '+(pf.balance_count||0)+' assets');
