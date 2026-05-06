@@ -101,3 +101,14 @@ secrets/
 config/settings.live.yaml
 config/*.runtime.yaml
 .backup_pre_claude/
+data/*.db-shm
+data/*.db-wal
+data/trade_wal.jsonl
+idempotency_store.json
+order_audit_log.jsonl
+order_state.json
+ml_model.pkl
+models/ml_signal.lgb
+tests/data/
+tests/idempotency_store.json
+tests/order_audit_log.jsonl
