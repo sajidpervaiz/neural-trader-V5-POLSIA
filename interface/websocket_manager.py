@@ -4,8 +4,8 @@ Websocket manager for real-time data broadcasting to dashboard clients.
 
 import asyncio
 import json
-from typing import Dict, Set, Optional, Callable, Any
-from fastapi import WebSocket, WebSocketDisconnect
+from typing import Dict, Set, Optional, Any
+from fastapi import WebSocket
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum

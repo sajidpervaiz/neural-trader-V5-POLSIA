@@ -4,7 +4,7 @@ Risk API routes for FastAPI dashboard.
 
 import time
 from fastapi import APIRouter, HTTPException, Query, Body
-from typing import Any, Optional
+from typing import Optional
 from pydantic import BaseModel, Field
 from enum import Enum
 from loguru import logger

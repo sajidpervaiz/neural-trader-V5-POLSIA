@@ -168,7 +168,9 @@ class MonitoringDashboardAuth(BaseModel):
 
 
 class MonitoringDashboardConfig(BaseModel):
-    host: str = "0.0.0.0"
+    # Binding to 0.0.0.0 is intentional for container/VM deployments; the
+    # dashboard_api middleware enforces API-key auth in non-paper mode.
+    host: str = "0.0.0.0"  # noqa: S104  # nosec B104 — auth-gated via dashboard middleware
     port: int = 8000
     allow_origins: list[str] = Field(default_factory=lambda: ["http://localhost"])
     auth: MonitoringDashboardAuth = Field(default_factory=MonitoringDashboardAuth)

@@ -4,6 +4,7 @@ Retry Policy with exponential backoff and jitter.
 
 import asyncio
 import functools
+import inspect
 import random
 import time
 from typing import Callable, Optional, Type, List
@@ -73,7 +74,7 @@ class RetryPolicy:
 
         for attempt in range(1, self.max_attempts + 1):
             try:
-                if asyncio.iscoroutinefunction(operation):
+                if inspect.iscoroutinefunction(operation):
                     return await operation(*args, **kwargs)
                 return operation(*args, **kwargs)
             except Exception as e:
@@ -179,7 +180,7 @@ def with_retry(policy: Optional[RetryPolicy] = None):
 
             raise last_exception
 
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
             return async_wrapper
         else:
             return sync_wrapper

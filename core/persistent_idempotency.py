@@ -17,7 +17,7 @@ class PersistentIdempotencyManager(IdempotencyManager):
 
     def _load(self):
         try:
-            with open(self.filepath, "r") as f:
+            with open(self.filepath) as f:
                 data = json.load(f)
             now = time.time()
             for key, rec in data.items():

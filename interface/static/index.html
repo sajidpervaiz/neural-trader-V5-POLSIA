@@ -3415,7 +3415,11 @@ window.__flowSelectedId = null;       // currently-selected layer id (1..10)
 window.__flowCtx = null;              // last-loaded context bundle
 
 async function loadFlowCtx() {
-  const [layers, quality, session, geo, status, recon, latency, fsm, uptime, ebstats] = await Promise.all([
+  // Build the (symbol, tf) the user is looking at — falls back to BTC/1m.
+  const sym = (typeof symbol !== 'undefined' && symbol) ? symbol : 'BTC';
+  const baseSymForApi = (sym + '/USDT:USDT').replace(/\//g, '%2F').replace(/:/g, '%3A');
+  const tfForApi = (typeof tf !== 'undefined' && tf) ? tf : '1m';
+  const [layers, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, levels, patterns] = await Promise.all([
     fetch('/api/layers').then(r=>r.json()).catch(()=>({layers:[]})),
     fetch('/api/quality').then(r=>r.json()).catch(()=>({})),
     fetch('/api/session').then(r=>r.json()).catch(()=>({})),
@@ -3426,6 +3430,8 @@ async function loadFlowCtx() {
     fetch('/api/state').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/uptime').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/eventbus/stats').then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/levels/' + baseSymForApi + '/' + tfForApi).then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/patterns/' + baseSymForApi + '/' + tfForApi + '?lookback=50').then(r=>r.json()).catch(()=>({available:false})),
   ]);
   // Synthesize the L10 (Geopolitical) layer entry the same way the Pipeline tab does.
   const list = (layers.layers || []).slice();
@@ -3447,7 +3453,7 @@ async function loadFlowCtx() {
       description:'RSS-driven per-symbol news factor',
       status:st, score: topAbs>=0?topAbs*100:0, threshold:50, detail});
   }
-  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, raw:layers};
+  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, levels, patterns, raw:layers};
   return window.__flowCtx;
 }
 
@@ -3482,6 +3488,40 @@ function renderLayerDetail(layer, ctx) {
       h += '</div></div>';
     }
   }
+  // L3 Smart Money — overlay candlestick pattern hits + fib/pivot proximity
+  if (layer.id === 4 && ctx) {
+    const lv = (ctx.levels && ctx.levels.available) ? ctx.levels : null;
+    const pat = (ctx.patterns && ctx.patterns.available) ? ctx.patterns : null;
+    if (pat && pat.latest_hits && Object.keys(pat.latest_hits).length) {
+      h += '<div class="section"><div class="meta">CANDLESTICK PATTERNS (LATEST BAR)</div>';
+      h += '<div style="display:flex;flex-wrap:wrap;gap:4px">';
+      for (const [name, val] of Object.entries(pat.latest_hits)) {
+        const v = Number(val) || 0;
+        const col = v > 0 ? 'var(--green)' : v < 0 ? 'var(--red)' : 'var(--text3)';
+        const sign = v > 0 ? '+' : '';
+        h += '<span style="font:600 10px \'JetBrains Mono\';border:1px solid '+col+';color:'+col+';padding:2px 6px;border-radius:3px">'+esc(name)+' '+sign+v+'</span>';
+      }
+      h += '</div>';
+      const comp = Number(pat.latest_composite || 0);
+      const compCol = comp > 0 ? 'var(--green)' : comp < 0 ? 'var(--red)' : 'var(--text3)';
+      h += '<div style="margin-top:6px;font:11px \'JetBrains Mono\';color:'+compCol+'">composite '+(comp>=0?'+':'')+comp+' (window '+pat.bars+' bars)</div>';
+      h += '</div>';
+    }
+    if (lv && (lv.nearest_pivot || lv.nearest_fib)) {
+      h += '<div class="section"><div class="meta">NEAREST LEVELS</div>';
+      h += '<div class="kv">';
+      if (lv.nearest_pivot) {
+        const np = lv.nearest_pivot;
+        h += '<span class="k">Pivot</span><span class="v">'+esc(np[0])+' @ '+Number(np[1]).toFixed(2)+' ('+Number(np[2]).toFixed(2)+'%)</span>';
+      }
+      if (lv.nearest_fib) {
+        const nf = lv.nearest_fib;
+        const lblMap = {level_0:'0%', level_236:'23.6%', level_382:'38.2%', level_500:'50%', level_618:'61.8%', level_786:'78.6%', level_1000:'100%'};
+        h += '<span class="k">Fib</span><span class="v">'+esc(lblMap[nf[0]] || nf[0])+' @ '+Number(nf[1]).toFixed(2)+' ('+Number(nf[2]).toFixed(2)+'%)</span>';
+      }
+      h += '</div></div>';
+    }
+  }
   // L4 Volume Flow — VPVR liquidity zones + CVD-degraded pill
   if (layer.id === 5 && ctx && ctx.quality) {
     const vp = (ctx.quality && ctx.quality.volume_profile) || {};
@@ -3501,6 +3541,39 @@ function renderLayerDetail(layer, ctx) {
       if (vp.cvd_degraded) {
         const ambPct = Math.round(Number(vp.cvd_ambiguous_pct||0)*100);
         h += '<div style="margin-top:6px"><span style="display:inline-block;padding:2px 6px;border:1px solid var(--orange);color:var(--orange);font:600 10px \'JetBrains Mono\';border-radius:3px">CVD DEGRADED ('+ambPct+'% ambiguous)</span></div>';
+      }
+      h += '</div>';
+    }
+    // Pivots + Fibonacci levels for the same symbol/tf
+    const lv = (ctx.levels && ctx.levels.available) ? ctx.levels : null;
+    if (lv && (lv.pivots || lv.fibonacci)) {
+      h += '<div class="section"><div class="meta">PIVOTS & FIBONACCI</div>';
+      const last = Number(lv.last_close || 0);
+      h += '<div style="font:10px \'JetBrains Mono\';color:var(--text3);margin-bottom:6px">last close '+last.toFixed(2)+'</div>';
+      const piv = lv.pivots || {};
+      if (Object.keys(piv).length) {
+        h += '<div style="font:600 9px \'Inter\';color:var(--text3);text-transform:uppercase;margin-bottom:3px">Floor pivots</div>';
+        h += '<div style="display:flex;flex-wrap:wrap;gap:4px">';
+        for (const k of ["R3","R2","R1","P","S1","S2","S3"]) {
+          if (piv[k] === undefined) continue;
+          const v = Number(piv[k]);
+          const above = last >= v;
+          const col = k === "P" ? 'var(--cyan)' : (k.startsWith("R") ? 'var(--red)' : 'var(--green)');
+          h += '<span style="font:600 10px \'JetBrains Mono\';border:1px solid '+col+';color:'+col+';padding:1px 5px;border-radius:3px;opacity:'+(above?'1':'0.7')+'">'+k+' '+v.toFixed(2)+'</span>';
+        }
+        h += '</div>';
+      }
+      const fib = lv.fibonacci || {};
+      if (Object.keys(fib).length) {
+        const lblMap = {level_0:'0%', level_236:'23.6%', level_382:'38.2%', level_500:'50%', level_618:'61.8%', level_786:'78.6%', level_1000:'100%'};
+        h += '<div style="font:600 9px \'Inter\';color:var(--text3);text-transform:uppercase;margin:6px 0 3px">Fibonacci retracement</div>';
+        h += '<div style="display:flex;flex-wrap:wrap;gap:4px">';
+        for (const k of ["level_0","level_236","level_382","level_500","level_618","level_786","level_1000"]) {
+          if (fib[k] === undefined) continue;
+          const v = Number(fib[k]);
+          h += '<span style="font:600 10px \'JetBrains Mono\';border:1px solid var(--text3);color:var(--text2);padding:1px 5px;border-radius:3px">'+esc(lblMap[k] || k)+' '+v.toFixed(2)+'</span>';
+        }
+        h += '</div>';
       }
       h += '</div>';
     }

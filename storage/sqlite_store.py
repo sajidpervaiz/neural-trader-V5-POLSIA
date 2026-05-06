@@ -391,7 +391,8 @@ class SQLiteStore:
         with self._lock:
             assert self._conn is not None
             for table in ("ticks", "candles"):
-                cur = self._conn.execute(f"DELETE FROM {table} WHERE time_ns < ?", (cutoff_ns,))
+                # Table names are a hardcoded literal tuple, not user input
+                cur = self._conn.execute(f"DELETE FROM {table} WHERE time_ns < ?", (cutoff_ns,))  # noqa: S608  # nosec B608
                 deleted += cur.rowcount
             self._conn.commit()
         if deleted:

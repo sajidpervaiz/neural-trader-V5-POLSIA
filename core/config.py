@@ -57,12 +57,12 @@ class Config:
         self._path = Path(path)
         self._runtime_override_path = self._resolve_runtime_override_path()
 
-        with open(self._path, "r") as fh:
+        with open(self._path) as fh:
             raw = yaml.safe_load(fh) or {}
 
         if self._runtime_override_path.exists():
             try:
-                with open(self._runtime_override_path, "r") as fh:
+                with open(self._runtime_override_path) as fh:
                     override_raw = yaml.safe_load(fh) or {}
                 raw = _deep_merge(raw, override_raw)
                 logger.debug("Applied runtime overrides from {}", self._runtime_override_path)

@@ -3,6 +3,7 @@ Circuit Breaker with half-open state testing for resilience.
 """
 
 import asyncio
+import inspect
 import time
 from enum import Enum
 from typing import Callable, Optional, Type
@@ -55,7 +56,7 @@ class CircuitBreaker:
                     raise Exception("Circuit breaker is OPEN - rejecting call")
 
         try:
-            result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
+            result = await func(*args, **kwargs) if inspect.iscoroutinefunction(func) else func(*args, **kwargs)
             async with self._lock:
                 self.record_success()
                 self._call_stats["total"] += 1

@@ -10,9 +10,9 @@ from opentelemetry.exporter.jaeger.thrift import JaegerExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.instrumentation.redis import RedisInstrumentor
-from opentelemetry import propagate
 from contextvars import ContextVar
 from typing import Optional, Dict
+import inspect
 import uuid
 import time
 from loguru import logger
@@ -218,7 +218,7 @@ class DistributedTracer:
 
                     raise
 
-            if hasattr(func, '__call__') and asyncio.iscoroutinefunction(func):
+            if hasattr(func, '__call__') and inspect.iscoroutinefunction(func):
                 return async_wrapper
             else:
                 return sync_wrapper
