@@ -14,12 +14,12 @@ from loguru import logger
 from core.config import Config
 from core.event_bus import EventBus
 from core.dispatcher import Dispatcher
-from core.state_machine import OperationalState, OperationalStateMachine
 
 from data_ingestion.cex_websocket import CEXWebSocketManager
 from data_ingestion.dex_rpc import DEXRPCFeed
 from data_ingestion.funding_feed import FundingRateFeed
 from data_ingestion.news_feed import NewsFeed
+from data_ingestion.geopolitical_news import GeoPoliticalNewsFeed
 from data_ingestion.oi_feed import OpenInterestFeed
 from data_ingestion.orderbook_feed import OrderbookFeed
 from data_ingestion.vix_proxy import VIXProxy
@@ -28,6 +28,7 @@ from data_ingestion.user_stream import UserDataStream
 from analysis.data_manager import DataManager
 from analysis.sentiment import SentimentManager
 
+from engine.geopolitical_scorer import GeoPoliticalScorer
 from engine.signal_generator import SignalGenerator
 
 from execution.risk_manager import RiskManager
@@ -48,7 +49,6 @@ from storage.sqlite_store import SQLiteStore
 from monitoring.metrics import Metrics
 from monitoring.health_checks import HealthChecker
 from monitoring.alert_manager import build_alert_manager_from_config, AlertDispatcher
-from monitoring.uptime_tracker import UptimeTracker
 
 from interface.dashboard_api import build_app, run_dashboard
 from interface.telegram_bot import TelegramNotifier
@@ -98,15 +98,10 @@ def _setup_logging(config: Config) -> None:
     )
 
 
-async def main() -> None:
-    # REQ-STATE-001..012: operational FSM.
-    # Constructed first so every subsequent stage can drive transitions
-    # through the canonical boot path. Single-writer; passed by reference.
-    state_machine = OperationalStateMachine()
-
+async def _run_bot(components: dict[str, Any]) -> None:
     config = Config.get(path=os.getenv("NT_CONFIG_PATH"))
     _setup_logging(config)
-    state_machine.transition_to(OperationalState.CONFIG_VALIDATED, reason="config_loaded")
+    components["paper_mode"] = config.paper_mode
 
     logger.info("=" * 60)
     logger.info("  NUERAL-TRADER-5  |  paper_mode={}", config.paper_mode)
@@ -127,13 +122,15 @@ async def main() -> None:
 
     event_bus = EventBus()
     db = DBHandler(config)
+    components["db"] = db
     cache = Cache(config)
     sqlite_store = SQLiteStore()
     metrics = Metrics(config, event_bus)
     health_checker = HealthChecker(check_interval=30)
-    uptime_tracker = UptimeTracker(paper_mode=config.paper_mode)
+    components["health_checker"] = health_checker
     alert_manager = build_alert_manager_from_config(config)
     alert_dispatcher = AlertDispatcher(event_bus, alert_manager)
+    components["alert_dispatcher"] = alert_dispatcher
 
     # ── Persist candles to SQLite on each CANDLE event ────────────────────
     async def _persist_candle(candle: Any) -> None:
@@ -180,26 +177,66 @@ async def main() -> None:
         )
 
     ws_manager = CEXWebSocketManager(config, event_bus)
+    components["ws_manager"] = ws_manager
     dex_feed = DEXRPCFeed(config, event_bus)
+    components["dex_feed"] = dex_feed
     funding_feed = FundingRateFeed(config, event_bus)
+    components["funding_feed"] = funding_feed
     oi_feed = OpenInterestFeed(config, event_bus)
+    components["oi_feed"] = oi_feed
     vix_proxy = VIXProxy(config, event_bus)
+    components["vix_proxy"] = vix_proxy
     sentiment = SentimentManager(config, event_bus)
+    components["sentiment"] = sentiment
     news_feed = NewsFeed(config, event_bus)
+    components["news_feed"] = news_feed
     orderbook_feed = OrderbookFeed(config, event_bus)
+    components["orderbook_feed"] = orderbook_feed
+
+    # Geopolitical scorer + RSS feed (Layer 10 additive contributor — opt-in via
+    # signals.geopolitical_weight; defaults to 0.0 so existing flows are unchanged).
+    geopolitical_scorer = GeoPoliticalScorer()
+    # Map every traded-symbol variant the bot may see (spot BTC/USDT, perp BTCUSDT,
+    # exchange-prefixed binance:BTC/USDT:USDT, etc.) to its canonical config key.
+    _geo_canonicals = list(geopolitical_scorer.symbols)
+    for canonical in _geo_canonicals:
+        base = canonical.split("/")[0]
+        for alias in {
+            canonical.replace(":USDT", ""),  # BTC/USDT
+            canonical.replace("/", "").replace(":USDT", ""),  # BTCUSDT
+            f"{base}/USDT",
+            f"{base}USDT",
+            f"binance:{canonical}",
+            f"bybit:{canonical}",
+        }:
+            geopolitical_scorer.add_alias(alias, canonical)
+    components["geopolitical_scorer"] = geopolitical_scorer
+    geopolitical_feed = GeoPoliticalNewsFeed(config, event_bus, geopolitical_scorer)
+    components["geopolitical_feed"] = geopolitical_feed
 
     data_manager = DataManager(config, event_bus)
     signal_gen = SignalGenerator(config, event_bus, data_manager)
-    # Auto-trading defaults to ON in paper mode for immediate signal generation
-    signal_gen.set_auto_trading(True)
+    signal_gen.set_geopolitical_scorer(geopolitical_scorer)
+    # Live mode: require explicit operator opt-in via /api/auto/toggle.
+    # Paper mode: auto-enable for instant signal flow during dev/testing.
+    signal_gen.set_auto_trading(bool(config.paper_mode))
+    if not config.paper_mode:
+        logger.warning(
+            "LIVE MODE: auto-trading disabled at boot. "
+            "POST /api/auto/toggle {{\"enabled\": true}} to start trading.",
+        )
     risk_mgr = RiskManager(config, event_bus, sqlite_store=sqlite_store)
     signal_gen.set_risk_manager(risk_mgr)  # wire for accurate position counting
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
+    components["order_mgr"] = order_mgr
 
     executors = create_all_executors(config, event_bus, risk_mgr)
+    components["executors"] = executors
 
     # Variational DEX executor (perpetual futures via RFQ)
     variational_executor = create_variational_executor(config, event_bus, risk_mgr)
+    if variational_executor is not None:
+        components["variational_executor"] = variational_executor
 
     by_exchange = {getattr(executor, "exchange_id", ""): executor for executor in executors}
     smart_router = SmartOrderRouter(
@@ -210,9 +247,11 @@ async def main() -> None:
     order_mgr.attach_router(smart_router)
 
     telegram = TelegramNotifier(config, event_bus)
+    components["telegram"] = telegram
 
     # ── User Data Stream (live mode only) ─────────────────────────────────
     user_stream = UserDataStream(config, event_bus)
+    components["user_stream"] = user_stream
 
     # ── Pre-trade validation (live mode only) ─────────────────────────────
     recon_result = None
@@ -261,9 +300,9 @@ async def main() -> None:
     # REQ-POS-004 / REQ-FS-007: lightweight periodic re-check during the run.
     # Distinct from StartupReconciler — it just diffs exchange vs internal
     # positions every 5 min and trips SafeMode on mismatch (no state rebuild).
+    periodic_reconciler: PeriodicReconciler | None = None
     # `client` is only defined inside the live-mode init block above; paper
     # mode never gets a real exchange client and there's nothing to reconcile.
-    periodic_reconciler: PeriodicReconciler | None = None
     _maybe_client = locals().get("client")
     if _maybe_client:
         recon_cfg = config.get_value("monitoring", "reconciliation") or {}
@@ -273,6 +312,7 @@ async def main() -> None:
             client=_maybe_client,
             interval_seconds=float(recon_cfg.get("interval_seconds", 300.0)),
         )
+        components["periodic_reconciler"] = periodic_reconciler
 
     app = build_app(
         config, event_bus, risk_mgr, data_manager, order_mgr, db, cache, signal_gen,
@@ -284,11 +324,9 @@ async def main() -> None:
         user_stream=user_stream,
         reconciliation_result=recon_result,
         sqlite_store=sqlite_store,
-        audit_repo=audit_repo,
         metrics=metrics,
+        geopolitical_feed=geopolitical_feed,
         periodic_reconciler=periodic_reconciler,
-        state_machine=state_machine,
-        uptime_tracker=uptime_tracker,
     )
 
     if app is not None:
@@ -326,6 +364,7 @@ async def main() -> None:
         cache=cache,
         metrics=metrics,
     )
+    components["dispatcher"] = dispatcher
 
     loop = asyncio.get_event_loop()
     stop_event = asyncio.Event()
@@ -354,6 +393,23 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 pass
 
+    async def _midnight_daily_reset(rm: RiskManager, stop_ev: asyncio.Event) -> None:
+        """Reset daily-loss counter at 00:00 UTC. Industry-standard safety pattern."""
+        import datetime as _dt
+        while not stop_ev.is_set():
+            now = _dt.datetime.now(_dt.timezone.utc)
+            tomorrow = (now + _dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            sleep_s = max(60.0, (tomorrow - now).total_seconds())
+            try:
+                await asyncio.wait_for(stop_ev.wait(), timeout=sleep_s)
+                break
+            except asyncio.TimeoutError:
+                pass
+            try:
+                rm.reset_daily_losses()
+            except Exception as exc:
+                logger.error("Midnight daily reset failed: {}", exc)
+
     async def _periodic_funding_check(rm: RiskManager, stop_ev: asyncio.Event) -> None:
         """Run funding re-check for existing positions every 8h."""
         while not stop_ev.is_set():
@@ -380,6 +436,7 @@ async def main() -> None:
         timeframes=["1m", "5m", "15m", "1h", "4h", "1d"],
         data_manager=data_manager,
     )
+    components["paper_feed"] = paper_feed
     _seed_only = not config.paper_mode  # live mode: seed only, WS provides data
 
     # ── Health check component registrations ──────────────────────────────
@@ -411,61 +468,6 @@ async def main() -> None:
     await health_checker.register_component("risk_manager", _check_risk_manager)
     await health_checker.register_component("data_manager", _check_data_manager)
 
-    # ── FSM: boot path → SIGNALING_ACTIVE → EXECUTION_ENABLED ─────────────
-    # WARMUP / market-data / order-book stages are visited synchronously here
-    # before background tasks run. The actual WS connect+sync happens in the
-    # paper_feed/orderbook_feed tasks below; advancing to MARKET_DATA_LIVE
-    # there is a future enhancement. For now we record the structural
-    # progression that we know is true at this point.
-    state_machine.transition_to(OperationalState.WARMUP, reason="hydrating_indicators")
-    state_machine.transition_to(OperationalState.CONNECTING_MARKET_DATA, reason="ws_subscribe")
-    state_machine.transition_to(OperationalState.MARKET_DATA_LIVE, reason="paper_feed_ready")
-    state_machine.transition_to(OperationalState.ORDER_BOOK_SYNCED, reason="orderbook_feed_ready")
-    state_machine.transition_to(OperationalState.SIGNALING_ACTIVE, reason="signal_generator_active")
-    # Reflect the active safety primitives now — execution is ENABLED unless
-    # the kill switch / safe mode / circuit breaker says otherwise.
-    sm = getattr(risk_mgr, "safe_mode", None)
-    cb_open = bool(getattr(getattr(risk_mgr, "_circuit_breaker", None), "is_open", False))
-    if sm is not None and getattr(sm, "is_active", False):
-        state_machine.transition_to(OperationalState.SAFE_MODE, reason="safe_mode_active_at_boot")
-    elif cb_open:
-        state_machine.transition_to(OperationalState.CIRCUIT_BREAKER_ACTIVE, reason="cb_open_at_boot")
-    else:
-        state_machine.transition_to(OperationalState.EXECUTION_ENABLED, reason="all_gates_clear")
-
-    # Bridge SafeModeManager into the FSM. SafeMode is multi-reason; we map
-    # ANY active reason → SAFE_MODE, all-clear → back to EXECUTION_ENABLED.
-    if sm is not None:
-        _orig_activate = sm.activate
-        _orig_deactivate = sm.deactivate
-
-        def _bridge_activate(reason, detail=""):  # type: ignore[no-untyped-def]
-            result = _orig_activate(reason, detail)
-            try:
-                if state_machine.current is not OperationalState.SAFE_MODE:
-                    state_machine.force_to(
-                        OperationalState.SAFE_MODE,
-                        reason=f"safe_mode:{getattr(reason, 'value', reason)}",
-                    )
-            except Exception as exc:
-                logger.warning("FSM bridge SafeMode.activate failed: {}", exc)
-            return result
-
-        def _bridge_deactivate(reason):  # type: ignore[no-untyped-def]
-            result = _orig_deactivate(reason)
-            try:
-                if not sm.is_active and state_machine.current is OperationalState.SAFE_MODE:
-                    state_machine.transition_to(
-                        OperationalState.EXECUTION_ENABLED,
-                        reason=f"safe_mode_cleared:{getattr(reason, 'value', reason)}",
-                    )
-            except Exception as exc:
-                logger.warning("FSM bridge SafeMode.deactivate failed: {}", exc)
-            return result
-
-        sm.activate = _bridge_activate  # type: ignore[method-assign]
-        sm.deactivate = _bridge_deactivate  # type: ignore[method-assign]
-
     tasks = [
         asyncio.create_task(paper_feed.run(seed_only=_seed_only), name="paper_feed"),
         asyncio.create_task(dispatcher.start(), name="dispatcher"),
@@ -476,20 +478,20 @@ async def main() -> None:
         asyncio.create_task(vix_proxy.run(), name="vix"),
         asyncio.create_task(sentiment.run(), name="sentiment"),
         asyncio.create_task(news_feed.run(), name="news_feed"),
+        asyncio.create_task(geopolitical_feed.run(), name="geopolitical_feed"),
         asyncio.create_task(orderbook_feed.run(), name="orderbook_feed"),
         asyncio.create_task(telegram.run(), name="telegram"),
         asyncio.create_task(order_mgr.run(), name="order_manager"),
         asyncio.create_task(user_stream.run(), name="user_data_stream"),
         asyncio.create_task(_periodic_liq_check(risk_mgr, stop_event), name="liq_check"),
         asyncio.create_task(_periodic_funding_check(risk_mgr, stop_event), name="funding_recheck"),
+        asyncio.create_task(_midnight_daily_reset(risk_mgr, stop_event), name="midnight_reset"),
         asyncio.create_task(health_checker.start_periodic_checks(), name="health_checker"),
         asyncio.create_task(alert_dispatcher.run(), name="alert_dispatcher"),
     ]
 
     if model_retrainer is not None:
         tasks.append(asyncio.create_task(model_retrainer.run(), name="model_retrainer"))
-
-    tasks.append(asyncio.create_task(uptime_tracker.run(), name="uptime_tracker"))
 
     if periodic_reconciler is not None:
         tasks.append(asyncio.create_task(periodic_reconciler.run(), name="periodic_reconciler"))
@@ -503,54 +505,109 @@ async def main() -> None:
     if app is not None:
         tasks.append(asyncio.create_task(run_dashboard(config, app), name="dashboard"))
 
+    components["tasks"] = tasks
+
     await stop_event.wait()
     logger.info("Initiating graceful shutdown…")
+    # Component teardown is performed in main()'s finally block (_final_cleanup),
+    # which also runs on partial-state startup crashes so aiohttp ClientSessions
+    # are always closed.
 
-    # ── Graceful shutdown: cancel open orders on exchange ──────────────────
-    for executor in executors:
-        if not config.paper_mode and hasattr(executor, "_client") and executor._client:
+
+async def _safe_call(label: str, fn: Any) -> None:
+    if fn is None:
+        return
+    try:
+        result = fn()
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception as exc:
+        logger.warning("Shutdown {} failed: {}", label, exc)
+
+
+async def _final_cleanup(components: dict[str, Any]) -> None:
+    """Idempotent teardown — runs on graceful shutdown AND startup-crash paths."""
+    paper_mode = bool(components.get("paper_mode", True))
+    tasks = components.get("tasks") or []
+    executors = components.get("executors") or []
+
+    # 1. Cancel open exchange orders (live mode only).
+    if not paper_mode:
+        for executor in executors:
+            client = getattr(executor, "_client", None)
+            if not client:
+                continue
             try:
-                open_orders = await executor._client.fetch_open_orders()
+                open_orders = await client.fetch_open_orders()
                 for o in open_orders:
                     try:
-                        await executor._client.cancel_order(o["id"], o.get("symbol"))
+                        await client.cancel_order(o["id"], o.get("symbol"))
                     except Exception:
                         pass
                 if open_orders:
                     logger.info(
                         "Shutdown: cancelled {} open orders on {}",
-                        len(open_orders), executor.exchange_id,
+                        len(open_orders), getattr(executor, "exchange_id", "?"),
                     )
             except Exception as exc:
-                logger.warning("Shutdown order cancel failed on {}: {}", executor.exchange_id, exc)
+                logger.warning(
+                    "Shutdown order cancel failed on {}: {}",
+                    getattr(executor, "exchange_id", "?"), exc,
+                )
 
-    # Close executors (closes ccxt client)
+    # 2. Close executors (closes ccxt client + aiohttp session).
     for executor in executors:
-        await executor.close()
+        await _safe_call(f"exec_{getattr(executor, 'exchange_id', '?')}_close",
+                         getattr(executor, "close", None))
+    variational = components.get("variational_executor")
+    if variational is not None:
+        await _safe_call("variational_executor_close", getattr(variational, "close", None))
 
-    # Stop user data stream
-    await user_stream.stop()
+    # 3. Stop user data stream before cancelling tasks (releases listenKey).
+    user_stream = components.get("user_stream")
+    if user_stream is not None:
+        await _safe_call("user_stream", getattr(user_stream, "stop", None))
 
+    # 4. Cancel background tasks and await their completion.
     for task in tasks:
-        task.cancel()
+        if not task.done():
+            task.cancel()
+    if tasks:
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as exc:
+            logger.warning("Shutdown task gather failed: {}", exc)
 
-    await asyncio.gather(*tasks, return_exceptions=True)
-    await dispatcher.stop()
-    await ws_manager.stop()
-    await funding_feed.stop()
-    await oi_feed.stop()
-    await sentiment.stop()
-    await news_feed.stop()
-    await orderbook_feed.stop()
-    await telegram.stop()
-    await order_mgr.stop()
-    await alert_dispatcher.stop()
-    await health_checker.stop_periodic_checks()
-    await db.close()
+    # 5. Stop remaining components in the same order as the previous graceful path.
+    cleanup_order = [
+        "dispatcher", "ws_manager", "funding_feed", "oi_feed", "sentiment",
+        "news_feed", "geopolitical_feed", "orderbook_feed", "dex_feed", "vix_proxy", "telegram",
+        "order_mgr", "alert_dispatcher", "paper_feed",
+    ]
+    for name in cleanup_order:
+        comp = components.get(name)
+        if comp is None:
+            continue
+        await _safe_call(name, getattr(comp, "stop", None))
 
-    uptime_tracker.stop(clean=True)
-    state_machine.force_to(OperationalState.SHUTDOWN, reason="graceful_shutdown")
-    logger.info("Shutdown complete")
+    # 6. Health checker uses a different stop method name.
+    hc = components.get("health_checker")
+    if hc is not None:
+        await _safe_call("health_checker", getattr(hc, "stop_periodic_checks", None))
+
+    # 7. DB last so persistence calls during teardown still succeed.
+    db = components.get("db")
+    if db is not None:
+        await _safe_call("db", getattr(db, "close", None))
+
+
+async def main() -> None:
+    components: dict[str, Any] = {}
+    try:
+        await _run_bot(components)
+    finally:
+        await _final_cleanup(components)
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":
