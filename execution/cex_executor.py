@@ -94,15 +94,19 @@ class CEXExecutor:
         try:
             self._client = cls(params)
             # Two distinct binance sandboxes:
-            #   demo: true     → demo.binance.com keys, REST at demo-fapi.binance.com (CCXT announcement #92 path)
+            #   demo: true     → demo.binance.com keys (ccxt.enable_demo_trading)
             #   testnet: true  → testnet.binancefuture.com keys, classic urls['test'] swap
-            # If both are set, demo wins (it's the supported direction).
+            # If both are set, demo wins (it's the CCXT-supported direction per
+            # announcement #92 — testnet/sandbox no longer supported for futures).
             if cfg.get("demo") and self.exchange_id == "binance":
-                api_urls = self._client.urls.get("api", {})
-                for k, v in list(api_urls.items()):
-                    if isinstance(v, str) and "://fapi.binance.com" in v:
-                        api_urls[k] = v.replace("://fapi.binance.com", "://demo-fapi.binance.com")
-                self._client.urls["api"] = api_urls
+                if hasattr(self._client, "enable_demo_trading"):
+                    self._client.enable_demo_trading(True)
+                else:
+                    api_urls = self._client.urls.get("api", {})
+                    for k, v in self._client.urls.get("demo", {}).items():
+                        if k in api_urls:
+                            api_urls[k] = v
+                    self._client.urls["api"] = api_urls
             elif cfg.get("testnet"):
                 # Proper testnet setup: manually swap only futures URLs
                 # instead of set_sandbox_mode() which triggers ccxt's

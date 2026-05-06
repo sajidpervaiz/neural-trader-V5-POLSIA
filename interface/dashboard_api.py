@@ -2909,19 +2909,29 @@ def build_app(
                 params["password"] = str(passphrase)
         client = cls(params)
         # Sandbox mode: two distinct binance environments — opt in via the request body.
-        #   demo=true       → demo.binance.com keys, REST at demo-fapi.binance.com  ← CCXT announcement #92 path
-        #   testnet=true    → testnet.binancefuture.com keys, classic urls['test']  ← deprecated for futures but still works
+        #   demo=true       → demo.binance.com keys, ccxt's enable_demo_trading()  ← CCXT announcement #92 path
+        #   testnet=true    → testnet.binancefuture.com keys, classic urls['test']
         # If neither, talks to mainnet.
         demo = bool(body.get("demo", False))
         if venue == "binance" and demo:
             try:
-                api_urls = client.urls.get("api", {}) if isinstance(getattr(client, "urls", {}), dict) else {}
-                for k, v in list(api_urls.items()):
-                    if isinstance(v, str) and "://fapi.binance.com" in v:
-                        api_urls[k] = v.replace("://fapi.binance.com", "://demo-fapi.binance.com")
-                client.urls["api"] = api_urls
+                # Official ccxt path — swaps urls['api'] for urls['demo'] which
+                # includes BOTH spot (demo-api.binance.com) and futures
+                # (demo-fapi.binance.com). A manual fapi-only swap is insufficient
+                # because ccxt's load_markets() / fetch_balance() also issues spot
+                # (sapi) requests that need to be redirected.
+                if hasattr(client, "enable_demo_trading"):
+                    client.enable_demo_trading(True)
+                else:
+                    # Older ccxt that lacks the helper — fall back to manual swap
+                    api_urls = client.urls.get("api", {})
+                    demo_urls = client.urls.get("demo", {})
+                    for k, v in demo_urls.items():
+                        if k in api_urls:
+                            api_urls[k] = v
+                    client.urls["api"] = api_urls
             except Exception as exc:
-                logger.debug("test-keys: demo URL swap failed: {}", exc)
+                logger.debug("test-keys: demo mode setup failed: {}", exc)
         elif testnet:
             # CCXT removed set_sandbox_mode for binance futures (announcement #92).
             # Swap fapi/dapi entries from urls['test'] into urls['api']. Falls
