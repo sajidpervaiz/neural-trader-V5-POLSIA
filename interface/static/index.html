@@ -834,6 +834,17 @@ let agentChatHistory = [{sender:'Assistant', msg:'Ask for status, risk, learning
 /* ── Helpers ── */
 function esc(v) { return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function $(id) { return document.getElementById(id); }
+/* armCard(label, value, sub?, status?)  — status: 'ok' | 'warn' | 'danger' */
+function armCard(label, value, sub, status) {
+  let h = '<div class="arms-card">';
+  h += '<div class="arms-card-title">' + esc(label);
+  if (status) h += ' <span class="arms-status ' + esc(status) + '">' + esc(String(status).toUpperCase()) + '</span>';
+  h += '</div>';
+  h += '<div class="arms-val">' + esc(value) + '</div>';
+  if (sub) h += '<div class="arms-sub">' + esc(sub) + '</div>';
+  h += '</div>';
+  return h;
+}
 function fmt$(n) { return '$' + Number(n||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:2}); }
 function getConnectionLabel(state='') {
   const venue = String(activeVenue || (isLiveMode || isDemoMode ? 'binance' : 'paper')).toUpperCase();
