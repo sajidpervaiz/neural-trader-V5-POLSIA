@@ -1951,7 +1951,7 @@ async function loadArms() {
       _j('/api/arms/stress-test'), _j('/api/arms/execution'), _j('/api/arms/weights'), _j('/api/arms/prewarm'),
     ]);
     renderArms({snap,health,guard,lat,regime,session,quality,stress,execd,weights,prewarm});
-  } catch(e) { $('armsPanel').innerHTML='<div class="arms2-unavailable">ARMS data unavailable</div>'; }
+  } catch(e) { console.error('loadArms failed:', e); $('armsPanel').innerHTML='<div class="arms2-unavailable">ARMS data unavailable</div>'; }
 }
 
 function _armsPill(kind,label){ return '<span class="arms2-pill '+kind+'">'+esc(label)+'</span>'; }
@@ -2191,7 +2191,7 @@ async function loadPipeline() {
       const card = document.querySelector('.pp-card[data-layer-id="'+window.__pipelineSelectedId+'"]');
       if (card) card.classList.add('selected');
     }
-  } catch(e) { $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
+  } catch(e) { console.error('loadPipeline failed:', e); $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
 }
 // Previous score map, keyed by layer id — used to compute delta between polls
 window.__pp_prev = window.__pp_prev || {};
@@ -2493,7 +2493,7 @@ async function loadHeatmap() {
     }
     html += '</div>';
     $('heatmapPanel').innerHTML = html;
-  } catch (e) { $('heatmapPanel').innerHTML = '<div style="color:var(--text3)">Heatmap unavailable</div>'; }
+  } catch (e) { console.error('loadHeatmap failed:', e); $('heatmapPanel').innerHTML = '<div style="color:var(--text3)">Heatmap unavailable</div>'; }
 }
 function setSymbol(sym) {
   if (typeof window.changeSymbol === 'function') { window.changeSymbol(sym); }
@@ -2557,7 +2557,7 @@ async function loadAlerts() {
       html += '</div>';
     }
     $('alertsPanel').innerHTML = html;
-  } catch (e) { $('alertsPanel').innerHTML = '<div style="color:var(--text3)">Alerts data unavailable</div>'; }
+  } catch (e) { console.error('loadAlerts failed:', e); $('alertsPanel').innerHTML = '<div style="color:var(--text3)">Alerts data unavailable</div>'; }
 }
 
 /* ── Component Health (HealthChecker) ── */
@@ -2591,7 +2591,7 @@ async function loadHealth() {
     }
     html += '</div>';
     $('healthPanel').innerHTML = html;
-  } catch (e) { $('healthPanel').innerHTML = '<div style="color:var(--text3)">Health data unavailable</div>'; }
+  } catch (e) { console.error('loadHealth failed:', e); $('healthPanel').innerHTML = '<div style="color:var(--text3)">Health data unavailable</div>'; }
 }
 
 /* ── V6 Tab: Killzone + MasterScorer + ML Retrain + Pair Tiers ── */
@@ -2665,7 +2665,7 @@ async function loadV6() {
       html += '</div>';
     }
     $('v6Panel').innerHTML = html;
-  } catch (e) { $('v6Panel').innerHTML = '<div style="color:var(--text3)">V6 data unavailable</div>'; }
+  } catch (e) { console.error('loadV6 failed:', e); $('v6Panel').innerHTML = '<div style="color:var(--text3)">V6 data unavailable</div>'; }
 }
 
 async function triggerRetrain() {
@@ -2703,7 +2703,7 @@ async function loadSMC() {
       html += '</div>';
     }
     $('smcPanel').innerHTML = html;
-  } catch (e) { $('smcPanel').innerHTML = '<div style="color:var(--text3)">SMC data unavailable</div>'; }
+  } catch (e) { console.error('loadSMC failed:', e); $('smcPanel').innerHTML = '<div style="color:var(--text3)">SMC data unavailable</div>'; }
 }
 
 /* ── EStop Tab ── */
@@ -2738,7 +2738,7 @@ async function loadEStop() {
       html += '</div>';
     }
     $('estopPanel').innerHTML = html;
-  } catch (e) { $('estopPanel').innerHTML = '<div style="color:var(--text3)">E-Stop data unavailable</div>'; }
+  } catch (e) { console.error('loadEStop failed:', e); $('estopPanel').innerHTML = '<div style="color:var(--text3)">E-Stop data unavailable</div>'; }
 }
 
 async function triggerEstop() {
@@ -2975,7 +2975,7 @@ function renderNewsTab(d) {
 /* ── Geopolitical Tab — Layer 10 RSS scorer ── */
 async function loadGeopolitical() {
   try { const d=await(await fetch('/api/geopolitical')).json(); renderGeopolitical(d); }
-  catch(_){ $('geoPanel').innerHTML='<div style="color:var(--text3)">Geopolitical data unavailable</div>'; }
+  catch(e){ console.error('loadGeopolitical failed:', e); $('geoPanel').innerHTML='<div style="color:var(--text3)">Geopolitical data unavailable</div>'; }
 }
 function _geoScoreColor(s) {
   const v = Number(s) || 0;
@@ -3195,7 +3195,7 @@ async function loadLogs() {
   try {
     const d=await(await fetch('/api/logs/recent')).json();
     $('logsPanel').innerHTML=(d.logs||[]).map(l=>'<div class="log-item"><span class="log-level '+esc(l.level)+'">'+esc(l.level)+'</span>'+new Date(l.ts).toLocaleTimeString('en-GB')+' '+esc(l.message)+'</div>').join('') || '<div style="color:var(--text3)">No recent logs</div>';
-  } catch(_){ $('logsPanel').innerHTML='<div style="color:var(--text3)">Logs unavailable</div>'; }
+  } catch(e){ console.error('loadLogs failed:', e); $('logsPanel').innerHTML='<div style="color:var(--text3)">Logs unavailable</div>'; }
 }
 
 /* ── Portfolio Tab ── */
@@ -3236,7 +3236,7 @@ async function loadPortfolio() {
       }).join('');
     } else h+='<div style="color:var(--text3);padding:12px 0">No open positions</div>';
     $('portfolioPanel').innerHTML=h;
-  } catch(_){ $('portfolioPanel').innerHTML='<div style="color:var(--text3)">Portfolio unavailable</div>'; }
+  } catch(e){ console.error('loadPortfolio failed:', e); $('portfolioPanel').innerHTML='<div style="color:var(--text3)">Portfolio unavailable</div>'; }
 }
 
 /* ── Trading ── */
@@ -3696,7 +3696,7 @@ function renderFlowSummary(ctx) {
 
 async function loadFlow() {
   try { await loadFlowCtx(); renderFlow(); }
-  catch(e){ $('flowPanel').innerHTML='<div style="color:var(--text3)">Flow data unavailable</div>'; }
+  catch(e){ console.error('loadFlow failed:', e); $('flowPanel').innerHTML='<div style="color:var(--text3)">Flow data unavailable</div>'; }
 }
 function _flowArrowSvg() {
   return '<svg viewBox="0 0 14 18" aria-hidden="true"><path d="M7 0 V14 M2 9 L7 17 L12 9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
