@@ -213,7 +213,7 @@ ai_agent:
   enabled: true
   mode: full
   provider: claude
-  model: claude-3-5-sonnet-latest
+  model: claude-sonnet-4-6
   api_key: "${ANTHROPIC_API_KEY:-}"
   timeout_seconds: 8.0
   remote_weight: 0.35

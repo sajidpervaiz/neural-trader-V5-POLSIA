@@ -98,7 +98,7 @@ class TradingAIAgent:
     @staticmethod
     def _default_model_for_provider(provider: str) -> str:
         defaults = {
-            "claude": os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest"),
+            "claude": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
             "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             "gemini": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
             "local": "local-rule-engine",
@@ -198,7 +198,7 @@ class TradingAIAgent:
             "last_decision": dict(self._last_decision),
         }
 
-    def review_signal(self, signal: Any) -> AgentDecision:
+    async def review_signal(self, signal: Any) -> AgentDecision:
         if not self.enabled:
             return self._finalize(
                 AgentDecision(
@@ -224,7 +224,7 @@ class TradingAIAgent:
 
         remote_decision: AgentDecision | None = None
         try:
-            remote_decision = self._review_with_remote(signal, local_decision)
+            remote_decision = await self._review_with_remote(signal, local_decision)
         except Exception as exc:
             self._last_error = str(exc)[:240]
             logger.warning("{} supervisory review failed — falling back to local agent: {}", self._provider_display_name(), exc)
@@ -356,7 +356,7 @@ class TradingAIAgent:
             summary=remote.summary or local.summary or "Approved by AI supervision",
         )
 
-    def chat(self, message: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def chat(self, message: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Interactive assistant reply for dashboard chat and bot supervision."""
         prompt = str(message or "").strip()
         if not prompt:
@@ -365,7 +365,7 @@ class TradingAIAgent:
         context = context or {}
         if self._remote_enabled():
             try:
-                reply = self._chat_with_remote(prompt, context)
+                reply = await self._chat_with_remote(prompt, context)
                 self._last_decision_source = f"{self.provider}_chat"
                 return {"success": True, "provider": self.provider, "reply": reply}
             except Exception as exc:
@@ -374,6 +374,29 @@ class TradingAIAgent:
 
         self._last_decision_source = "local"
         return {"success": True, "provider": "local", "reply": self._local_chat_reply(prompt, context)}
+
+    async def test_connection(self) -> dict[str, Any]:
+        """Ping the configured remote provider with a tiny prompt to verify the API key works."""
+        provider_name = self._provider_display_name()
+        if not self.enabled:
+            return {"success": False, "provider": self.provider, "reason": "agent_disabled", "message": "AI agent is disabled."}
+        if self.provider == "local":
+            return {"success": True, "provider": "local", "reason": "local_ok", "message": "Local rule engine is always available."}
+        if not self.api_key:
+            return {"success": False, "provider": self.provider, "reason": "missing_api_key", "message": f"{provider_name} API key is not configured."}
+        try:
+            reply = await self._chat_with_remote("Reply with the single word: OK.", {"healthcheck": True})
+        except Exception as exc:
+            self._last_error = str(exc)[:240]
+            return {"success": False, "provider": self.provider, "reason": "remote_error", "message": f"{provider_name} error: {exc}"[:240]}
+        ok = bool(reply and "OK" in reply.upper())
+        return {
+            "success": ok,
+            "provider": self.provider,
+            "model": self.model,
+            "reason": "remote_ok" if ok else "unexpected_reply",
+            "message": (reply or "")[:240] if ok else f"Reply did not contain OK: {(reply or '')[:120]}",
+        }
 
     def _local_chat_reply(self, message: str, context: dict[str, Any]) -> str:
         lower = message.lower()
@@ -409,18 +432,22 @@ class TradingAIAgent:
             "For deeper interaction, connect a supported remote AI provider in Settings."
         )
 
-    def _review_with_remote(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
+    async def _review_with_remote(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
         if self.provider == "claude":
-            return self._review_with_claude(signal, local_decision)
+            return await self._review_with_claude(signal, local_decision)
         if self.provider == "openai":
-            return self._review_with_openai(signal, local_decision)
+            return await self._review_with_openai(signal, local_decision)
+        if self.provider == "gemini":
+            return await self._review_with_gemini(signal, local_decision)
         return None
 
-    def _chat_with_remote(self, message: str, context: dict[str, Any]) -> str:
+    async def _chat_with_remote(self, message: str, context: dict[str, Any]) -> str:
         if self.provider == "claude":
-            return self._chat_with_claude(message, context)
+            return await self._chat_with_claude(message, context)
         if self.provider == "openai":
-            return self._chat_with_openai(message, context)
+            return await self._chat_with_openai(message, context)
+        if self.provider == "gemini":
+            return await self._chat_with_gemini(message, context)
         return self._local_chat_reply(message, context)
 
     def _parse_remote_decision(self, text: str, *, reason_prefix: str, summary_prefix: str) -> AgentDecision:
@@ -462,9 +489,9 @@ class TradingAIAgent:
             "local_decision": local_decision.to_dict(),
         }
 
-    def _review_with_claude(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
+    async def _review_with_claude(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
         prompt = self._review_prompt_payload(signal, local_decision)
-        payload = self._call_claude(
+        payload = await self._call_claude(
             system=(
                 "You are a risk-first crypto trading supervisor. Return JSON only. "
                 "Never increase size above 1.0. Use one of approve, reduce_size, reject."
@@ -482,9 +509,9 @@ class TradingAIAgent:
             return None
         return self._parse_remote_decision(text, reason_prefix="claude_review", summary_prefix="Claude supervisory review")
 
-    def _review_with_openai(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
+    async def _review_with_openai(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
         prompt = self._review_prompt_payload(signal, local_decision)
-        payload = self._call_openai(
+        payload = await self._call_openai(
             system=(
                 "You are a risk-first crypto trading supervisor. Respond with JSON only. "
                 "Never increase size above 1.0. Use one of approve, reduce_size, reject."
@@ -501,8 +528,27 @@ class TradingAIAgent:
             return None
         return self._parse_remote_decision(text, reason_prefix="openai_review", summary_prefix="OpenAI supervisory review")
 
-    def _chat_with_claude(self, message: str, context: dict[str, Any]) -> str:
-        payload = self._call_claude(
+    async def _review_with_gemini(self, signal: Any, local_decision: AgentDecision) -> AgentDecision | None:
+        prompt = self._review_prompt_payload(signal, local_decision)
+        payload = await self._call_gemini(
+            system=(
+                "You are a risk-first crypto trading supervisor. Respond with JSON only. "
+                "Never increase size above 1.0. Use one of approve, reduce_size, reject."
+            ),
+            user_prompt=(
+                "Review this trade candidate. Respond with strict JSON containing "
+                "approved, action, confidence, size_multiplier, reason, summary.\n"
+                + json.dumps(prompt, separators=(",", ":"))
+            ),
+            max_tokens=180,
+        )
+        text = self._extract_gemini_text_content(payload)
+        if not text:
+            return None
+        return self._parse_remote_decision(text, reason_prefix="gemini_review", summary_prefix="Gemini supervisory review")
+
+    async def _chat_with_claude(self, message: str, context: dict[str, Any]) -> str:
+        payload = await self._call_claude(
             system=(
                 "You are an embedded trading-bot assistant. Be concise, risk-first, and practical. "
                 "Do not promise profits. Use the supplied runtime context."
@@ -518,8 +564,8 @@ class TradingAIAgent:
         text = self._extract_text_content(payload)
         return text or "Claude did not return a reply."
 
-    def _chat_with_openai(self, message: str, context: dict[str, Any]) -> str:
-        payload = self._call_openai(
+    async def _chat_with_openai(self, message: str, context: dict[str, Any]) -> str:
+        payload = await self._call_openai(
             system=(
                 "You are an embedded trading-bot assistant. Be concise, risk-first, and practical. "
                 "Do not promise profits. Use the supplied runtime context."
@@ -535,7 +581,24 @@ class TradingAIAgent:
         text = self._extract_openai_text_content(payload)
         return text or "OpenAI did not return a reply."
 
-    def _call_claude(self, *, system: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
+    async def _chat_with_gemini(self, message: str, context: dict[str, Any]) -> str:
+        payload = await self._call_gemini(
+            system=(
+                "You are an embedded trading-bot assistant. Be concise, risk-first, and practical. "
+                "Do not promise profits. Use the supplied runtime context."
+            ),
+            user_prompt=(
+                "User message:\n"
+                + message
+                + "\n\nBot runtime context:\n"
+                + json.dumps(context, default=str, separators=(",", ":"))
+            ),
+            max_tokens=220,
+        )
+        text = self._extract_gemini_text_content(payload)
+        return text or "Gemini did not return a reply."
+
+    async def _call_claude(self, *, system: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -548,12 +611,12 @@ class TradingAIAgent:
             "system": system,
             "messages": [{"role": "user", "content": user_prompt}],
         }
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(self.api_url, headers=headers, json=body)
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(self.api_url, headers=headers, json=body)
             response.raise_for_status()
             return response.json()
 
-    def _call_openai(self, *, system: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
+    async def _call_openai(self, *, system: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "content-type": "application/json",
@@ -567,8 +630,21 @@ class TradingAIAgent:
             "temperature": 0,
             "max_tokens": max_tokens,
         }
-        with httpx.Client(timeout=self.timeout_seconds) as client:
-            response = client.post(self.api_url, headers=headers, json=body)
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(self.api_url, headers=headers, json=body)
+            response.raise_for_status()
+            return response.json()
+
+    async def _call_gemini(self, *, system: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
+        # Gemini auths via ?key= query string and folds the system prompt into systemInstruction.
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": int(max_tokens)},
+        }
+        params = {"key": self.api_key}
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(self.api_url, params=params, json=body)
             response.raise_for_status()
             return response.json()
 
@@ -589,6 +665,17 @@ class TradingAIAgent:
         if isinstance(content, list):
             return "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict)).strip()
         return str(content or "").strip()
+
+    @staticmethod
+    def _extract_gemini_text_content(payload: dict[str, Any]) -> str:
+        candidates = payload.get("candidates", [])
+        if not candidates:
+            return ""
+        content = candidates[0].get("content", {}) if isinstance(candidates[0], dict) else {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        return "\n".join(
+            str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("text")
+        ).strip()
 
     def _finalize(self, decision: AgentDecision, *, source: str) -> AgentDecision:
         self._last_decision_source = source
