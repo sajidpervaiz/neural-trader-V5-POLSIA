@@ -49,9 +49,13 @@ class SafeModeManager:
     """Thread-safe safe mode controller.  Multiple reasons can be active
     simultaneously — safe mode is ON as long as *any* reason remains."""
 
-    def __init__(self) -> None:
+    def __init__(self, event_bus: Any = None) -> None:
         self._active_reasons: dict[SafeModeReason, SafeModeEvent] = {}
         self._history: list[dict[str, Any]] = []
+        # Optional event bus for audit emission. Activate/deactivate/clear_all
+        # publish ALERT_WARNING (or ALERT_CRITICAL on full activation) so the
+        # existing audit pipeline persists them to the errors table.
+        self._event_bus = event_bus
 
     # ── Queries ───────────────────────────────────────────────────────────
     @property
@@ -65,6 +69,15 @@ class SafeModeManager:
     @property
     def active_events(self) -> list[SafeModeEvent]:
         return list(self._active_reasons.values())
+
+    def _emit(self, alert_level: str, payload: dict[str, Any]) -> None:
+        """Emit safe-mode state-change event onto the bus (if configured)."""
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.publish_nowait(alert_level, payload)
+        except Exception as exc:
+            logger.debug("SafeMode emit {} failed: {}", alert_level, exc)
 
     # ── Mutations ─────────────────────────────────────────────────────────
     def activate(self, reason: SafeModeReason, detail: str = "") -> None:
@@ -80,8 +93,21 @@ class SafeModeManager:
         })
         if not was_active:
             logger.critical("SAFE MODE ACTIVATED — reason: {} ({})", reason.value, detail)
+            self._emit("ALERT_CRITICAL", {
+                "type": f"safe_mode_activated_{reason.value}",
+                "reason": reason.value,
+                "detail": detail,
+                "needs_ack": True,
+                "ts": event.timestamp,
+            })
         else:
             logger.warning("Safe mode reason added: {} ({})", reason.value, detail)
+            self._emit("ALERT_WARNING", {
+                "type": f"safe_mode_reason_added_{reason.value}",
+                "reason": reason.value,
+                "detail": detail,
+                "ts": event.timestamp,
+            })
 
     def deactivate(self, reason: SafeModeReason) -> bool:
         """Clear a single reason.  Returns True if safe mode is now fully clear."""
@@ -93,19 +119,38 @@ class SafeModeManager:
                 "timestamp": time.time(),
             })
             logger.info("Safe mode reason cleared: {}", reason.value)
+            self._emit("ALERT_WARNING", {
+                "type": f"safe_mode_reason_cleared_{reason.value}",
+                "reason": reason.value,
+                "ts": time.time(),
+            })
         if not self.is_active:
             logger.info("SAFE MODE FULLY CLEARED — normal operation resumed")
+            self._emit("ALERT_WARNING", {
+                "type": "safe_mode_fully_cleared",
+                "ts": time.time(),
+            })
             return True
         return False
 
-    def clear_all(self) -> None:
+    def clear_all(self, operator: str = "system") -> None:
         """Force-clear all reasons (admin override)."""
+        prior_reasons = [r.value for r in self._active_reasons.keys()]
         self._active_reasons.clear()
         self._history.append({
             "action": "clear_all",
+            "operator": operator,
+            "prior_reasons": prior_reasons,
             "timestamp": time.time(),
         })
-        logger.info("SAFE MODE force-cleared (all reasons)")
+        logger.warning("SAFE MODE force-cleared (all reasons) by {}; prior={}", operator, prior_reasons)
+        self._emit("ALERT_CRITICAL", {
+            "type": "safe_mode_force_cleared",
+            "operator": operator,
+            "prior_reasons": prior_reasons,
+            "needs_ack": True,
+            "ts": time.time(),
+        })
 
     def get_status(self) -> dict[str, Any]:
         return {
