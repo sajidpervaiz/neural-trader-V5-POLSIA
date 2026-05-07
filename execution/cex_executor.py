@@ -379,15 +379,24 @@ class CEXExecutor:
                             signal.symbol, pos.stop_loss, pos.take_profit,
                         )
                     except ProtectiveOrderFallbackRequired as exc:
-                        logger.warning(
-                            "Exchange-side SL/TP unavailable for {} — using bot-managed exits only: {}",
-                            signal.symbol,
-                            exc,
+                        # ESCALATED to CRITICAL: the position has no exchange-side
+                        # stop. If the bot crashes before a bot-managed exit fires,
+                        # the position is fully unprotected. Operator must ack.
+                        logger.critical(
+                            "Exchange-side SL/TP unavailable for {} — falling back to bot-managed exits "
+                            "(bot crash leaves position unprotected); OPERATOR ACK REQUIRED: {}",
+                            signal.symbol, exc,
                         )
                         await self.event_bus.publish("ALERT_WARNING", {
                             "type": "sl_fallback_local",
                             "symbol": signal.symbol,
                             "error": str(exc),
+                            "needs_ack": True,
+                            "exchange": signal.exchange,
+                            "direction": signal.direction,
+                            "quantity": filled_qty,
+                            "fill_price": fill_price,
+                            "ts": int(time.time()),
                         })
                     except Exception as exc:
                         logger.critical(
@@ -428,11 +437,22 @@ class CEXExecutor:
                             tp_price=pos.take_profit,
                         )
                     except ProtectiveOrderFallbackRequired as exc:
-                        logger.warning(
-                            "Exchange-side SL/TP unavailable for partial fill {} — using bot-managed exits only: {}",
-                            signal.symbol,
-                            exc,
+                        logger.critical(
+                            "Exchange-side SL/TP unavailable for PARTIAL fill {} — falling back to bot-managed exits "
+                            "(bot crash leaves partial position unprotected); OPERATOR ACK REQUIRED: {}",
+                            signal.symbol, exc,
                         )
+                        await self.event_bus.publish("ALERT_WARNING", {
+                            "type": "sl_fallback_local_partial",
+                            "symbol": signal.symbol,
+                            "error": str(exc),
+                            "needs_ack": True,
+                            "exchange": signal.exchange,
+                            "direction": signal.direction,
+                            "quantity": filled_qty,
+                            "fill_price": fill_price,
+                            "ts": int(time.time()),
+                        })
                     except Exception as exc:
                         logger.critical(
                             "SL placement failed for partial fill {} — attempting emergency market close: {}",

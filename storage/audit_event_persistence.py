@@ -41,6 +41,10 @@ class AuditEventPersistence:
         self._event_bus.subscribe("EQUITY_SNAPSHOT", self._on_equity_snapshot)
         self._event_bus.subscribe("PNL_UPDATE", self._on_pnl_update)
         self._event_bus.subscribe("COMPONENT_ERROR", self._on_error)
+        # Operator-visible alerts — were previously dead-letters (no subscriber).
+        # Persisted into the `errors` table so they survive bot restarts.
+        self._event_bus.subscribe("ALERT_WARNING", self._on_alert)
+        self._event_bus.subscribe("ALERT_CRITICAL", self._on_alert)
         logger.info("AuditEventPersistence subscribed to all audit events")
 
     # ── Signal ────────────────────────────────────────────────────────────
@@ -223,3 +227,30 @@ class AuditEventPersistence:
                 )
         except Exception as exc:
             logger.debug("_on_error audit error: {}", exc)
+
+    # ── Operator alerts (ALERT_WARNING / ALERT_CRITICAL) ─────────────────
+    # Routed into the errors table so they're durable across bot restarts.
+    # Distinguished from genuine COMPONENT_ERROR by error_type prefix "alert.".
+
+    async def _on_alert(self, payload: Any) -> None:
+        try:
+            if not isinstance(payload, dict):
+                return
+            alert_type = str(payload.get("type", "unknown"))
+            symbol = payload.get("symbol", "")
+            error = payload.get("error", "")
+            needs_ack = bool(payload.get("needs_ack", False))
+            # Build a single-line message from the alert payload.
+            parts = [f"[{alert_type}]"]
+            if symbol: parts.append(f"symbol={symbol}")
+            if error: parts.append(f"error={error}")
+            if needs_ack: parts.append("NEEDS_ACK")
+            message = " ".join(parts)
+            await self._repo.persist_error(
+                component="alert",
+                error_type=f"alert.{alert_type}",
+                message=message,
+                metadata={k: v for k, v in payload.items() if k not in {"type", "symbol", "error"}},
+            )
+        except Exception as exc:
+            logger.debug("_on_alert audit error: {}", exc)
