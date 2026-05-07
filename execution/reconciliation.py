@@ -359,22 +359,22 @@ class StartupReconciler:
             }
 
             if exch_leverage != expected_leverage:
+                # Symbols in exchange_positions HAVE an open position. Binance
+                # rejects set_leverage with -4161 ("Leverage reduction is not
+                # supported in Isolated Margin Mode with open positions"), which
+                # was previously caught and added to mismatches → safe_mode
+                # tripped on every restart whenever leverage drifted. Treat the
+                # exchange's actual leverage as ground truth and leave it alone;
+                # leverage will be re-applied at next entry on a flat symbol
+                # (cex_executor._init_client already verifies & warns there).
                 logger.warning(
-                    "Leverage mismatch for {}: config={} exchange={}",
+                    "Leverage mismatch for {} (open position — leaving exchange-side as-is): "
+                    "config={} exchange={}",
                     symbol, expected_leverage, exch_leverage,
                 )
-                # Attempt to correct leverage
-                try:
-                    await self._client.set_leverage(expected_leverage, symbol)
-                    result.actions_taken.append(
-                        f"corrected_leverage: {symbol} {exch_leverage} → {expected_leverage}"
-                    )
-                    result.leverage_settings[symbol]["leverage"] = expected_leverage
-                except Exception as exc:
-                    logger.error("Failed to set leverage for {}: {}", symbol, exc)
-                    result.mismatches.append(
-                        f"leverage_mismatch: {symbol} config={expected_leverage} exchange={exch_leverage}"
-                    )
+                result.actions_taken.append(
+                    f"leverage_mismatch_open_position: {symbol} config={expected_leverage} exchange={exch_leverage}"
+                )
 
             if exch_margin and expected_margin and exch_margin != expected_margin:
                 logger.warning(
