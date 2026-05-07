@@ -137,7 +137,9 @@ async def _run_bot(components: dict[str, Any]) -> None:
             logger.warning("Starting in demo or testnet live mode — real-money confirmation not required")
 
     event_bus = EventBus()
-    db = DBHandler(config)
+    # Pass event_bus so DB connection failures emit ALERT_CRITICAL into the
+    # audit pipeline instead of silently turning off persistence.
+    db = DBHandler(config, event_bus=event_bus)
     components["db"] = db
     cache = Cache(config)
     sqlite_store = SQLiteStore()

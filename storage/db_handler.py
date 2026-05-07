@@ -118,9 +118,12 @@ ALL_DDL = [
 
 
 class DBHandler:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, event_bus: Any = None) -> None:
         self.config = config
         self._pool: Any = None
+        # Optional event bus for ALERT_CRITICAL on connection loss; if absent,
+        # only loguru sees the failure (legacy behaviour).
+        self._event_bus = event_bus
         pg = config.get_value("storage", "postgres") or {}
         self._dsn = (
             f"postgresql://{pg.get('user', 'trader')}:{pg.get('password', '')}@"
@@ -129,6 +132,7 @@ class DBHandler:
         )
         self._pool_size = int(pg.get("pool_size", 10))
         self._timescale = bool(pg.get("timescaledb", True))
+        self._connected_once = False  # for distinguishing initial fail vs reconnect fail
 
     async def connect(self, timeout: float = 10.0) -> None:
         if self._pool is not None:
@@ -148,9 +152,41 @@ class DBHandler:
             )
             await self._migrate()
             logger.info("Database connected (pool_size={})", self._pool_size)
+            if not self._connected_once:
+                self._connected_once = True
+            else:
+                # Reconnect after an outage — surface for audit
+                self._emit_alert("ALERT_WARNING", "db_reconnected",
+                                 "Database connection RESTORED after outage")
         except Exception as exc:
-            logger.warning("Database connection failed: {} — running without DB", exc)
+            # Loud-and-loud: was previously a single warning. Now CRITICAL +
+            # ALERT_CRITICAL event so monitoring and audit (when bus is wired)
+            # see it. The bot still continues — but the operator knows audit
+            # is offline for the duration.
+            logger.critical(
+                "Database connection FAILED: {} — running without DB. "
+                "Audit log offline; trades during this window will NOT be "
+                "persisted to PostgreSQL.", exc,
+            )
             self._pool = None
+            self._emit_alert(
+                "ALERT_CRITICAL",
+                "db_unavailable" if not self._connected_once else "db_disconnected",
+                f"PostgreSQL unreachable: {str(exc)[:160]}",
+            )
+
+    def _emit_alert(self, level: str, alert_type: str, message: str) -> None:
+        if self._event_bus is None:
+            return
+        try:
+            self._event_bus.publish_nowait(level, {
+                "type": alert_type,
+                "error": message,
+                "needs_ack": (level == "ALERT_CRITICAL"),
+                "ts": int(__import__("time").time()),
+            })
+        except Exception as exc:
+            logger.debug("DBHandler alert emit failed: {}", exc)
 
     async def _migrate(self) -> None:
         if self._pool is None:
