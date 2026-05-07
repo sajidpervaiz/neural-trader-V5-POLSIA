@@ -56,6 +56,10 @@ class CEXExecutor:
         self._post_only = bool(exec_cfg.get("post_only", True))
         self._iceberg_threshold_usd = float(exec_cfg.get("iceberg_threshold_usd", 10000.0))
         self._iceberg_chunks = int(exec_cfg.get("iceberg_chunks", 4))
+        # Verified exchange-side leverage per symbol — populated by _init_client.
+        # If a set_leverage call fails or echoes a different value, the actual
+        # leverage as reported by the exchange is recorded here.
+        self._actual_leverage: dict[str, int] = {}
 
     async def _init_client(self) -> None:
         if self._client is not None:
@@ -142,11 +146,45 @@ class CEXExecutor:
                 try:
                     await self._client.set_margin_mode(margin_mode, sym)
                 except Exception as e:
+                    # set_margin_mode often errors benignly (-4046 "no need to change",
+                    # -4067 "open orders"). Logged at debug; safe.
                     logger.debug("{} set_margin_mode({}, {}): {}", self.exchange_id, margin_mode, sym, e)
+                # Apply leverage and VERIFY the exchange actually accepted it.
+                # A silent failure here would leave the symbol on whatever leverage
+                # was set in a prior session — including potentially 50x.
+                applied = leverage
                 try:
-                    await self._client.set_leverage(leverage, sym)
+                    resp = await self._client.set_leverage(leverage, sym)
+                    if isinstance(resp, dict) and resp.get("leverage") is not None:
+                        applied = int(float(resp.get("leverage")))
                 except Exception as e:
-                    logger.debug("{} set_leverage({}, {}): {}", self.exchange_id, leverage, sym, e)
+                    logger.warning(
+                        "{} set_leverage({}, {}) failed ({}) — fetching actual leverage from exchange",
+                        self.exchange_id, leverage, sym, e,
+                    )
+                    try:
+                        positions = await self._client.fetch_positions([sym])
+                        if positions:
+                            applied = int(float(positions[0].get("leverage") or leverage))
+                    except Exception as fe:
+                        logger.warning("{} could not verify {} leverage: {}", self.exchange_id, sym, fe)
+                self._actual_leverage[sym] = applied
+                if applied != leverage:
+                    logger.warning(
+                        "{} {} LEVERAGE MISMATCH: requested={} applied={} — exchange-side leverage is {}x",
+                        self.exchange_id, sym, leverage, applied, applied,
+                    )
+                    try:
+                        await self.event_bus.publish("ALERT_WARNING", {
+                            "type": "leverage_mismatch",
+                            "exchange": self.exchange_id,
+                            "symbol": sym,
+                            "requested": leverage,
+                            "applied": applied,
+                            "ts": int(time.time()),
+                        })
+                    except Exception:
+                        pass
             logger.info("{} CEX client initialized (leverage={}, margin={})", self.exchange_id, leverage, margin_mode)
             # Pre-warm HTTP connection pool to eliminate cold-start latency
             try:
