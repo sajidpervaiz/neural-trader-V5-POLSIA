@@ -55,14 +55,12 @@ class StateRecovery:
             positions = await self._repo.load_open_positions()
             result.positions_recovered = len(positions)
 
-            # 3. Recover fills for open orders (for OrderManager.fills rebuild)
-            fills_count = 0
-            for order in orders:
-                oid = order.get("order_id", "")
-                if oid:
-                    fills = await self._repo.load_fills_for_order(oid)
-                    fills_count += len(fills)
-            result.fills_recovered = fills_count
+            # 3. Recover fills for open orders (for OrderManager.fills rebuild).
+            # Single batched query instead of N+1 — startup with 1000 historical
+            # orders previously meant 1000 sequential round-trips.
+            order_ids = [o.get("order_id", "") for o in orders if o.get("order_id")]
+            fills_by_oid = await self._repo.load_fills_for_orders(order_ids)
+            result.fills_recovered = sum(len(v) for v in fills_by_oid.values())
 
             # 4. Get last equity snapshot
             equity = await self._repo.load_latest_equity()

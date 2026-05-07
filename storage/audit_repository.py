@@ -314,6 +314,31 @@ class AuditRepository:
             logger.error("load_fills_for_order failed: {}", exc)
             return []
 
+    async def load_fills_for_orders(self, order_ids: list[str]) -> dict[str, list[dict]]:
+        """Batch-load fills for many orders in one query (closes the SR-1 N+1).
+
+        Returns a dict {order_id: [fill_dict, ...]} so callers can group without
+        a second pass. Empty input or no DB → empty dict.
+        """
+        if self._pool is None or not order_ids:
+            return {}
+        try:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT * FROM fills WHERE order_id = ANY($1) ORDER BY trade_time",
+                    list(order_ids),
+                )
+            grouped: dict[str, list[dict]] = {oid: [] for oid in order_ids}
+            for r in rows:
+                d = dict(r)
+                oid = d.get("order_id", "")
+                if oid in grouped:
+                    grouped[oid].append(d)
+            return grouped
+        except Exception as exc:
+            logger.error("load_fills_for_orders failed: {}", exc)
+            return {}
+
     async def load_open_positions(self) -> list[dict]:
         if self._pool is None:
             return []
