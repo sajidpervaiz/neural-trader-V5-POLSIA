@@ -79,22 +79,24 @@ class CEXExecutor:
         passphrase = cfg.get("passphrase")
         if passphrase:
             params["password"] = passphrase
-        if cfg.get("testnet"):
-            # Normalize type: ccxt expects 'future' not 'futures'
-            raw_type = cfg.get("type", "future")
-            if raw_type == "futures":
-                raw_type = "future"
-            params["options"] = {
-                "defaultType": raw_type,
-                # Skip sapi calls (spot auth) — testnet keys only work on futures endpoints
-                "fetchCurrencies": False,
-                "fetchMargins": False,
-                "warnOnFetchOpenOrdersWithoutSymbol": False,
-                # Restrict load_markets/fetch_balance to futures-only — without this,
-                # ccxt issues signed sapi calls to api.binance.com (mainnet) for spot
-                # margin/capital lookup, which fail with -2008 under testnet keys.
-                "fetchMarkets": ["linear", "inverse"],
-            }
+        # ccxt options apply equally to demo, testnet, and live — futures-only API
+        # keys require defaultType=future and disable spot/sapi calls during
+        # load_markets / fetch_balance. Skipping these for the demo branch (as the
+        # previous code did) made stray sapi calls hit mainnet api.binance.com,
+        # where demo keys don't exist → -2008.
+        raw_type = cfg.get("type", "future")
+        if raw_type == "futures":
+            raw_type = "future"
+        params["options"] = {
+            "defaultType": raw_type,
+            "fetchCurrencies": False,
+            "fetchMargins": False,
+            "warnOnFetchOpenOrdersWithoutSymbol": False,
+        }
+        if raw_type == "future":
+            # Restrict market loading to linear/inverse only — without this, ccxt
+            # tries to also fetch spot markets (sapi) which futures-only keys reject.
+            params["options"]["fetchMarkets"] = ["linear", "inverse"]
         try:
             self._client = cls(params)
             # Two distinct binance sandboxes:
