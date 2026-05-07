@@ -11,6 +11,18 @@ from typing import Callable, Optional, Type, List
 from loguru import logger
 
 
+# Sensible default for transient/retryable failures. Anything outside this
+# list (auth errors, validation errors, business-logic errors, etc.) should
+# fail fast — retrying them just burns rate budget and confuses operators.
+# Callers that genuinely want "retry every Exception" must opt in explicitly.
+_DEFAULT_RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
+    ConnectionError,
+    TimeoutError,
+    OSError,
+    asyncio.TimeoutError,
+)
+
+
 class RetryPolicy:
     """
     Production-grade retry policy with:
@@ -37,7 +49,10 @@ class RetryPolicy:
         self.max_delay = max_delay
         self.exponential_backoff = exponential_backoff
         self.jitter = jitter
-        self.retryable_exceptions = retryable_exceptions or [Exception]
+        # Default narrowed from [Exception] to transient network errors —
+        # auth / business-logic errors no longer waste 3 retries before failing.
+        # Pass retryable_exceptions=[Exception] explicitly to restore old behavior.
+        self.retryable_exceptions = retryable_exceptions or list(_DEFAULT_RETRYABLE_EXCEPTIONS)
         self.dead_letter_queue_size = dead_letter_queue_size
         self._dead_letter_queue: List[dict] = []
 
