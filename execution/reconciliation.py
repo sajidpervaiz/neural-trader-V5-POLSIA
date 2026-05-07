@@ -24,6 +24,7 @@ from core.config import Config
 from core.event_bus import EventBus
 from execution.risk_manager import RiskManager, Position
 from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrderFallbackRequired
+from execution.startup_validation import _sum_stable_usd
 
 
 class ReconciliationResult:
@@ -181,8 +182,10 @@ class StartupReconciler:
         """Fetch account balance from exchange."""
         try:
             balance = await self._client.fetch_balance()
-            total = float(balance.get("total", {}).get("USDT", 0))
-            free = float(balance.get("free", {}).get("USDT", 0))
+            # Sum stable USD pegs (USDT / USDC / BUSD / FDUSD) — accounts holding
+            # USDC must not be reset to equity=0.
+            total = _sum_stable_usd(balance.get("total"))
+            free = _sum_stable_usd(balance.get("free"))
             result.balance = total
             result.available_balance = free
             logger.info(

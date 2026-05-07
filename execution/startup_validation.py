@@ -27,6 +27,25 @@ class ValidationError(Exception):
     pass
 
 
+# Stable USD-pegged assets that count 1:1 toward USDT-equivalent balance.
+# Add more pegs here when needed (e.g. USDD, TUSD). BTC/ETH/etc. require a
+# price feed and are intentionally excluded.
+_STABLE_USD_ASSETS: tuple[str, ...] = ("USDT", "USDC", "BUSD", "FDUSD")
+
+
+def _sum_stable_usd(balance_field: dict[str, Any] | None) -> float:
+    """Sum the configured stable USD pegs from a ccxt balance['total'] / ['free'] dict."""
+    if not isinstance(balance_field, dict):
+        return 0.0
+    total = 0.0
+    for asset in _STABLE_USD_ASSETS:
+        try:
+            total += float(balance_field.get(asset, 0) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 @dataclass
 class SymbolSpec:
     """Extracted market spec for a single symbol."""
@@ -196,8 +215,10 @@ class StartupValidator:
                 balance = await self._client.fetch_balance()
                 self._cached_balance = balance
 
-            total_usdt = float(balance.get("total", {}).get("USDT", 0))
-            free_usdt = float(balance.get("free", {}).get("USDT", 0))
+            # Sum stable USD pegs (USDT / USDC / BUSD / FDUSD) — accounts holding
+            # USDC must not be rejected for "0 USDT".
+            total_usdt = _sum_stable_usd(balance.get("total"))
+            free_usdt = _sum_stable_usd(balance.get("free"))
 
             result.checks["balance"] = {
                 "total_usdt": total_usdt,
