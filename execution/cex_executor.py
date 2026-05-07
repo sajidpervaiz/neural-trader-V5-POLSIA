@@ -12,7 +12,7 @@ from core.config import Config
 from core.event_bus import EventBus
 from core.safe_mode import SafeModeReason
 from engine.signal_generator import TradingSignal
-from execution.order_manager import OrderManager
+from execution.order_manager import OrderManager, OrderSide, OrderType
 from execution.rate_limiter import RateLimiter
 from execution.risk_manager import RiskManager
 from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrderFallbackRequired
@@ -217,6 +217,7 @@ class CEXExecutor:
             is_paper=True,
             timestamp=int(time.time()),
         )
+        await self._record_paper_order_in_manager(signal, fill_price, result.quantity)
         await self.event_bus.publish("ORDER_FILLED", result)
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
         return result
@@ -236,9 +237,48 @@ class CEXExecutor:
             timestamp=int(time.time()),
         )
         pos = await self.risk_manager.open_position(signal, size)
+        await self._record_paper_order_in_manager(signal, fill_price, result.quantity)
         await self.event_bus.publish("ORDER_FILLED", result)
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
         return result
+
+    async def _record_paper_order_in_manager(
+        self, signal: TradingSignal, fill_price: float, filled_qty: float,
+    ) -> None:
+        """Register a paper fill through OrderManager so the lifecycle
+        (idempotency, self-trade prevention, audit, /api/exchange/orders) is
+        identical to live. Without this, paper mode silently bypasses
+        OrderManager and the live path is exercised first time in production.
+        """
+        if self._order_manager is None or filled_qty <= 0:
+            return
+        try:
+            side = OrderSide.BUY if signal.is_long else OrderSide.SELL
+            success, order, reason = await self._order_manager.place_order(
+                exchange=signal.exchange,
+                symbol=signal.symbol,
+                side=side,
+                quantity=filled_qty,
+                price=fill_price,
+                order_type=OrderType.MARKET,
+                metadata={"paper": True, "signal_score": float(getattr(signal, "score", 0.0) or 0.0)},
+            )
+            if not success or order is None:
+                logger.debug("paper order not registered in OrderManager: {}", reason)
+                return
+            await self._order_manager.confirm_order_submission(
+                client_order_id=order.client_order_id,
+                exchange_order_id=order.order_id,  # synthetic exchange id for paper
+            )
+            await self._order_manager.record_fill(
+                client_order_id=order.client_order_id,
+                fill_id=f"paper_fill_{int(time.time() * 1_000_000)}",
+                quantity=filled_qty,
+                price=fill_price,
+                fee=0.0,
+            )
+        except Exception as exc:
+            logger.debug("paper OrderManager registration failed: {}", exc)
 
     async def _emergency_market_close(
         self, signal: TradingSignal, filled_qty: float, fill_price: float, *, reason: str,
