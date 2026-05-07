@@ -244,6 +244,9 @@ class CEXExecutor:
         commission = float(bt.get("commission_pct", 0.0005))
         cost = slippage + commission
         fill_price = signal.price * (1 + cost if signal.is_long else 1 - cost)
+        # Note: open_position is called below and uses signal.price as entry.
+        # We overwrite pos.entry_price = fill_price afterwards so the position's
+        # cost basis reflects the entry-side slippage + commission.
         result = OrderResult(
             order_id=f"paper_{int(time.time()*1000)}",
             exchange=signal.exchange,
@@ -256,6 +259,15 @@ class CEXExecutor:
             timestamp=int(time.time()),
         )
         pos = await self.risk_manager.open_position(signal, size)
+        # Overwrite cost basis to the cost-adjusted fill_price so paper PnL
+        # reflects entry-side slippage + commission. Without this, only exit-side
+        # cost was charged in close_position → round-trip cost ≈ 7bps instead of
+        # the realistic 14bps.
+        if pos is not None:
+            pos.entry_price = fill_price
+            pos.current_price = fill_price
+            pos.highest_since_entry = fill_price
+            pos.lowest_since_entry = fill_price
         await self._record_paper_order_in_manager(signal, fill_price, result.quantity)
         await self.event_bus.publish("ORDER_FILLED", result)
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
