@@ -630,9 +630,12 @@ class TestStateRecoveryRecover:
         repo.load_open_positions = AsyncMock(return_value=[
             {"exchange": "binance", "symbol": "BTCUSDT", "size": 1.0},
         ])
-        repo.load_fills_for_order = AsyncMock(return_value=[
-            {"fill_id": "f1", "quantity": 0.5},
-        ])
+        # SR-1 fix: state_recovery now uses the batched load_fills_for_orders
+        # call instead of N+1 per-order. Mock returns {oid: [fill]} dict.
+        repo.load_fills_for_orders = AsyncMock(return_value={
+            "o1": [{"fill_id": "f1", "quantity": 0.5}],
+            "o2": [{"fill_id": "f2", "quantity": 0.5}],
+        })
         repo.load_latest_equity = AsyncMock(return_value={
             "equity": 10500.0, "drawdown_pct": 2.0,
         })
@@ -935,9 +938,11 @@ class TestEndToEndAuditChain:
         repo.load_open_positions = AsyncMock(return_value=[
             {"exchange": "binance", "symbol": "BTCUSDT", "size": 0.5, "entry_price": 49500},
         ])
-        repo.load_fills_for_order = AsyncMock(return_value=[
-            {"fill_id": "f1", "quantity": 0.3, "price": 49500},
-        ])
+        # SR-1: state_recovery uses batched load_fills_for_orders
+        repo.load_fills_for_orders = AsyncMock(return_value={
+            "pre-crash-1": [{"fill_id": "f1", "quantity": 0.3, "price": 49500}],
+            "pre-crash-2": [{"fill_id": "f2", "quantity": 0.2, "price": 49600}],
+        })
         repo.load_latest_equity = AsyncMock(return_value={
             "equity": 9800.0, "drawdown_pct": 3.5,
         })
