@@ -1006,6 +1006,16 @@ class RiskManager:
         if size <= 0:
             return False, "position_size_zero", 0.0
 
+        # SG-Sz: apply the signal-intrinsic size multiplier computed by
+        # signal_generator (session × MTF × transition × quality_boost ×
+        # regime_size). Without this, the entire spec-compliant sizing
+        # chain in signal_generator was discarded silently. Clamp [0.10,
+        # 2.0] so any pathological multiplier can't blow up notional.
+        signal_size_mult = float(getattr(signal, "size_multiplier", 1.0) or 1.0)
+        signal_size_mult = max(0.10, min(2.0, signal_size_mult))
+        if signal_size_mult != 1.0:
+            size *= signal_size_mult
+
         # ARMS-V2.1: Per-tier risk adjustment (§8)
         tier = int(signal.metadata.get("pair_tier", 0)) if signal.metadata else 0
         if tier > 0:
