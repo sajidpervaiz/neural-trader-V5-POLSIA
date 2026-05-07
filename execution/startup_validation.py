@@ -119,8 +119,11 @@ class StartupValidator:
         # 6. Leverage validation per symbol against exchange limits
         await self._check_leverage(result)
 
-        # 7. Margin mode verification
+        # 7. Margin mode verification (config-side schema)
         await self._check_margin_mode(result)
+
+        # 7b. Exchange-side leverage + margin verification (live truth)
+        await self._check_exchange_side_leverage_margin(result)
 
         # 8. Order size feasibility
         self._check_order_size_feasibility(result)
@@ -406,6 +409,61 @@ class StartupValidator:
 
         result.checks["margin_mode"] = {"mode": margin_mode, "status": "ok"}
         logger.info("Margin mode OK: {}", margin_mode)
+
+    # ── 7b. Exchange-side leverage + margin verification ─────────────────
+
+    async def _check_exchange_side_leverage_margin(self, result: ValidationResult) -> None:
+        """Verify exchange's actual leverage + margin mode match config per symbol.
+
+        Previously validation only checked config strings against schema. The
+        exchange might carry stale 50x / cross from a prior session; the bot
+        would happily start with 1x in config but trade at 50x in reality.
+        Mismatches surface as warnings (operator-visible at boot).
+        """
+        if self._client is None:
+            return
+        exchanges_cfg = self.config.get_value("exchanges") or {}
+        client_exchange = getattr(self._client, "id", "")
+        cfg = exchanges_cfg.get(client_exchange, {})
+        if not isinstance(cfg, dict) or not cfg.get("enabled", False):
+            return
+        symbols = cfg.get("symbols", [])
+        if not symbols:
+            return
+        expected_margin = str(cfg.get("margin_mode", "isolated")).lower()
+        expected_lev_default = float(
+            cfg.get("leverage", self._default_leverage) or self._default_leverage
+        )
+        try:
+            positions = await self._client.fetch_positions(symbols)
+        except Exception as exc:
+            result.warnings.append(f"could_not_verify_exchange_leverage: {exc}")
+            return
+        mismatches: list[str] = []
+        for p in positions or []:
+            sym = p.get("symbol", "")
+            if sym not in symbols:
+                continue
+            actual_lev = int(float(p.get("leverage", 0) or 0))
+            actual_margin = str(p.get("marginMode") or p.get("marginType") or "").lower()
+            expected_lev = int(
+                float(self._max_leverage_per_symbol.get(sym, expected_lev_default) or 0)
+            )
+            if actual_lev > 0 and expected_lev > 0 and actual_lev != expected_lev:
+                mismatches.append(
+                    f"{sym}: exchange leverage {actual_lev}x != config {expected_lev}x"
+                )
+            if actual_margin and expected_margin and actual_margin != expected_margin:
+                mismatches.append(
+                    f"{sym}: exchange margin '{actual_margin}' != config '{expected_margin}'"
+                )
+        if mismatches:
+            for m in mismatches:
+                result.warnings.append(m)
+            logger.warning("Exchange-side leverage/margin mismatch detected: {}", mismatches)
+        result.checks["exchange_side_leverage_margin"] = (
+            "ok" if not mismatches else f"{len(mismatches)} mismatch(es) — see warnings"
+        )
 
     # ── 8. Order size feasibility ────────────────────────────────────────
 
