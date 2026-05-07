@@ -161,7 +161,12 @@ class TestRetryPolicy:
 
     @pytest.mark.asyncio
     async def test_retry_on_failure_then_success(self):
-        """Should retry on failure, then succeed"""
+        """Should retry on transient failure, then succeed.
+
+        Uses ConnectionError (matches the new default retryable list per RT-1).
+        Plain Exception is no longer retryable by default — non-transient
+        errors fail fast.
+        """
         policy = RetryPolicy(max_attempts=3, initial_delay=0.01, max_delay=0.1)
         attempts = 0
 
@@ -169,7 +174,7 @@ class TestRetryPolicy:
             nonlocal attempts
             attempts += 1
             if attempts < 3:
-                raise Exception("Transient failure")
+                raise ConnectionError("Transient failure")
             return "success"
 
         result = await policy.execute_with_retry(
@@ -180,21 +185,38 @@ class TestRetryPolicy:
 
     @pytest.mark.asyncio
     async def test_retry_exhaust_all_attempts(self):
-        """Should fail after exhausting all attempts"""
+        """Should fail after exhausting all attempts on a transient error."""
         policy = RetryPolicy(max_attempts=2, initial_delay=0.01)
         attempts = 0
 
         async def always_failing():
             nonlocal attempts
             attempts += 1
-            raise Exception(f"Failure {attempts}")
+            raise ConnectionError(f"Failure {attempts}")
 
-        with pytest.raises(Exception, match="Failure 2"):
+        with pytest.raises(ConnectionError, match="Failure 2"):
             await policy.execute_with_retry(
                 always_failing, operation_name="failing_op"
             )
 
         assert attempts == 2
+
+    @pytest.mark.asyncio
+    async def test_non_retryable_exception_fails_fast(self):
+        """RT-1: non-transient errors (auth, validation, business logic) must
+        NOT be retried — that was the whole point of narrowing the default."""
+        policy = RetryPolicy(max_attempts=3, initial_delay=0.01)
+        attempts = 0
+
+        async def auth_error():
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("invalid api key")
+
+        with pytest.raises(ValueError, match="invalid api key"):
+            await policy.execute_with_retry(auth_error, operation_name="auth")
+
+        assert attempts == 1, "non-retryable exception should fire only once"
 
     @pytest.mark.asyncio
     async def test_dead_letter_queue(self):

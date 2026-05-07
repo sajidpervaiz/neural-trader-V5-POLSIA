@@ -12,13 +12,20 @@ from loguru import logger
 
 
 # Sensible default for transient/retryable failures. Anything outside this
-# list (auth errors, validation errors, business-logic errors, etc.) should
-# fail fast — retrying them just burns rate budget and confuses operators.
-# Callers that genuinely want "retry every Exception" must opt in explicitly.
+# list (auth errors, validation errors, business-logic errors, FileNotFound,
+# PermissionError, etc.) should fail fast — retrying them just burns rate
+# budget and confuses operators with 3× the same trace.
+#
+# Note: deliberately NOT including OSError — its subclasses include
+# PermissionError and FileNotFoundError which are NOT transient.
+# ConnectionError is a sibling that already covers BrokenPipeError,
+# ConnectionResetError, etc. — the genuine transient cases.
+#
+# Callers that want "retry every Exception" must opt in via
+# retryable_exceptions=[Exception].
 _DEFAULT_RETRYABLE_EXCEPTIONS: tuple[type[Exception], ...] = (
     ConnectionError,
     TimeoutError,
-    OSError,
     asyncio.TimeoutError,
 )
 
