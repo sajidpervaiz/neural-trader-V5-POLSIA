@@ -157,47 +157,56 @@ class EStopManager:
             return event
 
     async def _cancel_all_orders(self, executor: Any) -> int:
-        """Cancel all open orders via executor. Returns count cancelled."""
+        """Cancel all open orders via the executor's ccxt client.
+
+        CEXExecutor does not expose get_open_orders / cancel_order at the class
+        level — the dashboard /v1/kill route uses executor._client directly,
+        and we mirror that approach here. Returns count cancelled.
+        """
         count = 0
-        # Try executor.get_open_orders if it exists
-        get_orders = getattr(executor, "get_open_orders", None)
-        cancel_order = getattr(executor, "cancel_order", None)
-        if get_orders is None or cancel_order is None:
+        client = getattr(executor, "_client", None)
+        if client is None:
+            logger.warning("EStop: executor has no ccxt client — skipping order cancellation")
             return 0
         try:
-            open_orders = await get_orders()
-            for order in open_orders:
-                oid = order.get("order_id") or order.get("id", "")
+            open_orders = await client.fetch_open_orders()
+            for order in open_orders or []:
+                oid = order.get("id", "") or order.get("order_id", "")
                 sym = order.get("symbol", "")
-                if oid and sym:
-                    try:
-                        await cancel_order(str(oid), sym)
-                        count += 1
-                    except Exception as exc:
-                        logger.warning("EStop: cancel order {} failed: {}", oid, exc)
+                if not oid or not sym:
+                    continue
+                try:
+                    await client.cancel_order(str(oid), sym)
+                    count += 1
+                except Exception as exc:
+                    logger.warning("EStop: cancel order {} failed: {}", oid, exc)
         except Exception as exc:
-            logger.error("EStop: get_open_orders failed: {}", exc)
+            logger.error("EStop: fetch_open_orders failed: {}", exc)
         return count
 
     async def _close_all_positions(self, executor: Any, positions: list[dict]) -> int:
-        """Close all positions via market orders. Returns count closed."""
+        """Close all positions via reduceOnly market orders. Returns count closed."""
         count = 0
-        close_pos = getattr(executor, "_close_position_live", None) or \
-                    getattr(executor, "close_position", None)
-        if close_pos is None:
+        client = getattr(executor, "_client", None)
+        if client is None:
+            logger.warning("EStop: executor has no ccxt client — skipping position close")
             return 0
         for pos in positions:
             sym = pos.get("symbol", "")
-            size = float(pos.get("size", 0))
-            if sym and size > 0:
-                try:
-                    ok = await close_pos(sym, size)
-                    if ok:
-                        count += 1
-                    else:
-                        logger.warning("EStop: close_position {} returned False", sym)
-                except Exception as exc:
-                    logger.error("EStop: close_position {} failed: {}", sym, exc)
+            size = float(pos.get("size", 0) or 0)
+            direction = str(pos.get("direction") or pos.get("side") or "").lower()
+            if not sym or size <= 0 or direction not in ("long", "short"):
+                continue
+            close_side = "sell" if direction == "long" else "buy"
+            try:
+                await client.create_market_order(
+                    symbol=sym, side=close_side, amount=size,
+                    params={"reduceOnly": True},
+                )
+                count += 1
+            except Exception as exc:
+                logger.error("EStop: close_position {} ({}, qty={}) failed: {}",
+                             sym, close_side, size, exc)
         return count
 
     # ── Release ───────────────────────────────────────────────────────────────
