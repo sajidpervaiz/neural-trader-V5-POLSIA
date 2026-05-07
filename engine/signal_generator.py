@@ -2205,52 +2205,78 @@ class SignalGenerator:
         # ── L3: TECHNICAL CONFLUENCE (HARD GATE: ≥ 65/100) ──────────────
         # Spec: 12-indicator matrix → 3-group weighted avg
         # Trend group (35%), Momentum group (35%), Volatility group (30%)
+        # Direction-aware: bullish criteria for longs; mirror-image bearish
+        # criteria for shorts. atr/willr stay direction-blind (volatility
+        # expansion / overbought-vs-oversold balance both apply equally).
         last = df.iloc[-1]
         prev = df.iloc[-2] if len(df) >= 2 else last
+        is_long = proposed_direction == "long"
 
         # Trend group (EMA Stack, SuperTrend, Ichimoku, SAR)
         ema9 = float(last.get("ema_9", 0)); ema21 = float(last.get("ema_21", 0))
         ema50 = float(last.get("ema_50", 0))
-        if ema9 > ema21 > ema50 > 0:
-            ema_score = 100
-        elif ema21 > ema50:
-            ema_score = 60
+        if is_long:
+            if ema9 > ema21 > ema50 > 0:
+                ema_score = 100
+            elif ema21 > ema50:
+                ema_score = 60
+            else:
+                ema_score = 0
         else:
-            ema_score = 0
+            if 0 < ema9 < ema21 < ema50:
+                ema_score = 100
+            elif ema21 < ema50:
+                ema_score = 60
+            else:
+                ema_score = 0
 
         st_dir = float(last.get("supertrend_dir", 0))
-        supertrend_score = 100 if st_dir == 1 else 0
+        supertrend_score = 100 if (st_dir == 1 if is_long else st_dir == -1) else 0
 
-        ichimoku_score = 100 if last.get("ichimoku_above_cloud", 0) else 40
-        sar_score = 100 if float(last.get("psar_bullish", 0)) == 1.0 else 0
+        if is_long:
+            ichimoku_score = 100 if last.get("ichimoku_above_cloud", 0) else 40
+            sar_score = 100 if float(last.get("psar_bullish", 0)) == 1.0 else 0
+        else:
+            ichimoku_score = 100 if last.get("ichimoku_below_cloud", 0) else 40
+            # No explicit psar_bearish column — bearish ≡ NOT psar_bullish
+            sar_score = 100 if float(last.get("psar_bullish", 1)) == 0.0 else 0
 
         trend_avg = (ema_score + supertrend_score + ichimoku_score + sar_score) / 4.0
 
         # Momentum group (RSI, MACD, MFI, Stochastic)
         rsi = float(last.get("rsi_14", 50.0))
-        if 55 <= rsi <= 75:
-            rsi_score = 100
-        elif 50 < rsi < 55 or 75 < rsi < 80:
-            rsi_score = 50
+        if is_long:
+            if 55 <= rsi <= 75:
+                rsi_score = 100
+            elif 50 < rsi < 55 or 75 < rsi < 80:
+                rsi_score = 50
+            else:
+                rsi_score = 0
         else:
-            rsi_score = 0
+            # Mirror image of long ranges around 50
+            if 25 <= rsi <= 45:
+                rsi_score = 100
+            elif 45 < rsi < 50 or 20 < rsi < 25:
+                rsi_score = 50
+            else:
+                rsi_score = 0
 
         macd_val = float(last.get("macd", 0)); macd_sig = float(last.get("macd_signal", 0))
         macd_hist = float(last.get("macd_histogram", 0))
         prev_hist = float(prev.get("macd_histogram", 0))
-        if macd_val > macd_sig and macd_hist > prev_hist:
-            macd_score = 100
+        if is_long:
+            macd_score = 100 if (macd_val > macd_sig and macd_hist > prev_hist) else 30
         else:
-            macd_score = 30
+            macd_score = 100 if (macd_val < macd_sig and macd_hist < prev_hist) else 30
 
         mfi = float(last.get("mfi_14", 50.0))
-        mfi_score = 100 if mfi > 55 else 40
+        mfi_score = (100 if mfi > 55 else 40) if is_long else (100 if mfi < 45 else 40)
 
         stoch_k = float(last.get("stoch_k", 50)); stoch_d = float(last.get("stoch_d", 50))
-        if stoch_k > stoch_d and 20 <= stoch_k <= 80:
-            stoch_score = 100
+        if is_long:
+            stoch_score = 100 if (stoch_k > stoch_d and 20 <= stoch_k <= 80) else 50
         else:
-            stoch_score = 50
+            stoch_score = 100 if (stoch_k < stoch_d and 20 <= stoch_k <= 80) else 50
 
         momentum_avg = (rsi_score + macd_score + mfi_score + stoch_score) / 4.0
 
@@ -2258,13 +2284,22 @@ class SignalGenerator:
         bb_pct = float(last.get("bb_pct", 0.5))
         bb_upper = float(last.get("bb_upper", 0))
         bb_lower = float(last.get("bb_lower", 0))
-        if close_price > bb_upper > 0:
-            bb_score = 100
-        elif bb_upper > 0 and bb_lower > 0 and bb_pct > 0.5:
-            bb_score = 60  # Above BB midline
+        if is_long:
+            if close_price > bb_upper > 0:
+                bb_score = 100
+            elif bb_upper > 0 and bb_lower > 0 and bb_pct > 0.5:
+                bb_score = 60  # Above BB midline
+            else:
+                bb_score = 20
         else:
-            bb_score = 20
+            if 0 < bb_lower and close_price < bb_lower:
+                bb_score = 100
+            elif bb_upper > 0 and bb_lower > 0 and bb_pct < 0.5:
+                bb_score = 60  # Below BB midline
+            else:
+                bb_score = 20
 
+        # ATR expansion is direction-blind: volatility regime, not direction
         atr_20_mean = float(df["atr_14"].tail(20).mean()) if "atr_14" in df.columns and len(df) >= 20 else atr_14
         atr_expansion_ratio = atr_14 / atr_20_mean if atr_20_mean > 0 else 1.0
         atr_score = 100 if atr_expansion_ratio > 1.2 else (60 if atr_expansion_ratio > 0.8 else 20)
@@ -2272,13 +2307,22 @@ class SignalGenerator:
         kc_upper = float(last.get("kc_upper", 0))
         kc_lower = float(last.get("kc_lower", 0))
         kc_mid = (kc_upper + kc_lower) / 2 if kc_upper > 0 and kc_lower > 0 else 0
-        if close_price > kc_upper > 0:
-            keltner_score = 100
-        elif kc_mid > 0 and close_price > kc_mid:
-            keltner_score = 60
+        if is_long:
+            if close_price > kc_upper > 0:
+                keltner_score = 100
+            elif kc_mid > 0 and close_price > kc_mid:
+                keltner_score = 60
+            else:
+                keltner_score = 20
         else:
-            keltner_score = 20
+            if 0 < kc_lower and close_price < kc_lower:
+                keltner_score = 100
+            elif kc_mid > 0 and close_price < kc_mid:
+                keltner_score = 60
+            else:
+                keltner_score = 20
 
+        # Williams %R: -80..-20 = "neither extreme" (direction-blind, mid-range)
         wr = float(last.get("williams_r", -50.0))
         willr_score = 80 if -80 <= wr <= -20 else 30
 
