@@ -1989,17 +1989,28 @@ class SignalGenerator:
         return min(100, max(0, int(total)))
 
     async def _handle_candle(self, payload: Any) -> None:
-        """9-Layer Sequential Signal Confirmation Pipeline — V1.0 Professional Spec.
+        """9-Layer Sequential Signal Confirmation Pipeline — V6.0 spec.
 
-        L-1: On-Chain (placeholder — not yet integrated)
-        L0: Session & Killzone Rules + Sentiment Pre-Filter
-        L1: Market Regime Classification (ADX<25 = NO TRADE)
-        L2: Market Structure (BOS/CHoCH via SMC)
-        L3: Smart Money Concepts (FVG, Order Blocks, Liquidity)
-        L4: Momentum Convergence Matrix (15 indicators)
-        L5: Volume Profile & Order Flow Confirmation
-        L6: Multi-Timeframe Weighted Alignment
-        L7: Microstructure Confirmation (candle pattern + volume)
+        Layer numbering (matches the implementation, the dashboard panel
+        names, and the _compute_quality_score weight comments at line ~1916):
+
+        L1  Session / Killzone (time-of-day filter, weekend halt, no-trade hours)
+        L2  HTF Trend (multi-timeframe weighted agreement; HARD GATE)
+        L3  Technical Confluence (15-indicator matrix; HARD GATE ≥ threshold)
+        L4  Smart Money Concepts (FVG / Order Blocks / Breaker / Liq sweep; HARD GATE ≥ threshold)
+        L5  Volume Profile & Order Flow (POC/VAH/VAL/CVD; HARD GATE ≥ threshold)
+        L6  Regime classification (ADX-based; signal-type compatibility filter)
+        L7  ML Ensemble (AdaptiveMLScorer feeds quality, no hard gate)
+        L8  Quality Composite (weighted L2..L7 → 0-100; HARD GATE ≥ threshold)
+        L9  Risk Gate (RiskManager.approve_signal — equity/exposure/kelly/breakers)
+
+        L10 (additive) Geopolitical alignment bonus — gated by config weight.
+
+        N.B. older drafts of this docstring listed L0..L7 with different
+        contents; that numbering is obsolete. The implementation uses L1..L9
+        as above; the V6 master_scorer.py composite uses (L3, L4, L5, ML,
+        ExecLiquidity) with different weights and is computed alongside L8
+        for diagnostic purposes only — it is NOT the gate.
         """
         candle = payload
         if candle.timeframe != self._primary_tf:
