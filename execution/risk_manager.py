@@ -1406,10 +1406,34 @@ class RiskManager:
             )
             return closed
 
-    def deactivate_kill_switch(self) -> None:
+    def deactivate_kill_switch(self, operator: str = "system") -> None:
+        """Release the kill switch and clear the file-based trigger.
+
+        Without removing the kill-switch file and busting the 5s cache, the
+        next call to approve_signal would re-detect the file and re-set
+        self._killed = True — meaning the operator's deactivation would be
+        silently reverted. This method also resets the cached file-state
+        check so the next approve_signal sees fresh ground truth.
+        """
         self._killed = False
         self._equity_unreconciled = False
-        logger.info("Kill switch deactivated")
+        # Remove the kill-switch file if present, so cache re-check doesn't re-trip.
+        try:
+            if self._kill_switch_file.exists():
+                self._kill_switch_file.unlink()
+        except Exception as exc:
+            logger.warning("Could not remove kill-switch file {}: {}", self._kill_switch_file, exc)
+        # Bust the cache so the next approve_signal re-stats the file path immediately.
+        self._kill_switch_cache = False
+        self._kill_switch_last_check = 0.0
+        logger.warning("Kill switch DEACTIVATED by {}", operator)
+        try:
+            self.event_bus.publish_nowait("ESTOP_RELEASED", {
+                "operator": operator,
+                "ts": time.time(),
+            })
+        except Exception:
+            pass
 
     @property
     def killed(self) -> bool:
