@@ -191,8 +191,12 @@ class OrderManager:
         self._running = False
         self._audit_log_path = audit_log_path
         self._order_state_path = order_state_path
+        # Default: live mode → True (recover open orders / audit on restart);
+        # paper mode → False (start fresh, ignore stale paper-session state).
+        # Operators can override either way via execution.restore_orders_on_startup.
+        _default_restore = not bool(getattr(self.config, "paper_mode", True))
         self._restore_state_on_startup = bool(
-            self.config.get_value("execution", "restore_orders_on_startup", default=False)
+            self.config.get_value("execution", "restore_orders_on_startup", default=_default_restore)
         )
         if self._restore_state_on_startup:
             self._load_audit_log()
