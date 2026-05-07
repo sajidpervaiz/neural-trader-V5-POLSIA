@@ -56,6 +56,13 @@ class CEXExecutor:
         self._post_only = bool(exec_cfg.get("post_only", True))
         self._iceberg_threshold_usd = float(exec_cfg.get("iceberg_threshold_usd", 10000.0))
         self._iceberg_chunks = int(exec_cfg.get("iceberg_chunks", 4))
+        # Limit-fill polling behaviour (used by _wait_for_fill).
+        # Defaults preserve previous behaviour: 3 polls × 5s = 15s, then market.
+        # Set market_on_timeout: false to disable auto-conversion.
+        fill_cfg = exec_cfg.get("wait_for_fill", {}) or {}
+        self._fill_max_retries = int(fill_cfg.get("max_retries", 3))
+        self._fill_wait_seconds = float(fill_cfg.get("wait_seconds", 5.0))
+        self._fill_market_on_timeout = bool(fill_cfg.get("market_on_timeout", True))
         # Verified exchange-side leverage per symbol — populated by _init_client.
         # If a set_leverage call fails or echoes a different value, the actual
         # leverage as reported by the exchange is recorded here.
@@ -568,9 +575,18 @@ class CEXExecutor:
 
     async def _wait_for_fill(
         self, signal: TradingSignal, order: dict, amount: float,
-        max_retries: int = 3, wait_sec: float = 5.0,
+        max_retries: int | None = None, wait_sec: float | None = None,
     ) -> dict:
-        """Poll for fill; cancel & replace at market after max_retries."""
+        """Poll for fill; on timeout cancel and (if configured) replace at market.
+
+        Polling cadence + market-conversion behaviour are config-driven via
+        execution.wait_for_fill.{max_retries,wait_seconds,market_on_timeout}.
+        Explicit kwargs override config (used for tests / iceberg tuning).
+        """
+        if max_retries is None:
+            max_retries = self._fill_max_retries
+        if wait_sec is None:
+            wait_sec = self._fill_wait_seconds
         order_id = order.get("id", "")
         for attempt in range(max_retries):
             await asyncio.sleep(wait_sec)
@@ -592,6 +608,15 @@ class CEXExecutor:
                          self.exchange_id, order_id, (attempt + 1) * wait_sec, attempt + 1, max_retries)
 
         if self._client is None:
+            return order
+
+        # Operator opt-out: if market_on_timeout is False, return the unfilled
+        # limit order as-is. Caller decides whether to wait longer / cancel.
+        if not self._fill_market_on_timeout:
+            logger.info(
+                "{} limit {} unfilled after {}×{}s — market_on_timeout=false, leaving open",
+                self.exchange_id, order_id, max_retries, wait_sec,
+            )
             return order
 
         # Cancel the limit order and fall back to market
