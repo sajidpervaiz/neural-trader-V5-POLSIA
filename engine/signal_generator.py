@@ -3233,6 +3233,26 @@ class SignalGenerator:
             min_depth_usd=self._min_orderbook_depth_usd,
         )
 
+    async def _handle_position_closed(self, payload: Any) -> None:
+        """Clear _open_directions[symbol] so a new entry can be evaluated.
+
+        Without this, _open_directions[symbol] is set on signal publish
+        (line ~3069) and never cleared. The duplicate-guard at the top of
+        _handle_candle then permanently blocks new entries on that symbol
+        until bot restart — bot takes one trade per symbol per session.
+        """
+        try:
+            symbol = None
+            if isinstance(payload, dict):
+                pos = payload.get("position")
+                symbol = payload.get("symbol") or (getattr(pos, "symbol", None) if pos else None)
+            else:
+                symbol = getattr(payload, "symbol", None)
+            if symbol:
+                self._open_directions.pop(symbol, None)
+        except Exception as exc:
+            logger.debug("_handle_position_closed cleanup error: {}", exc)
+
     async def run(self) -> None:
         self._running = True
         self.event_bus.subscribe("CANDLE", self._handle_candle)
@@ -3241,6 +3261,10 @@ class SignalGenerator:
         self.event_bus.subscribe("NEWS_SENTIMENT", self._handle_news_sentiment)
         self.event_bus.subscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
         self.event_bus.subscribe("GEOPOLITICAL_EVENT", self._handle_geopolitical_event)
+        # Critical: clear per-symbol direction tracking when positions close.
+        # Without this subscription, _open_directions[symbol] stays set forever
+        # after the first trade, blocking all subsequent entries on that symbol.
+        self.event_bus.subscribe("POSITION_CLOSED", self._handle_position_closed)
         if self._ml_bootstrap_task is None or self._ml_bootstrap_task.done():
             self._ml_bootstrap_task = asyncio.create_task(self._bootstrap_ml_model_loop())
         logger.info(
@@ -3266,3 +3290,4 @@ class SignalGenerator:
         self.event_bus.unsubscribe("NEWS_SENTIMENT", self._handle_news_sentiment)
         self.event_bus.unsubscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
         self.event_bus.unsubscribe("GEOPOLITICAL_EVENT", self._handle_geopolitical_event)
+        self.event_bus.unsubscribe("POSITION_CLOSED", self._handle_position_closed)
