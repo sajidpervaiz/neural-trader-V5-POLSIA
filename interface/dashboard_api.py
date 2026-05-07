@@ -1022,7 +1022,7 @@ def build_app(
                 rl = getattr(exc, "_rate_limiter", None)
                 if rl:
                     await rl.acquire()
-                bal = await asyncio.wait_for(client.fetch_balance(), timeout=8.0)
+                bal = await asyncio.wait_for(client.fetch_balance(), timeout=20.0)
             except asyncio.TimeoutError:
                 return {"success": False, "exchange": ex_id, "error": "exchange timeout (8s)"}
             except Exception as fetch_err:
@@ -2954,7 +2954,7 @@ def build_app(
 
         balances_summary: list[dict[str, Any]] = []
         try:
-            bal = await asyncio.wait_for(client.fetch_balance(), timeout=8.0)
+            bal = await asyncio.wait_for(client.fetch_balance(), timeout=20.0)
             totals = (bal or {}).get("total") or {}
             for ccy, amt in sorted(totals.items(), key=lambda kv: -float(kv[1] or 0))[:10]:
                 try:

@@ -13,7 +13,11 @@ exchanges:
     api_key: "${BINANCE_API_KEY}"
     api_secret: "${BINANCE_API_SECRET}"
     type: futures
-    testnet: true
+    # demo: true → demo.binance.com (current Binance "Demo Trading", ccxt #92 path)
+    # testnet: true → testnet.binancefuture.com (legacy futures testnet)
+    # Both false → mainnet (real money). NEVER set both true.
+    demo: true
+    testnet: false
     symbols:
       - BTC/USDT:USDT
       - ETH/USDT:USDT
