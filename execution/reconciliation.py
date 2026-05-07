@@ -606,15 +606,48 @@ class StartupReconciler:
                         )
                         result.actions_taken.append(f"placed SL/TP for {symbol}")
                     except ProtectiveOrderFallbackRequired as exc:
-                        logger.warning(
-                            "Exchange-side SL unsupported for {} during reconciliation — bot-managed exits remain active: {}",
-                            symbol,
-                            exc,
+                        logger.critical(
+                            "Exchange-side SL unsupported for {} during reconciliation — bot-managed exits remain active "
+                            "(bot crash leaves position unprotected); OPERATOR ACK REQUIRED: {}",
+                            symbol, exc,
                         )
                         result.actions_taken.append(f"local SL/TP fallback for {symbol}")
+                        try:
+                            await self.event_bus.publish("ALERT_WARNING", {
+                                "type": "recon_sl_fallback_local",
+                                "symbol": symbol,
+                                "error": str(exc),
+                                "needs_ack": True,
+                                "exchange": "binance",
+                                "direction": pos.direction,
+                                "quantity": ep["size"],
+                                "entry_price": ep["entry_price"],
+                                "computed_sl": pos.stop_loss,
+                                "ts": int(time.time()),
+                            })
+                        except Exception:
+                            pass
                     except Exception as exc:
-                        logger.critical("FAILED to place SL for {}: {}", symbol, exc)
+                        logger.critical(
+                            "FAILED to place SL for {} during reconciliation — position UNPROTECTED, safe_mode tripping: {}",
+                            symbol, exc,
+                        )
                         result.mismatches.append(f"sl_placement_failed: {symbol}: {exc}")
+                        try:
+                            await self.event_bus.publish("ALERT_CRITICAL", {
+                                "type": "recon_sl_placement_failed",
+                                "symbol": symbol,
+                                "error": str(exc),
+                                "needs_ack": True,
+                                "exchange": "binance",
+                                "direction": pos.direction,
+                                "quantity": ep["size"],
+                                "entry_price": ep["entry_price"],
+                                "computed_sl": pos.stop_loss,
+                                "ts": int(time.time()),
+                            })
+                        except Exception:
+                            pass
                 elif pos and not self._order_placer:
                     logger.warning("No order_placer — cannot place SL/TP for {}", symbol)
             elif not has_tp:
