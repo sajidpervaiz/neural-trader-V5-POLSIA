@@ -13,6 +13,7 @@ Validates:
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -363,14 +364,39 @@ class StartupValidator:
             raise ValidationError(
                 f"Invalid default_leverage: {default_lev}. Must be >= 1."
             )
+        # Hard ceiling — refuse to start
         if default_lev > 20:
             raise ValidationError(
-                f"Leverage {default_lev}x is dangerously high. "
-                "Maximum recommended: 20x. Reduce risk.default_leverage."
+                f"Leverage {default_lev}x is dangerously high. Maximum allowed: 20x. "
+                "Reduce risk.default_leverage in config."
             )
+        # Tiered escalation — operator-visible per band, not silent.
+        # 20x is the hard cap; 10x+ is HIGH; 5x+ is MEDIUM.
+        # > 10x requires explicit env-var acknowledgement (no silent surprise).
         if default_lev > 10:
+            ack = os.getenv("ACKNOWLEDGE_HIGH_LEVERAGE", "").lower() == "true"
+            if not ack:
+                raise ValidationError(
+                    f"Leverage {default_lev}x exceeds 10x threshold. Set environment "
+                    f"variable ACKNOWLEDGE_HIGH_LEVERAGE=true to start the bot at this leverage. "
+                    f"At 10x leverage, a 5%% adverse move on a 1.5%% sized position = 7.5%% drawdown."
+                )
+            logger.critical(
+                "STARTING WITH HIGH LEVERAGE: {}x — acknowledged via env var", default_lev,
+            )
             result.warnings.append(
-                f"High leverage: {default_lev}x — ensure adequate margin"
+                f"HIGH LEVERAGE acknowledged: {default_lev}x (>10x). Math: per-trade {self._max_position_size_pct:.1%} × {default_lev}x = {self._max_position_size_pct * default_lev:.1%} notional/trade."
+            )
+        elif default_lev > 5:
+            logger.warning(
+                "Leverage {}x exceeds 5x conservative recommendation for crypto futures. "
+                "Per-trade exposure at {:.1%} × {}x = {:.1%} notional.",
+                default_lev, self._max_position_size_pct, default_lev,
+                self._max_position_size_pct * default_lev,
+            )
+            result.warnings.append(
+                f"Moderate leverage: {default_lev}x — per-trade notional exposure "
+                f"= {self._max_position_size_pct * default_lev:.1%} of equity"
             )
 
         # Per-symbol leverage checks against exchange max

@@ -601,7 +601,11 @@ class TestLeverageValidation:
             _cleanup_config(config)
 
     @pytest.mark.asyncio
-    async def test_leverage_11x_warns(self):
+    async def test_leverage_15x_requires_acknowledgement(self):
+        """Issue #23: 10x-20x range now requires explicit
+        ACKNOWLEDGE_HIGH_LEVERAGE=true env var to start. Without it,
+        ValidationError. With it, warning row recorded + critical log."""
+        import os as _os
         config = _make_config(risk={
             "min_balance_usd": 100, "risk_per_trade_pct": 0.01,
             "max_position_size_pct": 0.02, "default_leverage": 15.0,
@@ -610,8 +614,17 @@ class TestLeverageValidation:
         try:
             client = _make_client()
             validator = StartupValidator(config, client=client)
-            result = await validator.validate_all()
-            assert any("High leverage" in w for w in result["warnings"])
+            # Without env var → ValidationError refuses to start
+            _os.environ.pop("ACKNOWLEDGE_HIGH_LEVERAGE", None)
+            with pytest.raises(ValidationError, match="ACKNOWLEDGE_HIGH_LEVERAGE"):
+                await validator.validate_all()
+            # With env var → starts, but emits warning row
+            _os.environ["ACKNOWLEDGE_HIGH_LEVERAGE"] = "true"
+            try:
+                result = await validator.validate_all()
+                assert any("HIGH LEVERAGE" in w for w in result["warnings"])
+            finally:
+                _os.environ.pop("ACKNOWLEDGE_HIGH_LEVERAGE", None)
         finally:
             _cleanup_config(config)
 
