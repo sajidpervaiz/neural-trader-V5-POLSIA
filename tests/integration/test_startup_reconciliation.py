@@ -626,13 +626,17 @@ class TestLeverageMarginReconciliation:
     """Verify leverage/margin settings are checked and corrected."""
 
     @pytest.mark.asyncio
-    async def test_leverage_corrected_on_mismatch(self) -> None:
-        """Config says lev=10, exchange has lev=5 → auto-correct attempted."""
+    async def test_leverage_mismatch_does_not_trigger_set_leverage_with_open_position(self) -> None:
+        """Symbols with open positions: don't call set_leverage. Binance returns
+        -4161 ('Leverage reduction not supported with open positions') for any
+        leverage decrease while the position exists, which previously was caught
+        and added to mismatches → safe_mode tripped on every restart whenever
+        config leverage drifted. New behaviour: take exchange leverage as ground
+        truth, record in actions_taken, do NOT trip safe_mode from this alone."""
         config = _make_config()
         bus = EventBus()
         rm = _make_risk_manager(config, bus)
 
-        # Exchange position with wrong leverage
         client = _make_exchange_client(
             positions=[_make_exchange_position(leverage=5)],  # Config expects 10
             orders=[
@@ -643,13 +647,18 @@ class TestLeverageMarginReconciliation:
         reconciler = StartupReconciler(config, bus, rm, client)
         result = await reconciler.reconcile()
 
-        client.set_leverage.assert_called_once_with(10, "BTC/USDT:USDT")
-        assert any("corrected_leverage" in a for a in result.actions_taken)
-        assert result.leverage_settings["BTC/USDT:USDT"]["leverage"] == 10
+        client.set_leverage.assert_not_called()
+        assert any("leverage_mismatch_open_position" in a for a in result.actions_taken)
+        assert not any("leverage_mismatch" in m for m in result.mismatches)
+        # Exchange's actual leverage is recorded as ground truth
+        assert result.leverage_settings["BTC/USDT:USDT"]["leverage"] == 5
+        assert result.leverage_settings["BTC/USDT:USDT"]["expected_leverage"] == 10
 
     @pytest.mark.asyncio
     async def test_leverage_uses_risk_default_when_exchange_setting_missing(self) -> None:
-        """If exchanges.binance.leverage is absent, use risk.default_leverage."""
+        """If exchanges.binance.leverage is absent, expected_leverage falls back
+        to risk.default_leverage. Same no-set_leverage rule applies for symbols
+        with open positions."""
         config = _make_config({
             "risk": {"default_leverage": 5},
             "exchanges": {"binance": {"leverage": None}},
@@ -667,8 +676,12 @@ class TestLeverageMarginReconciliation:
         reconciler = StartupReconciler(config, bus, rm, client)
         result = await reconciler.reconcile()
 
-        client.set_leverage.assert_called_once_with(5, "BTC/USDT:USDT")
+        # New behaviour: don't call set_leverage on open position
+        client.set_leverage.assert_not_called()
+        # expected_leverage came from risk.default_leverage = 5
         assert result.leverage_settings["BTC/USDT:USDT"]["expected_leverage"] == 5
+        # actual exchange leverage (3) is recorded
+        assert result.leverage_settings["BTC/USDT:USDT"]["leverage"] == 3
 
     @pytest.mark.asyncio
     async def test_margin_mode_mismatch_triggers_safe_mode(self) -> None:
@@ -691,8 +704,11 @@ class TestLeverageMarginReconciliation:
         assert result.safe_mode is True
 
     @pytest.mark.asyncio
-    async def test_leverage_correction_failure(self) -> None:
-        """If set_leverage fails, recorded as mismatch → safe mode."""
+    async def test_leverage_mismatch_alone_does_not_trip_safe_mode(self) -> None:
+        """Even if set_leverage WOULD have failed (e.g. -4161 with open position),
+        the new code never calls it → no exception → leverage mismatch alone
+        does not trip safe_mode. set_leverage AsyncMock is configured here only
+        to verify it's never reached."""
         config = _make_config()
         bus = EventBus()
         rm = _make_risk_manager(config, bus)
@@ -708,8 +724,11 @@ class TestLeverageMarginReconciliation:
         reconciler = StartupReconciler(config, bus, rm, client)
         result = await reconciler.reconcile()
 
-        assert any("leverage_mismatch" in m for m in result.mismatches)
-        assert result.safe_mode is True
+        # Verify the broken set_leverage path is never taken
+        client.set_leverage.assert_not_called()
+        # Mismatch is now in actions_taken, not mismatches
+        assert any("leverage_mismatch_open_position" in a for a in result.actions_taken)
+        assert not any("leverage_mismatch" in m for m in result.mismatches)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
