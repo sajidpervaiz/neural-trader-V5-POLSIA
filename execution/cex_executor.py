@@ -238,6 +238,41 @@ class CEXExecutor:
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
         return result
 
+    async def _emergency_market_close(
+        self, signal: TradingSignal, filled_qty: float, fill_price: float, *, reason: str,
+    ) -> bool:
+        """Flatten an unprotected position with a reduceOnly market order.
+
+        Called when exchange-side SL placement raises a non-fallback exception:
+        the position is open but has no protective stop, so the safer move is to
+        exit immediately rather than leave it bleeding while the operator
+        responds to the alert. Returns True iff the exchange close succeeded.
+        """
+        if self._client is None or filled_qty <= 0:
+            return False
+        close_side = "sell" if signal.is_long else "buy"
+        try:
+            await self._rate_limiter.acquire()
+            await self._client.create_market_order(
+                symbol=signal.symbol, side=close_side, amount=filled_qty,
+                params={"reduceOnly": True},
+            )
+            try:
+                await self.risk_manager.close_position(signal.exchange, signal.symbol, fill_price)
+            except Exception as rm_exc:
+                logger.warning("Emergency close: risk_manager.close_position failed: {}", rm_exc)
+            logger.warning(
+                "EMERGENCY market close completed for {} ({}): qty={} reason={}",
+                signal.symbol, signal.direction, filled_qty, reason,
+            )
+            return True
+        except Exception as close_exc:
+            logger.critical(
+                "EMERGENCY market close FAILED for {}: {} — position UNPROTECTED",
+                signal.symbol, close_exc,
+            )
+            return False
+
     async def _live_execute(self, signal: TradingSignal, size: float, reserved_pos: Any = None) -> OrderResult | None:
         """Execute using LIMIT order for entries; MARKET only for emergency exits.
         Places exchange-side SL/TP after fill for crash protection.
@@ -354,10 +389,14 @@ class CEXExecutor:
                         })
                     except Exception as exc:
                         logger.critical(
-                            "FAILED to place exchange-side SL for {} — tripping circuit breaker: {}",
+                            "FAILED to place exchange-side SL for {} — attempting emergency market close: {}",
                             signal.symbol, exc,
                         )
-                        # Position is unprotected — trip circuit breaker to prevent more entries
+                        # Try to flatten the now-unprotected position before halting trading.
+                        closed_ok = await self._emergency_market_close(
+                            signal, filled_qty, fill_price, reason="sl_placement_failed",
+                        )
+                        # Trip the breaker either way — new entries are paused until operator reviews.
                         self.risk_manager._circuit_breaker.trip(
                             f"sl_placement_failed:{signal.symbol}"
                         )
@@ -365,6 +404,7 @@ class CEXExecutor:
                             "type": "sl_placement_failed",
                             "symbol": signal.symbol,
                             "error": str(exc),
+                            "emergency_close_ok": closed_ok,
                         })
             elif result.status == "partially_filled" and filled_qty > 0:
                 if reserved_pos is not None:
@@ -392,10 +432,22 @@ class CEXExecutor:
                             exc,
                         )
                     except Exception as exc:
-                        logger.critical("SL placement failed for partial fill {}: {}", signal.symbol, exc)
+                        logger.critical(
+                            "SL placement failed for partial fill {} — attempting emergency market close: {}",
+                            signal.symbol, exc,
+                        )
+                        closed_ok = await self._emergency_market_close(
+                            signal, filled_qty, fill_price, reason="sl_placement_failed_partial",
+                        )
                         self.risk_manager._circuit_breaker.trip(
                             f"sl_placement_failed:{signal.symbol}"
                         )
+                        await self.event_bus.publish("ALERT_CRITICAL", {
+                            "type": "sl_placement_failed_partial",
+                            "symbol": signal.symbol,
+                            "error": str(exc),
+                            "emergency_close_ok": closed_ok,
+                        })
             else:
                 logger.warning("{} order not filled: status={}", self.exchange_id, result.status)
                 await self.event_bus.publish("ORDER_FAILED", result)
