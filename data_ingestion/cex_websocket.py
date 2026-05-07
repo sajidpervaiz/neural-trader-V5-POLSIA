@@ -152,6 +152,16 @@ class CEXWebSocketManager:
         subscribe_msgs = self._build_subscribe_msg(exchange, symbols)
         reconnect_delay = 1.0
 
+        # Disconnect-tracking: emit ALERT_CRITICAL after the gap exceeds the
+        # threshold (default 30s), and ALERT_WARNING on first reconnect after
+        # such a prolonged outage. Tracks contiguous-disconnect window.
+        disconnect_started_at: float | None = None
+        prolonged_alert_emitted = False
+        # Threshold: 30s of contiguous disconnect crosses from "transient blip"
+        # to "trade decisions are blind". 15-min primary TF means 30s is 3% of
+        # one candle — borderline-meaningful gap. Configurable via env.
+        prolonged_threshold = float(self.config.get_value("data_ingestion", "ws_prolonged_disconnect_seconds") or 30.0)
+
         while self._running:
             try:
                 logger.info("Connecting to {} WebSocket: {}", exchange, url)
@@ -167,6 +177,24 @@ class CEXWebSocketManager:
                         await ws.send(json.dumps(msg))
                     logger.info("{} WebSocket connected and subscribed", exchange)
 
+                    # If we were in a prolonged disconnect, surface the recovery.
+                    if disconnect_started_at is not None and prolonged_alert_emitted:
+                        outage_duration = time.time() - disconnect_started_at
+                        try:
+                            await self.event_bus.publish("ALERT_WARNING", {
+                                "type": "ws_reconnected",
+                                "exchange": exchange,
+                                "outage_duration_seconds": round(outage_duration, 1),
+                                "ts": int(time.time()),
+                            })
+                        except Exception:
+                            pass
+                        logger.warning(
+                            "{} WebSocket RECONNECTED after {:.1f}s outage", exchange, outage_duration,
+                        )
+                    disconnect_started_at = None
+                    prolonged_alert_emitted = False
+
                     # Reset sequence tracking on reconnect to avoid false gap alerts
                     keys_to_remove = [
                         k for k in self._last_sequence if k == exchange or k.startswith(f"{exchange}:")
@@ -180,9 +208,38 @@ class CEXWebSocketManager:
                         await self._handle_message(exchange, raw)
 
             except (websockets.ConnectionClosed, ConnectionError, OSError) as exc:
+                if disconnect_started_at is None:
+                    disconnect_started_at = time.time()
                 logger.warning("{} WebSocket disconnected: {} — retry in {}s", exchange, exc, reconnect_delay)
             except Exception as exc:
+                if disconnect_started_at is None:
+                    disconnect_started_at = time.time()
                 logger.exception("{} WebSocket unexpected error: {}", exchange, exc)
+
+            # If still down beyond the threshold, emit ALERT_CRITICAL once.
+            # The bot keeps trying — the alert just makes the outage visible.
+            if (
+                disconnect_started_at is not None
+                and not prolonged_alert_emitted
+                and (time.time() - disconnect_started_at) >= prolonged_threshold
+            ):
+                prolonged_alert_emitted = True
+                try:
+                    await self.event_bus.publish("ALERT_CRITICAL", {
+                        "type": "ws_prolonged_disconnect",
+                        "exchange": exchange,
+                        "duration_seconds": round(time.time() - disconnect_started_at, 1),
+                        "threshold_seconds": prolonged_threshold,
+                        "needs_ack": True,
+                        "ts": int(time.time()),
+                    })
+                except Exception:
+                    pass
+                logger.critical(
+                    "{} WebSocket disconnected for >{:.0f}s — operator ACK required. "
+                    "Decisions made on stale tick data. SafeMode not auto-tripped — operator decides.",
+                    exchange, prolonged_threshold,
+                )
 
             if self._running:
                 await asyncio.sleep(reconnect_delay)
