@@ -125,7 +125,7 @@ class Config:
                 if not isinstance(venue_cfg, dict):
                     continue
                 persisted: dict[str, Any] = {}
-                for key in ("enabled", "api_key", "api_secret", "passphrase", "testnet", "type"):
+                for key in ("enabled", "api_key", "api_secret", "passphrase", "testnet", "demo", "type"):
                     if key in venue_cfg:
                         persisted[key] = venue_cfg.get(key)
                 if "symbols" in venue_cfg:
