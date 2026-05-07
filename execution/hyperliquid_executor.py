@@ -10,6 +10,7 @@ from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
 from execution.cex_executor import CEXExecutor, OrderResult
+from execution.order_manager import OrderManager
 from execution.risk_manager import RiskManager
 
 
@@ -26,8 +27,20 @@ class HyperliquidExecutor(CEXExecutor):
             testnet: false
     """
 
-    def __init__(self, config: Config, event_bus: EventBus, risk_manager: RiskManager) -> None:
-        super().__init__(config, event_bus, risk_manager, exchange_id="hyperliquid")
+    def __init__(
+        self,
+        config: Config,
+        event_bus: EventBus,
+        risk_manager: RiskManager,
+        order_manager: OrderManager | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            event_bus,
+            risk_manager,
+            exchange_id="hyperliquid",
+            order_manager=order_manager,
+        )
         self._hl_info: Any = None
         self._hl_exchange: Any = None
         self._wallet_address: str = ""
@@ -133,7 +146,7 @@ class HyperliquidExecutor(CEXExecutor):
                 order_id,
             )
 
-            return OrderResult(
+            result = OrderResult(
                 order_id=order_id,
                 exchange="hyperliquid",
                 symbol=signal.symbol,
@@ -144,6 +157,13 @@ class HyperliquidExecutor(CEXExecutor):
                 is_paper=False,
                 timestamp=int(time.time() * 1000),
             )
+            if reserved_pos is not None:
+                reserved_pos.current_price = fill_px
+                reserved_pos.size = fill_sz
+            else:
+                await self.risk_manager.open_position(signal, fill_sz * fill_px)
+            await self.event_bus.publish("ORDER_FILLED", result)
+            return result
 
         except Exception as exc:
             logger.error("Hyperliquid live execute error: {}", exc)

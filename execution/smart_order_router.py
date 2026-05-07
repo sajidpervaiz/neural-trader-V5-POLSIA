@@ -4,7 +4,7 @@ Smart Order Router with venue scoring and liquidity-based routing.
 
 import asyncio
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
@@ -50,6 +50,18 @@ class RoutingDecision:
     total_cost: float
     recommended_venue: Venue
     confidence: float
+
+
+@dataclass
+class _RouterDepthLevel:
+    price: float
+    quantity: float
+
+
+@dataclass
+class _RouterOrderbookSnapshot:
+    bids: List[_RouterDepthLevel]
+    asks: List[_RouterDepthLevel]
 
 
 class SmartOrderRouter:
@@ -275,7 +287,7 @@ class SmartOrderRouter:
             )
 
         try:
-            snapshot = await executor.get_orderbook_snapshot(symbol, depth=10)
+            snapshot = await self._get_orderbook_snapshot(executor, symbol, depth=10)
 
             liquidity = sum(
                 level.quantity
@@ -341,7 +353,7 @@ class SmartOrderRouter:
             return 0.0
 
         try:
-            snapshot = await executor.get_orderbook_snapshot(symbol, depth=1)
+            snapshot = await self._get_orderbook_snapshot(executor, symbol, depth=1)
 
             if side == OrderSide.BUY:
                 return snapshot.asks[0].price if snapshot.asks else 0.0
@@ -350,6 +362,38 @@ class SmartOrderRouter:
 
         except Exception:
             return 0.0
+
+    async def _get_orderbook_snapshot(
+        self, executor: Any, symbol: str, depth: int
+    ) -> _RouterOrderbookSnapshot:
+        """Fetch an orderbook snapshot from either legacy or runtime CEX executors."""
+        if hasattr(executor, "get_orderbook_snapshot"):
+            snapshot = await executor.get_orderbook_snapshot(symbol, depth=depth)
+            return _RouterOrderbookSnapshot(
+                bids=[_RouterDepthLevel(float(level.price), float(level.quantity)) for level in snapshot.bids],
+                asks=[_RouterDepthLevel(float(level.price), float(level.quantity)) for level in snapshot.asks],
+            )
+
+        client = getattr(executor, "_client", None)
+        if client is None and hasattr(executor, "_init_client"):
+            await executor._init_client()
+            client = getattr(executor, "_client", None)
+
+        if client is None or not hasattr(client, "fetch_order_book"):
+            raise RuntimeError("executor has no orderbook-capable client")
+
+        orderbook = await client.fetch_order_book(symbol, limit=depth)
+        bids = [
+            _RouterDepthLevel(price=float(level[0]), quantity=float(level[1]))
+            for level in orderbook.get("bids", [])[:depth]
+            if len(level) >= 2
+        ]
+        asks = [
+            _RouterDepthLevel(price=float(level[0]), quantity=float(level[1]))
+            for level in orderbook.get("asks", [])[:depth]
+            if len(level) >= 2
+        ]
+        return _RouterOrderbookSnapshot(bids=bids, asks=asks)
 
     def _calculate_estimated_cost(self, score: VenueScore, quantity: float, expected_price: float) -> float:
         """Calculate estimated execution cost including fees and slippage."""

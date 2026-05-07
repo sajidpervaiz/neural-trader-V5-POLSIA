@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from loguru import logger
 
@@ -8,14 +9,27 @@ from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
 from execution.cex_executor import CEXExecutor, OrderResult
+from execution.order_manager import OrderManager
 from execution.risk_manager import RiskManager
 
 
 class KrakenExecutor(CEXExecutor):
     """Kraken-specific CEX executor (spot + futures)."""
 
-    def __init__(self, config: Config, event_bus: EventBus, risk_manager: RiskManager) -> None:
-        super().__init__(config, event_bus, risk_manager, exchange_id="kraken")
+    def __init__(
+        self,
+        config: Config,
+        event_bus: EventBus,
+        risk_manager: RiskManager,
+        order_manager: OrderManager | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            event_bus,
+            risk_manager,
+            exchange_id="kraken",
+            order_manager=order_manager,
+        )
 
     @staticmethod
     def _normalize_symbol(symbol: str) -> str:
@@ -30,7 +44,12 @@ class KrakenExecutor(CEXExecutor):
             symbol = symbol.split(":", 1)[0]
         return symbol
 
-    async def _live_execute(self, signal: TradingSignal, size: float) -> OrderResult | None:
+    async def _live_execute(
+        self,
+        signal: TradingSignal,
+        size: float,
+        reserved_pos: Any | None = None,
+    ) -> OrderResult | None:
         if self._client is None:
             logger.error("No live client for kraken — cannot execute")
             return None
@@ -66,8 +85,12 @@ class KrakenExecutor(CEXExecutor):
                 timestamp=int(time.time()),
                 raw=order,
             )
-            # Use actual filled notional for position tracking
-            await self.risk_manager.open_position(signal, filled_notional)
+            # Use reserved position from atomic approval flow when present.
+            if reserved_pos is not None:
+                reserved_pos.current_price = fill_price
+                reserved_pos.size = filled_qty
+            else:
+                await self.risk_manager.open_position(signal, filled_notional)
 
             # Place protective SL/TP via parent class order placer
             if self._order_placer and hasattr(signal, "sl") and signal.sl:

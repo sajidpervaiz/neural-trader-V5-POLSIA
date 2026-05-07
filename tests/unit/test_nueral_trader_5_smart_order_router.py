@@ -34,6 +34,23 @@ class _DummyExecutor:
         )
 
 
+class _CexClientStub:
+    async def fetch_order_book(self, symbol: str, limit: int = 10):
+        _ = (symbol, limit)
+        return {
+            "bids": [[100.0, 25.0], [99.9, 20.0]],
+            "asks": [[100.1, 24.0], [100.2, 21.0]],
+        }
+
+
+class _CexStyleExecutor:
+    def __init__(self) -> None:
+        self._client = None
+
+    async def _init_client(self) -> None:
+        self._client = _CexClientStub()
+
+
 @pytest.mark.asyncio
 async def test_route_order_refreshes_scores_lazily() -> None:
     router = SmartOrderRouter(
@@ -72,3 +89,22 @@ async def test_estimated_cost_uses_expected_price_not_liquidity() -> None:
     expected_slippage = (score.spread / 2) * route.quantity
     expected_fee = route.expected_fill_price * route.quantity * score.fee
     assert route.estimated_cost == pytest.approx(expected_slippage + expected_fee, rel=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_route_order_supports_cex_runtime_executor_without_legacy_snapshot_api() -> None:
+    router = SmartOrderRouter(
+        binance_executor=_CexStyleExecutor(),
+        bybit_executor=None,
+        okx_executor=None,
+    )
+
+    decision = await router.route_order(
+        "BTC/USDT:USDT",
+        OrderSide.BUY,
+        quantity=3.0,
+        min_score_threshold=0.1,
+    )
+
+    assert decision is not None
+    assert decision.recommended_venue == Venue.BINANCE

@@ -151,7 +151,7 @@ class OrderManager:
         # Order storage
         self.orders: Dict[str, Order] = {}
         self.client_order_map: Dict[str, Order] = {}
-        self.exchange_order_map: Dict[str, Order] = {}
+        self.exchange_order_map: Dict[Tuple[Optional[str], str], Order] = {}
         self.pending_orders: Dict[str, Order] = {}
         self.user_orders: Dict[str, Dict[str, Order]] = {}
         # Idempotency manager (persistent)
@@ -316,7 +316,15 @@ class OrderManager:
                 with open(self._order_state_path) as f:
                     state = json.load(f)
                 self.orders = {k: self._dict_to_order(v) for k, v in state.get("orders", {}).items()}
-                self.client_order_map = {k: self.orders[k] for k in state.get("client_order_map", []) if k in self.orders}
+                restored_client_ids = set(state.get("client_order_map", []) or [])
+                self.client_order_map = {}
+                for order in self.orders.values():
+                    client_oid = order.client_order_id
+                    if not client_oid:
+                        continue
+                    if restored_client_ids and client_oid not in restored_client_ids:
+                        continue
+                    self.client_order_map[client_oid] = order
                 # Restore exchange_order_map with proper (venue, exchange_id) → Order mapping
                 exchange_map_raw = state.get("exchange_order_map", {})
                 if isinstance(exchange_map_raw, dict):
@@ -592,6 +600,11 @@ class OrderManager:
 
             total_value = sum(f.quantity * f.price for f in order.fills)
             order.average_fill_price = total_value / order.cumulative_quantity if order.cumulative_quantity > 0 else 0.0
+            # Keep legacy response fields in sync with canonical cumulative fields.
+            order.filled_quantity = order.cumulative_quantity
+            order.remaining_quantity = max(order.quantity - order.cumulative_quantity, 0.0)
+            order.avg_fill_price = order.average_fill_price
+            order.updated_at = fill.timestamp
 
             if abs(order.cumulative_quantity - order.quantity) < 1e-8:
                 order.status = OrderStatus.FILLED
@@ -725,7 +738,7 @@ class OrderManager:
         threshold_ms = 30_000  # 30 seconds
         fill_threshold = 0.70
 
-        orders_to_cancel = []
+        orders_to_cancel: list[tuple[str, str]] = []
         async with self._lock:
             for oid, order in self.orders.items():
                 if order.status not in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED, OrderStatus.SUBMITTED):
@@ -735,11 +748,12 @@ class OrderManager:
                     continue
                 fill_ratio = order.cumulative_quantity / order.quantity if order.quantity > 0 else 0
                 if fill_ratio < fill_threshold:
-                    orders_to_cancel.append(oid)
+                    if order.client_order_id:
+                        orders_to_cancel.append((oid, order.client_order_id))
 
-        for oid in orders_to_cancel:
+        for oid, client_oid in orders_to_cancel:
             try:
-                await self.cancel_order(oid)
+                await self.cancel_order(client_oid)
                 logger.info("V6.0 partial fill timeout: cancelled order {} (<70% filled after 30s)", oid)
             except Exception as exc:
                 logger.debug("Failed to cancel order {}: {}", oid, exc)
@@ -750,7 +764,7 @@ class OrderManager:
         now_ms = int(time.time() * 1000)
         expiry_ms = 120_000  # 120 seconds
 
-        orders_to_expire = []
+        orders_to_expire: list[tuple[str, str]] = []
         async with self._lock:
             for oid, order in self.orders.items():
                 if order.order_type != OrderType.LIMIT:
@@ -759,11 +773,12 @@ class OrderManager:
                     continue
                 age_ms = now_ms - order.created_at
                 if age_ms >= expiry_ms and order.cumulative_quantity == 0:
-                    orders_to_expire.append(oid)
+                    if order.client_order_id:
+                        orders_to_expire.append((oid, order.client_order_id))
 
-        for oid in orders_to_expire:
+        for oid, client_oid in orders_to_expire:
             try:
-                await self.cancel_order(oid)
+                await self.cancel_order(client_oid)
                 order = self.orders.get(oid)
                 if order:
                     order.status = OrderStatus.EXPIRED
@@ -789,7 +804,7 @@ class OrderManager:
                     continue
                 self.client_order_map.pop(order.client_order_id, None)
                 if order.exchange_order_id:
-                    self.exchange_order_map.pop(order.exchange_order_id, None)
+                    self.exchange_order_map.pop((order.venue, order.exchange_order_id), None)
                 self.pending_orders.pop(oid, None)
                 if order.user_id and order.user_id in self.user_orders:
                     self.user_orders[order.user_id].pop(oid, None)

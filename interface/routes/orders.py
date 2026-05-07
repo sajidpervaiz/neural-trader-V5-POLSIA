@@ -107,8 +107,8 @@ def _to_response(order: Any) -> OrderResponse:
         avg_fill_price=float(order.avg_fill_price),
         status=str(order.status.value).upper(),
         venue=str(order.venue),
-        created_at=int(order.created_at * 1000),
-        updated_at=int(order.updated_at * 1000),
+        created_at=int(order.created_at),
+        updated_at=int(order.updated_at),
     )
 
 
