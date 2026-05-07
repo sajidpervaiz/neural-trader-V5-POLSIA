@@ -395,10 +395,17 @@ class StartupReconciler:
         from execution.order_manager import Order, OrderStatus, OrderSide, OrderType
 
         restored = 0
+        # exchange_order_map is keyed by (venue, exchange_order_id) — that's the
+        # right namespace to dedup against (NOT order_manager.orders, which is
+        # keyed by the bot's internal ord_<uuid> ids generated in place_order).
+        existing_exchange_keys = set(self._order_manager.exchange_order_map.keys())
         for eo in result.exchange_open_orders:
-            order_id = str(eo.get("id", ""))
-            if not order_id or order_id in self._order_manager.orders:
-                continue  # Already tracked or no ID
+            exch_oid = str(eo.get("id", ""))
+            if not exch_oid:
+                continue
+            venue = "binance"
+            if (venue, exch_oid) in existing_exchange_keys:
+                continue  # already tracked
 
             side_str = str(eo.get("side", "buy")).lower()
             type_str = str(eo.get("type", "limit")).lower()
@@ -411,20 +418,25 @@ class StartupReconciler:
             else:
                 order_type = OrderType.LIMIT
 
+            # Synthesize a client_order_id so idempotency / user-stream fill
+            # match logic has a stable internal handle. Prefix marks origin.
+            client_oid = f"recon-{exch_oid}"
             order = Order(
-                order_id=order_id,
-                client_order_id=None,
+                order_id=exch_oid,
+                client_order_id=client_oid,
                 symbol=eo.get("symbol", ""),
                 side=OrderSide.BUY if side_str == "buy" else OrderSide.SELL,
                 order_type=order_type,
                 quantity=float(eo.get("amount", 0)),
                 price=float(eo.get("price", 0) or 0),
                 status=OrderStatus.OPEN,
-                exchange_order_id=order_id,
-                venue="binance",
+                exchange_order_id=exch_oid,
+                venue=venue,
                 reduce_only=bool(eo.get("reduce_only", False)),
             )
-            self._order_manager.orders[order_id] = order
+            self._order_manager.orders[exch_oid] = order
+            self._order_manager.client_order_map[client_oid] = order
+            self._order_manager.exchange_order_map[(venue, exch_oid)] = order
             restored += 1
 
         if restored:
