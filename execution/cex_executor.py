@@ -210,9 +210,18 @@ class CEXExecutor:
         return await self._live_execute(signal, size)
 
     async def _paper_execute_with_pos(self, signal: TradingSignal, size: float, pos: Any) -> OrderResult:
-        """Paper execute with pre-opened position (from approve_and_open)."""
-        slippage = self.config.get_value("backtest", "slippage_pct") or 0.0002
-        fill_price = signal.price * (1 + slippage if signal.is_long else 1 - slippage)
+        """Paper execute with pre-opened position (from approve_and_open).
+
+        Applies BOTH slippage + commission to the fill so paper PnL matches
+        real-world taker costs (~5bps slippage + 5bps Binance USDM taker fee
+        per side ≈ 20bps round-trip). Without the commission, paper-mode
+        backtests showed fictional profits on strategies that lose money live.
+        """
+        bt = self.config.get_value("backtest") or {}
+        slippage = float(bt.get("slippage_pct", 0.0002))
+        commission = float(bt.get("commission_pct", 0.0005))  # taker default
+        cost = slippage + commission
+        fill_price = signal.price * (1 + cost if signal.is_long else 1 - cost)
         result = OrderResult(
             order_id=f"paper_{int(time.time()*1000)}",
             exchange=signal.exchange,
@@ -230,8 +239,11 @@ class CEXExecutor:
         return result
 
     async def _paper_execute(self, signal: TradingSignal, size: float) -> OrderResult:
-        slippage = self.config.get_value("backtest", "slippage_pct") or 0.0002
-        fill_price = signal.price * (1 + slippage if signal.is_long else 1 - slippage)
+        bt = self.config.get_value("backtest") or {}
+        slippage = float(bt.get("slippage_pct", 0.0002))
+        commission = float(bt.get("commission_pct", 0.0005))
+        cost = slippage + commission
+        fill_price = signal.price * (1 + cost if signal.is_long else 1 - cost)
         result = OrderResult(
             order_id=f"paper_{int(time.time()*1000)}",
             exchange=signal.exchange,

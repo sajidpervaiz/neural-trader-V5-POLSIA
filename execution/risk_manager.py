@@ -1245,6 +1245,20 @@ class RiskManager:
             pos = self._positions.pop(key, None)
             if pos is None:
                 return None
+            # Paper-mode realism: charge slippage + commission on exit too.
+            # In live mode the exchange already debits real fees from the
+            # account balance; risk_manager doesn't double-charge there.
+            try:
+                paper_mode = bool(getattr(self.config, "paper_mode", False))
+            except Exception:
+                paper_mode = False
+            if paper_mode:
+                bt = self.config.get_value("backtest") or {}
+                slippage = float(bt.get("slippage_pct", 0.0002))
+                commission = float(bt.get("commission_pct", 0.0005))
+                cost = slippage + commission
+                # Closing a long sells at a worse price; closing a short buys at a worse price.
+                exit_price = exit_price * (1 - cost) if pos.is_long else exit_price * (1 + cost)
             pos.update_price(exit_price)
             pnl_dollar = pos.pnl
             self._equity += pnl_dollar
