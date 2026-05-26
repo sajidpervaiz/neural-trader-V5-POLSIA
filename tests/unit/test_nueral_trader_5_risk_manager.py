@@ -234,6 +234,22 @@ class TestPositionManagement:
         assert "current_drawdown_pct" in snap
         assert snap["kill_switch_active"] is False
 
+    def test_trading_state_reducing_blocks_new_entries(self, risk_manager: RiskManager) -> None:
+        state = risk_manager.set_trading_state("REDUCING", reason="unit_test")
+        assert state["state"] == "REDUCING"
+        assert state["can_open_new_positions"] is False
+        assert state["can_reduce_positions"] is True
+
+        approved, reason, size = risk_manager.approve_signal(_make_signal())
+
+        assert not approved
+        assert size == 0.0
+        assert "trading_state_reducing" in reason
+
+        released = risk_manager.set_trading_state("ACTIVE", reason="unit_test_release")
+        assert released["state"] == "ACTIVE"
+        assert risk_manager.get_risk_snapshot()["can_open_new_positions"] is True
+
 
 class TestIteration1Fixes:
     """Tests for P0/P1 fixes from production readiness iteration."""
@@ -249,12 +265,28 @@ class TestIteration1Fixes:
         size_neg = risk_manager.calculate_position_size(signal)
         assert size_neg == 0.0
 
+    def test_approve_signal_rejects_non_finite_position_size(
+        self,
+        risk_manager: RiskManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """P0: non-finite size must not reach exchange order placement."""
+        signal = _make_signal()
+        monkeypatch.setattr(risk_manager, "calculate_position_size", lambda _: float("inf"))
+
+        approved, reason, size = risk_manager.approve_signal(signal)
+
+        assert approved is False
+        assert reason == "position_size_invalid"
+        assert size == 0.0
+
     async def test_approve_and_open_atomic(self, risk_manager: RiskManager) -> None:
         """P0: approve_and_open atomically approves + opens position under lock."""
         signal = _make_signal()
         approved, reason, size, pos = await risk_manager.approve_and_open(signal)
         assert approved is True
         assert pos is not None
+        assert pos.pending_fill is False
         assert len(risk_manager.positions) == 1
 
         # Second call for same symbol must reject (already in position)
@@ -262,6 +294,80 @@ class TestIteration1Fixes:
         assert approved2 is False
         assert "already_in_position" in reason2
         assert pos2 is None
+
+    async def test_reserved_position_skips_ticks_until_rebased(
+        self,
+        risk_manager: RiskManager,
+    ) -> None:
+        """P0: live reservations must not run SL/TP logic before exchange fill."""
+        signal = _make_signal()
+        approved, _, _, pos = await risk_manager.approve_and_open(
+            signal,
+            reserve_until_fill=True,
+        )
+        assert approved is True
+        assert pos is not None
+        assert pos.pending_fill is True
+
+        signal_entry = pos.entry_price
+        sl_distance = abs(pos.entry_price - pos.stop_loss)
+        tp_distance = abs(pos.take_profit - pos.entry_price)
+
+        await risk_manager.update_prices(signal.exchange, signal.symbol, signal.price * 0.90)
+
+        assert pos.current_price == pytest.approx(signal_entry)
+        assert pos.entry_price == pytest.approx(signal_entry)
+
+        rebased = await risk_manager.rebase_position_to_fill(
+            signal.exchange,
+            signal.symbol,
+            fill_price=50_100.0,
+            filled_quantity=0.25,
+        )
+
+        assert rebased is pos
+        assert pos.pending_fill is False
+        assert pos.entry_price == pytest.approx(50_100.0)
+        assert pos.current_price == pytest.approx(50_100.0)
+        assert pos.size == pytest.approx(0.25)
+        assert pos.stop_loss == pytest.approx(50_100.0 - sl_distance)
+        assert pos.take_profit == pytest.approx(50_100.0 + tp_distance)
+
+        await risk_manager.update_prices(signal.exchange, signal.symbol, 50_125.0)
+
+        assert pos.current_price == pytest.approx(50_125.0)
+
+    async def test_cancel_reserved_position_removes_only_pending_reservations(
+        self,
+        risk_manager: RiskManager,
+    ) -> None:
+        signal = _make_signal()
+        approved, _, _, pos = await risk_manager.approve_and_open(
+            signal,
+            reserve_until_fill=True,
+        )
+        assert approved is True
+        assert pos is not None
+        equity_before = risk_manager.equity
+
+        cancelled = await risk_manager.cancel_reserved_position(
+            signal.exchange,
+            signal.symbol,
+        )
+
+        assert cancelled is pos
+        assert len(risk_manager.positions) == 0
+        assert risk_manager.equity == pytest.approx(equity_before)
+        assert risk_manager._closed_trades == []
+
+        approved2, _, _, active_pos = await risk_manager.approve_and_open(signal)
+        assert approved2 is True
+        assert active_pos is not None
+        refused = await risk_manager.cancel_reserved_position(signal.exchange, signal.symbol)
+
+        assert refused is None
+        assert len(risk_manager.positions) == 1
+        assert risk_manager.positions[f"{signal.exchange}:{signal.symbol}"] is active_pos
 
     async def test_negative_equity_trips_kill_switch(self, risk_manager: RiskManager) -> None:
         """P0: equity going to zero or negative must activate kill switch."""
@@ -591,6 +697,40 @@ class TestIteration2Fixes:
         body = resp.json()
         assert body["success"] is False
         assert "size" in body["error"].lower()
+
+    def test_api_trade_rejects_live_manual_orders_by_default(self) -> None:
+        """P0: dashboard manual live trades must fail closed unless explicitly enabled."""
+        from interface.dashboard_api import build_app
+        from fastapi.testclient import TestClient
+
+        config = MagicMock(spec=Config)
+        config.paper_mode = False
+
+        def _get_value(*keys, default=None):
+            if keys == ("monitoring", "dashboard_api"):
+                return {"auth": {"require_api_key": False, "allow_unauthenticated_non_paper": True}}
+            return default
+
+        config.get_value.side_effect = _get_value
+        bus = EventBus()
+        rm = RiskManager(config, bus)
+        fake_client = MagicMock()
+        fake_exec = MagicMock(exchange_id="binance")
+        fake_exec._client = fake_client
+        fake_exec._rate_limiter = None
+
+        app = build_app(config, bus, risk_manager=rm, executors=[fake_exec])
+        client = TestClient(app)
+        resp = client.post("/api/trade", json={
+            "symbol": "BTC/USDT:USDT",
+            "side": "BUY",
+            "size": 0.01,
+            "order_type": "market",
+        })
+        body = resp.json()
+        assert body["success"] is False
+        assert "manual live trading is disabled" in body["error"].lower()
+        fake_client.create_market_order.assert_not_called()
 
     def test_validator_updates_last_price_on_rejection(self) -> None:
         """P1: TickValidator must update last_price on rejection to prevent permanent blindness."""

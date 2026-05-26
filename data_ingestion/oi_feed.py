@@ -8,6 +8,8 @@ from typing import Any
 import aiohttp
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 
@@ -143,7 +145,8 @@ class OpenInterestFeed:
                 await self.event_bus.publish("OPEN_INTEREST", all_results)
                 logger.debug("Fetched OI for {} instruments", len(all_results))
             except Exception as exc:
-                logger.exception("OI feed error: {}", exc)
+                logger.error("OI feed error: {}", sanitize_exception(exc))
+                logger.opt(exception=True).debug("OI feed stack trace")
             await asyncio.sleep(interval)
 
     async def stop(self) -> None:

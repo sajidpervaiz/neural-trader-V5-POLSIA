@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import hmac
 import json
 import os
@@ -13,8 +14,10 @@ from typing import Any
 
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 try:
-    from fastapi import FastAPI, Query, Request
+    from fastapi import FastAPI, HTTPException, Query, Request
     from fastapi.responses import JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.staticfiles import StaticFiles
@@ -30,6 +33,7 @@ from pathlib import Path
 
 from core.config import Config
 from core.event_bus import EventBus
+from execution.executor_contract import executor_contract_status
 from interface.routes.config import router as config_router, configure_config_routes
 from interface.routes.orders import router as orders_router, configure_order_routes
 from interface.routes.positions import router as positions_router, configure_positions_routes
@@ -139,6 +143,44 @@ def _validate_timeframe(timeframe: str) -> str:
     return timeframe
 
 
+def _redact_config_value(value: Any) -> Any:
+    """Return a stable JSON-safe config object with secrets removed before hashing."""
+    secret_tokens = ("key", "secret", "password", "token", "passphrase", "private")
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if any(token in str(key).lower() for token in secret_tokens):
+                redacted[str(key)] = "***"
+            else:
+                redacted[str(key)] = _redact_config_value(item)
+        return redacted
+    if isinstance(value, (list, tuple)):
+        return [_redact_config_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _config_hash(config: Config) -> str:
+    """Compute a deterministic redacted config fingerprint for audit/readiness."""
+    snapshot: dict[str, Any] = {"paper_mode": bool(getattr(config, "paper_mode", True))}
+    for section in (
+        "system",
+        "exchanges",
+        "storage",
+        "monitoring",
+        "risk",
+        "signals",
+        "auto_trading",
+    ):
+        try:
+            snapshot[section] = config.get_value(section, default={}) or {}
+        except Exception:
+            snapshot[section] = {}
+    payload = json.dumps(_redact_config_value(snapshot), sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def build_app(
     config: Config,
     event_bus: EventBus,
@@ -163,6 +205,7 @@ def build_app(
     audit_repo: Any = None,
     metrics: Any = None,
     geopolitical_feed: Any = None,
+    market_data_integrity: Any = None,
 ) -> Any:
     if not _FASTAPI:
         return None
@@ -173,6 +216,11 @@ def build_app(
         version="4.0.0",
     )
     app.state.started_at = int(time.time())
+    app.state.config_hash = _config_hash(config)
+    app.state.order_manager = order_manager
+    app.state.risk_manager = risk_manager
+    app.state.data_manager = data_manager
+    app.state.market_data_integrity = market_data_integrity
     static_dir = Path(__file__).resolve().parent / "static"
     static_index = static_dir / "index.html"
 
@@ -202,13 +250,9 @@ def build_app(
         )
     # /health leaks equity/positions/kill-switch state — gate it like everything else.
     # /livez is a plain liveness probe, safe to expose.
-    exempt_paths = {
-        "/",
-        "/livez",
-        "/docs",
-        "/openapi.json",
-        "/redoc",
-    }
+    exempt_paths = {"/", "/livez"}
+    if config.paper_mode:
+        exempt_paths.update({"/docs", "/openapi.json", "/redoc"})
 
     # LRU-bounded in-memory limiter — prevents unbounded growth from unique-IP floods.
     _MAX_RL_IPS = 10_000
@@ -222,13 +266,107 @@ def build_app(
                 return chain[-trusted_proxy_hops]
         return request.client.host if request.client else "unknown"
 
+    def _risk_kill_switch_active() -> bool:
+        """Return the canonical kill-switch state across RiskManager variants."""
+        if risk_manager is None:
+            return True
+        for attr in ("kill_switch_active", "killed"):
+            value = getattr(risk_manager, attr, None)
+            if isinstance(value, bool):
+                return value
+        try:
+            snap = risk_manager.get_risk_snapshot()
+            if isinstance(snap, dict):
+                return bool(snap.get("kill_switch_active", False))
+        except Exception:
+            logger.warning("Unable to read risk-manager kill-switch state; failing closed")
+            return True
+        return False
+
+    def _live_readiness_blockers_for_activation() -> list[str]:
+        """Fail-closed live activation gate shared by every auto-enable path."""
+        if config.paper_mode:
+            return []
+        blockers: list[str] = []
+        if not bool(getattr(db_handler, "available", False)):
+            blockers.append("audit_db")
+        if require_api_key and not api_key:
+            blockers.append("dashboard_auth")
+        exchange_count = 0
+        live_clients = 0
+        for ex in executors or []:
+            exchange_count += 1
+            client = getattr(ex, "_client", None)
+            markets = getattr(client, "markets", None) if client is not None else None
+            if client is not None and markets:
+                live_clients += 1
+        if exchange_count <= 0 or live_clients != exchange_count:
+            blockers.append("exchange")
+        if risk_manager is None or _risk_kill_switch_active():
+            blockers.append("risk")
+        if user_stream is None or not bool(getattr(user_stream, "connected", False)):
+            blockers.append("user_stream")
+        if reconciliation_result is None:
+            blockers.append("reconciliation")
+        else:
+            recon_mismatches = list(getattr(reconciliation_result, "mismatches", []) or [])
+            recon_positions_without_sl = list(getattr(reconciliation_result, "positions_without_sl", []) or [])
+            if (
+                not bool(getattr(reconciliation_result, "success", False))
+                or bool(getattr(reconciliation_result, "safe_mode", False))
+                or recon_mismatches
+                or recon_positions_without_sl
+            ):
+                blockers.append("reconciliation")
+        return blockers
+
+    def _require_live_auto_activation_allowed(body: dict[str, Any]) -> None:
+        """Block every live auto-trading activation unless readiness and typed confirmation are clean."""
+        if config.paper_mode:
+            return
+        blockers = _live_readiness_blockers_for_activation()
+        if blockers:
+            raise HTTPException(
+                status_code=423,
+                detail={"error": "live_readiness_blocked", "blockers": blockers},
+            )
+        confirmation = str(body.get("confirm_live_auto_trading", "") or "").strip()
+        if confirmation != "ENABLE LIVE AUTO TRADING":
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "typed_confirmation_required", "required": "ENABLE LIVE AUTO TRADING"},
+            )
+
     @app.middleware("http")
     async def api_guard(request: Request, call_next):
         path = request.url.path
-        if path in exempt_paths:
+        if path in exempt_paths or path.startswith("/static/"):
             return await call_next(request)
 
-        if rate_limit_per_min > 0:
+        authenticated = False
+        if require_api_key:
+            if not api_key:
+                return JSONResponse(status_code=503, content={"detail": "api_auth_misconfigured"})
+            provided = request.headers.get("x-api-key") or ""
+            if not provided and path == "/api/realtime/stream":
+                # Browser EventSource cannot send custom headers. Permit the
+                # dashboard to pass the same API key as a query parameter for
+                # this SSE endpoint only; all normal fetch/XHR calls continue
+                # to use X-API-Key / Authorization headers.
+                provided = request.query_params.get("api_key", "") or ""
+            if not provided:
+                auth_header = request.headers.get("authorization", "") or ""
+                if auth_header.lower().startswith("bearer "):
+                    provided = auth_header[7:].strip()
+            if not hmac.compare_digest(provided.encode("utf-8"), api_key.encode("utf-8")):
+                return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+            authenticated = True
+
+        # Do not throttle the authenticated operator UI against itself.  The
+        # dashboard performs many parallel polling calls on load; counting those
+        # before auth made the secured browser UI degrade into 429s and stale
+        # zeros.  Unauthenticated/open deployments remain IP-rate-limited.
+        if rate_limit_per_min > 0 and not authenticated:
             ip = _client_ip(request)
             now = int(time.time())
             state = ip_rate_state.get(ip) or {"window_start": now, "count": 0}
@@ -243,17 +381,6 @@ def build_app(
             if state["count"] > rate_limit_per_min:
                 return JSONResponse(status_code=429, content={"detail": "rate_limit_exceeded"})
 
-        if require_api_key:
-            if not api_key:
-                return JSONResponse(status_code=503, content={"detail": "api_auth_misconfigured"})
-            provided = request.headers.get("x-api-key") or ""
-            if not provided:
-                auth_header = request.headers.get("authorization", "") or ""
-                if auth_header.lower().startswith("bearer "):
-                    provided = auth_header[7:].strip()
-            if not hmac.compare_digest(provided.encode("utf-8"), api_key.encode("utf-8")):
-                return JSONResponse(status_code=401, content={"detail": "unauthorized"})
-
         return await call_next(request)
 
     app.add_middleware(
@@ -266,9 +393,9 @@ def build_app(
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-    configure_order_routes(order_manager)
+    configure_order_routes(order_manager, config=config, risk_manager=risk_manager, db_handler=db_handler)
     configure_risk_routes(risk_manager)
-    configure_positions_routes(risk_manager)
+    configure_positions_routes(risk_manager, config=config, db_handler=db_handler)
     configure_config_routes(config, risk_manager, order_manager, executors=executors)
     # Mount existing routers under /api prefix so UI /api/* calls work
     app.include_router(config_router, prefix="/api")
@@ -342,7 +469,8 @@ def build_app(
                     "daily_loss": getattr(rm, "daily_loss", 0.0),
                 }
             except Exception as exc:
-                logger.exception("health: risk snapshot failed")
+                logger.error("health: risk snapshot failed: {}", sanitize_exception(exc))
+                logger.opt(exception=True).debug("health: risk snapshot stack trace")
                 result["risk"] = {"error": "unavailable"}
                 component_errors.append(f"risk:{type(exc).__name__}")
 
@@ -357,7 +485,8 @@ def build_app(
                     "reasons": [r["reason"] for r in status.get("active_reasons", [])],
                 }
         except Exception as exc:
-            logger.exception("health: safe_mode status failed")
+            logger.error("health: safe_mode status failed: {}", sanitize_exception(exc))
+            logger.opt(exception=True).debug("health: safe_mode status stack trace")
             component_errors.append(f"safe_mode:{type(exc).__name__}")
 
         # Alert manager
@@ -367,7 +496,8 @@ def build_app(
             if am is not None and isinstance(am, AlertManager):
                 result["alerts"] = am.get_status()
         except Exception as exc:
-            logger.exception("health: alert_manager status failed")
+            logger.error("health: alert_manager status failed: {}", sanitize_exception(exc))
+            logger.opt(exception=True).debug("health: alert_manager status stack trace")
             component_errors.append(f"alerts:{type(exc).__name__}")
 
         # Component health (if a HealthChecker is attached)
@@ -386,7 +516,8 @@ def build_app(
                     for name, comp in hcr.components.items()
                 }
         except Exception as exc:
-            logger.exception("health: component checker failed")
+            logger.error("health: component checker failed: {}", sanitize_exception(exc))
+            logger.opt(exception=True).debug("health: component checker stack trace")
             component_errors.append(f"components:{type(exc).__name__}")
 
         if component_errors:
@@ -435,7 +566,17 @@ def build_app(
 
     @app.get("/features")
     async def features_status() -> dict[str, Any]:
-        dex_config = config.get_value("dex") or {}
+        dex_config = config.get_value("dex", default={}) or {}
+        macro_config = config.get_value("macro", default={}) or {}
+        ts_dex_config = config.get_value("ts_dex_layer", default={}) or {}
+        funding_cfg = macro_config.get("funding_rates", {}) if isinstance(macro_config, dict) else {}
+        oi_cfg = macro_config.get("open_interest", {}) if isinstance(macro_config, dict) else {}
+        vix_cfg = macro_config.get("vix_proxy", {}) if isinstance(macro_config, dict) else {}
+        ts_dex_enabled = (
+            bool(ts_dex_config.get("enabled", False))
+            if isinstance(ts_dex_config, dict)
+            else bool(ts_dex_config)
+        )
         return {
             "enabled": {
                 "cex_trading": True,
@@ -444,10 +585,10 @@ def build_app(
                 "sushiswap": dex_config.get("sushiswap", {}).get("enabled", False),
                 "pancakeswap": dex_config.get("pancakeswap", {}).get("enabled", False),
                 "dydx": dex_config.get("dydx", {}).get("enabled", False),
-                "ts_dex_layer": config.get_value("ts_dex_layer", "enabled", False),
-                "funding_rates": config.get_value("macro", "funding_rates", {}).get("enabled", False),
-                "open_interest": config.get_value("macro", "open_interest", {}).get("enabled", False),
-                "vix_proxy": config.get_value("macro", "vix_proxy", {}).get("enabled", False),
+                "ts_dex_layer": ts_dex_enabled,
+                "funding_rates": funding_cfg.get("enabled", False) if isinstance(funding_cfg, dict) else False,
+                "open_interest": oi_cfg.get("enabled", False) if isinstance(oi_cfg, dict) else False,
+                "vix_proxy": vix_cfg.get("enabled", False) if isinstance(vix_cfg, dict) else False,
             },
             "chains": ["ethereum", "bsc", "arbitrum", "dydx_chain"] if dex_config.get("enabled") else [],
             "protocols": ["uniswap_v3", "sushiswap", "pancakeswap_v3", "dydx_perpetuals"],
@@ -617,9 +758,19 @@ def build_app(
         }
 
     @app.post("/v1/kill/deactivate")
-    async def kill_switch_deactivate() -> dict[str, Any]:
+    async def kill_switch_deactivate(request: Request) -> dict[str, Any]:
         if risk_manager is None:
             return {"success": False, "error": "risk_manager not available"}
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not config.paper_mode:
+            if str(body.get("confirmation", "")).strip() != "DEACTIVATE KILL SWITCH":
+                return {"success": False, "error": "typed confirmation required: DEACTIVATE KILL SWITCH"}
+            if not bool(getattr(db_handler, "available", False)):
+                return {"success": False, "error": "cannot deactivate kill switch: audit DB unavailable"}
         risk_manager.deactivate_kill_switch()
         return {"success": True, "kill_switch_active": False}
 
@@ -731,7 +882,7 @@ def build_app(
             symbol = _validate_symbol(symbol)
             timeframe = _validate_timeframe(timeframe)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
         lookback = max(20, min(int(lookback), 500))
 
         df = None
@@ -821,7 +972,7 @@ def build_app(
             symbol = _validate_symbol(symbol)
             timeframe = _validate_timeframe(timeframe)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
 
         # Build all symbol variants to try
         clean_sym = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -1152,7 +1303,12 @@ def build_app(
     @app.get("/api/latency")
     async def api_latency() -> dict[str, Any]:
         """REQ-MON-002: latency stats with p50/p95/p99 percentiles."""
-        stats: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
+        stats: dict[str, Any] = {
+            "feed_lag": {},
+            "order_latency": {},
+            "decision_latency": {},
+            "pipeline_latency": {},
+        }
         if metrics and hasattr(metrics, "get_latency_stats"):
             stats = metrics.get_latency_stats()
         return stats
@@ -1162,7 +1318,7 @@ def build_app(
         """Compact p50/p95/p99 payload for the dashboard chip strip."""
         if metrics and hasattr(metrics, "get_latency_percentiles"):
             return metrics.get_latency_percentiles()
-        return {"feed_lag": {}, "order_latency": {}}
+        return {"feed_lag": {}, "order_latency": {}, "decision_latency": {}, "pipeline_latency": {}}
 
     # ── /api/trade-history — closed trades + realized PnL ─────────────────
     @app.get("/api/trade-history")
@@ -1295,7 +1451,7 @@ def build_app(
         try:
             symbol = _validate_symbol(symbol)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
         depth = max(1, min(depth, 50))
         # Check event-bus cache first
         for key, cached in _orderbook_cache.items():
@@ -1440,7 +1596,7 @@ def build_app(
             }
         except Exception as exc:
             logger.debug("Variational status error: {}", exc)
-            return {"enabled": True, "connected": False, "error": str(exc), "positions": [], "portfolio": {}}
+            return {"enabled": True, "connected": False, "error": sanitize_exception(exc), "positions": [], "portfolio": {}}
 
     # ── /api/news — live news feed ────────────────────────────────────────
     @app.get("/api/news")
@@ -1505,7 +1661,7 @@ def build_app(
         try:
             stats = geopolitical_feed.stats()
         except Exception as exc:
-            return {"available": False, "error": str(exc)}
+            return {"available": False, "error": sanitize_exception(exc)}
 
         # Strategy module exposes static config used by the dashboard's Geo tab
         # so the user can verify which keywords/feeds/hours the bot is actually
@@ -1647,7 +1803,7 @@ def build_app(
             symbol = _validate_symbol(symbol)
             timeframe = _validate_timeframe(timeframe)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
         df = None
         if data_manager is not None:
             clean = symbol.replace("/", "").replace(":USDT", "").upper()
@@ -1684,7 +1840,7 @@ def build_app(
             symbol = _validate_symbol(symbol)
             timeframe = _validate_timeframe(timeframe)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
         lookback = max(5, min(int(lookback), 200))
         df = None
         if data_manager is not None:
@@ -1729,7 +1885,7 @@ def build_app(
         try:
             symbol = _validate_symbol(symbol)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
         if signal_generator is None or not hasattr(signal_generator, "_orderbook_scorer"):
             return {"available": False, "reason": "orderbook_scorer not wired"}
         scorer = signal_generator._orderbook_scorer
@@ -1795,7 +1951,7 @@ def build_app(
         try:
             trace = await audit_repo.load_trace_by_correlation_id(correlation_id)
         except Exception as exc:
-            return {"available": False, "error": str(exc)}
+            return {"available": False, "error": sanitize_exception(exc)}
         # Surface counts for quick rendering.
         counts = {k: len(v) for k, v in trace.items()}
         total = sum(counts.values())
@@ -1893,7 +2049,1014 @@ def build_app(
     async def api_logs_recent() -> dict[str, Any]:
         return {"logs": list(_log_buffer)[-50:][::-1]}
 
+    def _resolve_paper_fill_price(symbol: str, fallback_price: float | None = None) -> float:
+        """Resolve a deterministic paper fill price from in-memory market state.
+
+        Never block the dashboard route on a public exchange call while placing a
+        paper order; if cached market/orderbook data is unavailable, fail closed
+        rather than creating an unpriced filled position.
+        """
+        if fallback_price and fallback_price > 0:
+            return float(fallback_price)
+        now = time.time()
+        max_age = 60.0
+        sym_key = symbol.replace("/", "").replace(":", "").replace("-", "").upper()
+        for key, cached in _orderbook_cache.items():
+            cache_ts = float(cached.get("ts", 0) or 0)
+            if cache_ts and (now - cache_ts) > max_age:
+                continue
+            key_norm = key.replace("/", "").replace(":", "").replace("-", "").upper()
+            if sym_key in key_norm or key_norm in sym_key:
+                bids = cached.get("bids") or []
+                asks = cached.get("asks") or []
+                if bids and asks:
+                    return (float(bids[0][0]) + float(asks[0][0])) / 2.0
+                if bids:
+                    return float(bids[0][0])
+                if asks:
+                    return float(asks[0][0])
+        clean = symbol.replace("/", "").replace(":USDT", "").upper()
+        base = clean.replace("USDT", "") if clean.endswith("USDT") else clean
+        if data_manager is not None:
+            for sym_try in (f"{base}/USDT:USDT", symbol, f"{base}/USDT", clean):
+                for tf_try in ("1m", "5m", "15m", "1h"):
+                    try:
+                        df = data_manager.get_dataframe("binance", sym_try, tf_try)
+                    except Exception:
+                        df = None
+                    if df is not None and len(df) > 0:
+                        price = float(df.iloc[-1].get("close", 0) or 0)
+                        if price > 0:
+                            return price
+        market_ts = float(_market_cache.get("ts", 0) or 0)
+        if market_ts and (now - market_ts) <= max_age:
+            for coin in _market_cache.get("coins", []) or []:
+                if str(coin.get("symbol", "")).upper() == base:
+                    price = float(coin.get("price") or 0)
+                    if price > 0:
+                        return price
+        return 0.0
+
     # ── /api/trade — place a trade ────────────────────────────────────────
+    def _default_probe_symbol() -> str:
+        exchanges_cfg = config.get_value("exchanges", default={}) or {}
+        if isinstance(exchanges_cfg, dict):
+            for ex_cfg in exchanges_cfg.values():
+                if isinstance(ex_cfg, dict):
+                    symbols = ex_cfg.get("symbols", []) or []
+                    if symbols:
+                        return str(symbols[0])
+        return "BTC/USDT:USDT"
+
+    @app.get("/api/pipeline/probe/status")
+    async def api_pipeline_probe_status() -> dict[str, Any]:
+        payload = getattr(app.state, "last_pipeline_probe", None)
+        if isinstance(payload, dict):
+            return {"available": True, **payload}
+        return {"available": False, "reason": "probe_not_run"}
+
+    @app.post("/api/pipeline/probe")
+    async def api_pipeline_probe(request: Request) -> dict[str, Any]:
+        """Paper-only dry-run probe for signal -> risk -> executor wiring."""
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        if not config.paper_mode:
+            return {
+                "success": False,
+                "available": True,
+                "error": "pipeline_probe_is_paper_only",
+                "mode": "live",
+            }
+
+        from engine.signal_generator import TradingSignal
+
+        probe_started = time.perf_counter()
+        symbol = str(body.get("symbol") or _default_probe_symbol())
+        direction = str(body.get("direction") or "long").lower()
+        if direction not in {"long", "short"}:
+            direction = "long"
+        price = _resolve_paper_fill_price(symbol, float(body.get("price", 0) or 0) or None)
+        stages: list[dict[str, Any]] = []
+
+        def _stage(name: str, ok: bool, detail: str, **extra: Any) -> None:
+            payload = {"name": name, "ok": bool(ok), "detail": str(detail)}
+            payload.update(extra)
+            stages.append(payload)
+
+        if price <= 0:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "dry_run": True,
+                "symbol": symbol,
+                "error": "paper_probe_price_unavailable",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_probe = result
+            return result
+
+        sl_pct = max(0.001, float(body.get("stop_loss_pct", 1.0) or 1.0) / 100.0)
+        tp_pct = max(sl_pct * 1.5, float(body.get("take_profit_pct", 2.0) or 2.0) / 100.0)
+        stop_loss = price * (1.0 - sl_pct) if direction == "long" else price * (1.0 + sl_pct)
+        take_profit = price * (1.0 + tp_pct) if direction == "long" else price * (1.0 - tp_pct)
+        signal = TradingSignal(
+            exchange="binance",
+            symbol=symbol,
+            direction=direction,
+            score=1.0,
+            technical_score=0.75,
+            ml_score=0.25,
+            sentiment_score=0.0,
+            macro_score=0.0,
+            news_score=0.0,
+            orderbook_score=0.25,
+            regime="paper_probe",
+            regime_confidence=1.0,
+            price=price,
+            atr=max(price * 0.01, 1e-8),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timestamp=int(time.time()),
+            quality_score=100,
+            session_name="paper_probe",
+            metadata={
+                "source": "pipeline_probe",
+                "paper": True,
+                "atr_percentile": 50,
+                "adx": 25,
+            },
+            reasons=["operator_probe"],
+        )
+
+        try:
+            md = await api_market_data_health()
+            md_ok = bool(md.get("healthy", False)) or str(md.get("status", "")).upper() == "OK"
+            _stage("market_data", md_ok, f"{md.get('status', 'unknown')} feeds={md.get('healthy_count', 0)}/{md.get('feed_count', 0)}")
+        except Exception as exc:
+            md_ok = False
+            _stage("market_data", False, sanitize_exception(exc))
+
+        risk_ok = False
+        risk_reason = "risk_manager_unavailable"
+        approved_size = 0.0
+        if risk_manager is not None and not _risk_kill_switch_active():
+            risk_started = time.perf_counter()
+            try:
+                risk_ok, risk_reason, approved_size = risk_manager.approve_signal(signal)
+                if metrics and hasattr(metrics, "record_pipeline_latency"):
+                    metrics.record_pipeline_latency("paper_probe_risk_gate", "binance", symbol, time.perf_counter() - risk_started)
+            except Exception as exc:
+                risk_ok = False
+                risk_reason = sanitize_exception(exc)
+        _stage("risk_gate", risk_ok, risk_reason, approved_size=round(float(approved_size or 0.0), 6))
+
+        paper_execs = [
+            exc for exc in (executors or [])
+            if bool(getattr(exc, "is_paper", False)) or "simulated" in type(exc).__name__.lower()
+        ]
+        contract_details = [
+            executor_contract_status(exc, require_order_controls=True, require_market_data=True)
+            for exc in paper_execs
+        ]
+        executor_ok = bool(paper_execs and all(item.get("contract_ok", False) for item in contract_details))
+        missing = sorted({b for item in contract_details for b in item.get("blockers", [])})
+        detail = f"{len(paper_execs)} paper executor(s)"
+        if missing:
+            detail = f"missing {', '.join(missing)}"
+        _stage("executor_contract", executor_ok, detail, details=contract_details)
+
+        om_ok = order_manager is not None and hasattr(order_manager, "get_stats")
+        om_stats = order_manager.get_stats() if om_ok else {}
+        _stage(
+            "order_manager",
+            om_ok,
+            f"{int(om_stats.get('open_orders', 0) or 0)} open, {int(om_stats.get('filled_orders', 0) or 0)} filled",
+        )
+
+        total_latency = time.perf_counter() - probe_started
+        if metrics and hasattr(metrics, "record_pipeline_latency"):
+            metrics.record_pipeline_latency("paper_probe_total", "binance", symbol, total_latency)
+
+        success = bool(md_ok and risk_ok and executor_ok and om_ok)
+        result = {
+            "success": success,
+            "available": True,
+            "mode": "paper",
+            "dry_run": True,
+            "symbol": symbol,
+            "direction": direction,
+            "price": round(float(price), 8),
+            "approved": bool(risk_ok),
+            "approved_size": round(float(approved_size or 0.0), 6),
+            "risk_reason": risk_reason,
+            "latency_ms": round(total_latency * 1000.0, 3),
+            "stages": stages,
+            "timestamp": int(time.time()),
+        }
+        app.state.last_pipeline_probe = result
+        return result
+
+    @app.get("/api/pipeline/probe/fill/status")
+    async def api_pipeline_fill_probe_status() -> dict[str, Any]:
+        payload = getattr(app.state, "last_pipeline_fill_probe", None)
+        if isinstance(payload, dict):
+            return {"available": True, **payload}
+        return {"available": False, "reason": "fill_probe_not_run"}
+
+    @app.post("/api/pipeline/probe/fill")
+    async def api_pipeline_fill_probe(request: Request) -> dict[str, Any]:
+        """Paper-only entry-fill-close lifecycle probe.
+
+        This intentionally places and closes a simulated paper position so the
+        operator can verify real order-manager fills, risk position state,
+        protective SL/TP fields, SQLite close persistence, and post-close
+        reconciliation without any live exchange client.
+        """
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        if not config.paper_mode:
+            return {
+                "success": False,
+                "available": True,
+                "error": "fill_probe_is_paper_only",
+                "mode": "live",
+            }
+
+        from engine.signal_generator import TradingSignal
+
+        probe_started = time.perf_counter()
+        probe_started_ms = int(time.time() * 1000)
+        stages: list[dict[str, Any]] = []
+
+        def _stage(name: str, ok: bool, detail: str, **extra: Any) -> None:
+            payload = {"name": name, "ok": bool(ok), "detail": str(detail)}
+            payload.update(extra)
+            stages.append(payload)
+
+        paper_execs = [
+            exc for exc in (executors or [])
+            if (
+                bool(getattr(exc, "is_paper", False))
+                or "simulated" in type(exc).__name__.lower()
+            )
+            and hasattr(exc, "execute_signal")
+        ]
+        executor = next((exc for exc in paper_execs if hasattr(exc, "close_position")), None)
+        if executor is None:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "error": "paper_executor_close_contract_unavailable",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_fill_probe = result
+            return result
+
+        exchange_id = str(getattr(executor, "exchange_id", "binance") or "binance").lower()
+        preferred_symbol = str(body.get("symbol") or "").strip()
+        direction = str(body.get("direction") or "long").lower()
+        if direction not in {"long", "short"}:
+            direction = "long"
+
+        symbols: list[str] = []
+        if preferred_symbol:
+            symbols.append(preferred_symbol)
+        else:
+            exchange_cfg = config.get_value("exchanges", exchange_id, default={}) or {}
+            cfg_symbols = exchange_cfg.get("symbols", []) if isinstance(exchange_cfg, dict) else []
+            symbols.extend(str(sym) for sym in (cfg_symbols or []))
+            symbols.append(_default_probe_symbol())
+        seen_symbols: set[str] = set()
+        symbols = [sym for sym in symbols if sym and not (sym in seen_symbols or seen_symbols.add(sym))]
+
+        positions_before = dict(getattr(risk_manager, "positions", {}) or {}) if risk_manager is not None else {}
+
+        def _fill_probe_open_rows(symbol_value: str) -> int:
+            if sqlite_store is None or not hasattr(sqlite_store, "query"):
+                return 0
+            try:
+                rows = sqlite_store.query(
+                    "SELECT COUNT(*) AS n FROM positions WHERE exchange=? AND symbol=? AND close_time_ns IS NULL",
+                    (exchange_id, symbol_value),
+                )
+                return int(rows[0].get("n", 0)) if rows else 0
+            except Exception:
+                return 0
+
+        def _probe_symbol_in_cooldown(symbol_value: str) -> bool:
+            if risk_manager is None:
+                return False
+            last_trade = float((getattr(risk_manager, "_last_trade_time", {}) or {}).get(symbol_value, 0.0) or 0.0)
+            cooldown = float(getattr(risk_manager, "_cooldown_seconds", 0.0) or 0.0)
+            return cooldown > 0 and last_trade > 0 and (time.time() - last_trade) < cooldown
+
+        symbol = ""
+        for candidate in symbols:
+            key = f"{exchange_id}:{candidate}"
+            if (
+                key not in positions_before
+                and _fill_probe_open_rows(candidate) == 0
+                and not _probe_symbol_in_cooldown(candidate)
+            ):
+                symbol = candidate
+                break
+        if not symbol and preferred_symbol:
+            symbol = preferred_symbol
+
+        if not symbol:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "error": "no_available_probe_symbol",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_fill_probe = result
+            return result
+
+        key = f"{exchange_id}:{symbol}"
+        if key in positions_before:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "symbol": symbol,
+                "error": "probe_symbol_already_has_open_position",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_fill_probe = result
+            return result
+
+        price = _resolve_paper_fill_price(symbol, float(body.get("price", 0) or 0) or None)
+        if price <= 0:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "symbol": symbol,
+                "error": "paper_probe_price_unavailable",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_fill_probe = result
+            return result
+
+        sl_pct = max(0.001, float(body.get("stop_loss_pct", 1.0) or 1.0) / 100.0)
+        tp_pct = max(sl_pct * 1.5, float(body.get("take_profit_pct", 2.0) or 2.0) / 100.0)
+        stop_loss = price * (1.0 - sl_pct) if direction == "long" else price * (1.0 + sl_pct)
+        take_profit = price * (1.0 + tp_pct) if direction == "long" else price * (1.0 - tp_pct)
+        signal = TradingSignal(
+            exchange=exchange_id,
+            symbol=symbol,
+            direction=direction,
+            score=1.0,
+            technical_score=0.75,
+            ml_score=0.25,
+            sentiment_score=0.0,
+            macro_score=0.0,
+            news_score=0.0,
+            orderbook_score=0.25,
+            regime="paper_lifecycle_probe",
+            regime_confidence=1.0,
+            price=price,
+            atr=max(price * 0.01, 1e-8),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timestamp=int(time.time() * 1000),
+            quality_score=100,
+            session_name="paper_lifecycle_probe",
+            metadata={
+                "source": "pipeline_fill_probe",
+                "paper": True,
+                "atr_percentile": 50,
+                "adx": 25,
+            },
+            reasons=["operator_lifecycle_probe"],
+        )
+
+        sqlite_closed_before = -1
+        if sqlite_store is not None and hasattr(sqlite_store, "query"):
+            try:
+                rows = sqlite_store.query(
+                    "SELECT COUNT(*) AS n FROM positions WHERE exchange=? AND symbol=? AND close_time_ns IS NOT NULL",
+                    (exchange_id, symbol),
+                )
+                sqlite_closed_before = int(rows[0].get("n", 0)) if rows else 0
+            except Exception:
+                sqlite_closed_before = -1
+
+        try:
+            md = await api_market_data_health()
+            md_ok = bool(md.get("healthy", False)) or str(md.get("status", "")).upper() == "OK"
+            _stage("market_data", md_ok, f"{md.get('status', 'unknown')} feeds={md.get('healthy_count', 0)}/{md.get('feed_count', 0)}")
+        except Exception as exc:
+            md_ok = False
+            _stage("market_data", False, sanitize_exception(exc))
+
+        result_order = None
+        entry_ok = False
+        entry_detail = "not_submitted"
+        if md_ok and risk_manager is not None and not _risk_kill_switch_active():
+            try:
+                result_order = await executor.execute_signal(signal, float(body.get("size", 0) or 0.0))
+                if result_order is None:
+                    entry_detail = "executor_returned_none"
+                else:
+                    entry_detail = str(getattr(result_order, "status", "unknown"))
+                    entry_ok = entry_detail in {"filled", "partially_filled"}
+            except Exception as exc:
+                entry_detail = sanitize_exception(exc)
+        _stage("entry_order", entry_ok, entry_detail)
+
+        if result_order is not None and str(getattr(result_order, "status", "")) == "partially_filled":
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                await asyncio.sleep(0.05)
+                orders_for_symbol = (
+                    order_manager.get_orders_by_symbol(exchange_id, symbol)
+                    if order_manager is not None and hasattr(order_manager, "get_orders_by_symbol")
+                    else []
+                )
+                if any(str(getattr(o.status, "value", o.status)) == "filled" for o in orders_for_symbol):
+                    break
+
+        pos = (getattr(risk_manager, "positions", {}) or {}).get(key) if risk_manager is not None else None
+        position_ok = bool(pos is not None and not bool(getattr(pos, "pending_fill", False)))
+        _stage(
+            "position_open",
+            position_ok,
+            "active" if position_ok else "missing_or_pending",
+            size=round(float(getattr(pos, "size", 0.0) or 0.0), 8) if pos is not None else 0.0,
+        )
+
+        protective_ok = False
+        protective_detail = "position_unavailable"
+        if pos is not None:
+            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            sl = float(getattr(pos, "stop_loss", 0.0) or 0.0)
+            tp = float(getattr(pos, "take_profit", 0.0) or 0.0)
+            if direction == "long":
+                protective_ok = sl > 0 and tp > 0 and sl < entry < tp
+            else:
+                protective_ok = sl > 0 and tp > 0 and tp < entry < sl
+            protective_detail = f"SL={sl:.4f} TP={tp:.4f} entry={entry:.4f}"
+        _stage("protective_bounds", protective_ok, protective_detail)
+
+        close_ok = False
+        close_detail = "not_attempted"
+        close_result = None
+        if position_ok:
+            close_price = float(getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", price) or price)
+            try:
+                close_result = await executor.close_position(
+                    symbol,
+                    close_price,
+                    reason="paper_lifecycle_probe",
+                )
+                close_ok = close_result is not None and str(getattr(close_result, "status", "")) == "closed"
+                close_detail = str(getattr(close_result, "status", "close_failed")) if close_result else "close_failed"
+            except Exception as exc:
+                close_detail = sanitize_exception(exc)
+        _stage("exit_order", close_ok, close_detail)
+
+        positions_after = dict(getattr(risk_manager, "positions", {}) or {}) if risk_manager is not None else {}
+        no_orphan_position = key not in positions_after
+
+        active_probe_orders = []
+        filled_probe_orders = []
+        if order_manager is not None and hasattr(order_manager, "get_orders_by_symbol"):
+            for order in order_manager.get_orders_by_symbol(exchange_id, symbol):
+                created_at = int(getattr(order, "created_at", 0) or 0)
+                if created_at and created_at < probe_started_ms - 1000:
+                    continue
+                status = str(getattr(getattr(order, "status", ""), "value", getattr(order, "status", "")))
+                if status in {"pending", "submitted", "open", "partially_filled"}:
+                    active_probe_orders.append(order)
+                if status == "filled":
+                    filled_probe_orders.append(order)
+        orders_ok = len(filled_probe_orders) >= 2 and not active_probe_orders
+        _stage(
+            "order_manager_lifecycle",
+            orders_ok,
+            f"filled={len(filled_probe_orders)} active={len(active_probe_orders)}",
+        )
+
+        sqlite_ok = False
+        sqlite_detail = "sqlite_store_unavailable"
+        if sqlite_closed_before >= 0 and sqlite_store is not None and hasattr(sqlite_store, "query"):
+            try:
+                rows = sqlite_store.query(
+                    "SELECT COUNT(*) AS n FROM positions WHERE exchange=? AND symbol=? AND close_time_ns IS NOT NULL",
+                    (exchange_id, symbol),
+                )
+                sqlite_closed_after = int(rows[0].get("n", 0)) if rows else sqlite_closed_before
+                sqlite_ok = sqlite_closed_after > sqlite_closed_before
+                sqlite_detail = f"closed_rows_delta={sqlite_closed_after - sqlite_closed_before}"
+            except Exception as exc:
+                sqlite_ok = False
+                sqlite_detail = sanitize_exception(exc)
+        _stage("sqlite_close_audit", sqlite_ok, sqlite_detail)
+
+        recon_ok = bool(no_orphan_position and orders_ok)
+        _stage(
+            "post_close_reconciliation",
+            recon_ok,
+            f"orphan_position={not no_orphan_position} active_orders={len(active_probe_orders)}",
+        )
+
+        if not no_orphan_position and risk_manager is not None:
+            try:
+                await risk_manager.close_position(exchange_id, symbol, price)
+            except Exception:
+                pass
+
+        total_latency = time.perf_counter() - probe_started
+        if metrics and hasattr(metrics, "record_pipeline_latency"):
+            metrics.record_pipeline_latency("paper_fill_probe_total", exchange_id, symbol, total_latency)
+        _exchange_cache.pop("positions", None)
+        _exchange_cache.pop("orders", None)
+
+        success = all(bool(stage.get("ok")) for stage in stages)
+        result = {
+            "success": success,
+            "available": True,
+            "mode": "paper",
+            "dry_run": False,
+            "symbol": symbol,
+            "exchange": exchange_id,
+            "direction": direction,
+            "entry_order_id": str(getattr(result_order, "order_id", "")) if result_order is not None else "",
+            "exit_order_id": str(getattr(close_result, "order_id", "")) if close_result is not None else "",
+            "entry_price": round(float(getattr(result_order, "price", price) or price), 8) if result_order is not None else round(float(price), 8),
+            "exit_price": round(float(getattr(close_result, "price", 0.0) or 0.0), 8) if close_result is not None else 0.0,
+            "latency_ms": round(total_latency * 1000.0, 3),
+            "stages": stages,
+            "timestamp": int(time.time()),
+        }
+        app.state.last_pipeline_fill_probe = result
+        return result
+
+    def _risk_position_db_ids() -> dict[str, int]:
+        result: dict[str, int] = {}
+        positions = getattr(risk_manager, "positions", {}) or {}
+        if not isinstance(positions, dict):
+            return result
+        for key, pos in positions.items():
+            db_id = getattr(pos, "_db_id", None)
+            if db_id is not None:
+                try:
+                    result[str(key)] = int(db_id)
+                except Exception:
+                    pass
+        return result
+
+    def _build_recovery_ledger_audit() -> dict[str, Any]:
+        if sqlite_store is None or not hasattr(sqlite_store, "query"):
+            return {"available": False, "reason": "sqlite_store_unavailable"}
+
+        rows = sqlite_store.query(
+            "SELECT * FROM positions WHERE close_time_ns IS NULL "
+            "ORDER BY exchange, symbol, direction, open_time_ns, id"
+        )
+        mem_positions = getattr(risk_manager, "positions", {}) or {}
+        if not isinstance(mem_positions, dict):
+            mem_positions = {}
+        mem_db_ids = _risk_position_db_ids()
+        groups: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            exchange = str(row.get("exchange", "") or "").lower()
+            symbol = str(row.get("symbol", "") or "")
+            direction = str(row.get("direction", "") or "").lower()
+            key = f"{exchange}:{symbol}"
+            group_key = f"{exchange}:{symbol}:{direction}"
+            group = groups.setdefault(group_key, {
+                "key": group_key,
+                "risk_key": key,
+                "exchange": exchange,
+                "symbol": symbol,
+                "direction": direction,
+                "in_memory": key in mem_positions,
+                "canonical_id": None,
+                "rows": [],
+                "duplicate_ids": [],
+                "orphan": False,
+            })
+            row_payload = {
+                "id": int(row.get("id", 0) or 0),
+                "exchange": exchange,
+                "symbol": symbol,
+                "direction": direction,
+                "entry_price": float(row.get("entry_price", 0.0) or 0.0),
+                "size": float(row.get("size", 0.0) or 0.0),
+                "open_time_ns": int(row.get("open_time_ns", 0) or 0),
+                "is_paper": bool(int(row.get("is_paper", 0) or 0)),
+            }
+            group["rows"].append(row_payload)
+
+        duplicate_ids: list[int] = []
+        duplicate_groups: list[dict[str, Any]] = []
+        orphan_groups: list[dict[str, Any]] = []
+        for group in groups.values():
+            rows_for_group = list(group.get("rows", []) or [])
+            risk_key = str(group.get("risk_key", ""))
+            mem_db_id = mem_db_ids.get(risk_key)
+            row_ids = [int(r.get("id", 0) or 0) for r in rows_for_group]
+            canonical_id = mem_db_id if mem_db_id in row_ids else (row_ids[0] if row_ids else None)
+            group["canonical_id"] = canonical_id
+            safe_duplicate_ids = [
+                int(r.get("id", 0) or 0)
+                for r in rows_for_group
+                if int(r.get("id", 0) or 0) != canonical_id and bool(r.get("is_paper", False))
+            ]
+            group["duplicate_ids"] = safe_duplicate_ids
+            duplicate_ids.extend(safe_duplicate_ids)
+            if len(rows_for_group) > 1:
+                duplicate_groups.append(group)
+            if not bool(group.get("in_memory", False)):
+                group["orphan"] = True
+                orphan_groups.append(group)
+
+        phantom_positions = [
+            {"key": str(key), "db_id": mem_db_ids.get(str(key))}
+            for key in mem_positions.keys()
+            if str(key) not in {str(g.get("risk_key")) for g in groups.values()}
+        ]
+        return {
+            "available": True,
+            "mode": "paper" if config.paper_mode else "live",
+            "paper_only_cleanup": True,
+            "open_rows": len(rows),
+            "in_memory_open_positions": len(mem_positions),
+            "groups": list(groups.values()),
+            "duplicate_groups": duplicate_groups,
+            "duplicate_ids": duplicate_ids,
+            "duplicate_count": len(duplicate_ids),
+            "orphan_groups": orphan_groups,
+            "orphan_count": len(orphan_groups),
+            "phantom_positions": phantom_positions,
+            "phantom_count": len(phantom_positions),
+            "status": "WARN" if duplicate_ids or orphan_groups or phantom_positions else "PASS",
+            "timestamp": int(time.time()),
+        }
+
+    @app.get("/api/recovery/status")
+    async def api_recovery_status() -> dict[str, Any]:
+        status: dict[str, Any] = {}
+        if risk_manager is not None and hasattr(risk_manager, "get_startup_recovery_status"):
+            try:
+                status = risk_manager.get_startup_recovery_status()
+            except Exception as exc:
+                status = {"source": "sqlite", "success": False, "error": sanitize_exception(exc)}
+        elif hasattr(app.state, "sqlite_recovery_result"):
+            status = dict(getattr(app.state, "sqlite_recovery_result") or {})
+        else:
+            status = {"source": "sqlite", "success": True, "attempted": 0, "restored": 0}
+
+        ledger = _build_recovery_ledger_audit()
+        sqlite_open_count = 0
+        if sqlite_store is not None and hasattr(sqlite_store, "query"):
+            try:
+                rows = sqlite_store.query("SELECT COUNT(*) AS n FROM positions WHERE close_time_ns IS NULL")
+                sqlite_open_count = int(rows[0].get("n", 0)) if rows else 0
+            except Exception:
+                sqlite_open_count = -1
+        status["sqlite_open_positions"] = sqlite_open_count
+        status["in_memory_open_positions"] = len(getattr(risk_manager, "positions", {}) or {}) if risk_manager is not None else 0
+        status["ledger"] = ledger
+        return status
+
+    @app.get("/api/recovery/ledger")
+    async def api_recovery_ledger() -> dict[str, Any]:
+        return _build_recovery_ledger_audit()
+
+    @app.post("/api/recovery/ledger/archive-duplicates")
+    async def api_archive_duplicate_ledger_rows(request: Request) -> dict[str, Any]:
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        if not config.paper_mode:
+            return {"success": False, "mode": "live", "error": "paper_only_cleanup"}
+        if sqlite_store is None or not hasattr(sqlite_store, "archive_paper_open_position"):
+            return {"success": False, "mode": "paper", "error": "sqlite_archive_unavailable"}
+
+        audit_before = _build_recovery_ledger_audit()
+        allowed_ids = {int(i) for i in audit_before.get("duplicate_ids", []) or []}
+        requested_ids = body.get("ids")
+        if isinstance(requested_ids, list) and requested_ids:
+            try:
+                target_ids = {int(i) for i in requested_ids}
+            except Exception:
+                return {"success": False, "mode": "paper", "error": "invalid_ids"}
+            disallowed = sorted(target_ids - allowed_ids)
+            if disallowed:
+                return {
+                    "success": False,
+                    "mode": "paper",
+                    "error": "ids_not_safe_duplicates",
+                    "disallowed_ids": disallowed,
+                    "allowed_ids": sorted(allowed_ids),
+                }
+            archive_ids = sorted(target_ids)
+        else:
+            archive_ids = sorted(allowed_ids)
+
+        if not archive_ids:
+            return {
+                "success": True,
+                "mode": "paper",
+                "archived": 0,
+                "results": [],
+                "ledger": audit_before,
+            }
+
+        results = []
+        for pos_id in archive_ids:
+            results.append(sqlite_store.archive_paper_open_position(
+                pos_id,
+                reason=str(body.get("reason", "dashboard_duplicate_cleanup") or "dashboard_duplicate_cleanup"),
+            ))
+
+        audit_after = _build_recovery_ledger_audit()
+        try:
+            if hasattr(app.state, "last_pipeline_fill_probe"):
+                app.state.last_pipeline_fill_probe = None
+        except Exception:
+            pass
+        return {
+            "success": all(bool(r.get("success")) for r in results),
+            "mode": "paper",
+            "archived": sum(1 for r in results if r.get("success")),
+            "results": results,
+            "ledger": audit_after,
+        }
+
+    @app.post("/api/pipeline/probe/recovery")
+    async def api_pipeline_recovery_probe(request: Request) -> dict[str, Any]:
+        """Paper-only cold-start recovery drill using the SQLite position ledger."""
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        if not config.paper_mode:
+            return {
+                "success": False,
+                "available": True,
+                "mode": "live",
+                "error": "recovery_probe_is_paper_only",
+            }
+        if sqlite_store is None or not hasattr(sqlite_store, "query"):
+            return {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "error": "sqlite_store_unavailable",
+            }
+
+        from engine.signal_generator import TradingSignal
+        from execution.risk_manager import RiskManager
+
+        started = time.perf_counter()
+        stages: list[dict[str, Any]] = []
+
+        def _stage(name: str, ok: bool, detail: str, **extra: Any) -> None:
+            payload = {"name": name, "ok": bool(ok), "detail": str(detail)}
+            payload.update(extra)
+            stages.append(payload)
+
+        paper_execs = [
+            exc for exc in (executors or [])
+            if (
+                bool(getattr(exc, "is_paper", False))
+                or "simulated" in type(exc).__name__.lower()
+            )
+            and hasattr(exc, "execute_signal")
+            and hasattr(exc, "close_position")
+        ]
+        executor = paper_execs[0] if paper_execs else None
+        if executor is None:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "error": "paper_executor_close_contract_unavailable",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_recovery_probe = result
+            return result
+
+        exchange_id = str(getattr(executor, "exchange_id", "binance") or "binance").lower()
+        direction = str(body.get("direction") or "long").lower()
+        if direction not in {"long", "short"}:
+            direction = "long"
+
+        preferred_symbol = str(body.get("symbol") or "").strip()
+        symbols: list[str] = [preferred_symbol] if preferred_symbol else []
+        if not symbols:
+            exchange_cfg = config.get_value("exchanges", exchange_id, default={}) or {}
+            cfg_symbols = exchange_cfg.get("symbols", []) if isinstance(exchange_cfg, dict) else []
+            symbols.extend(str(sym) for sym in (cfg_symbols or []))
+            symbols.append(_default_probe_symbol())
+        seen_symbols: set[str] = set()
+        symbols = [sym for sym in symbols if sym and not (sym in seen_symbols or seen_symbols.add(sym))]
+
+        current_positions = dict(getattr(risk_manager, "positions", {}) or {}) if risk_manager is not None else {}
+
+        def _open_row_count(symbol_value: str) -> int:
+            try:
+                rows = sqlite_store.query(
+                    "SELECT COUNT(*) AS n FROM positions WHERE exchange=? AND symbol=? AND close_time_ns IS NULL",
+                    (exchange_id, symbol_value),
+                )
+                return int(rows[0].get("n", 0)) if rows else 0
+            except Exception:
+                return -1
+
+        symbol = ""
+        open_rows_before = 0
+        for candidate in symbols:
+            key = f"{exchange_id}:{candidate}"
+            candidate_rows = _open_row_count(candidate)
+            last_trade = 0.0
+            cooldown = 0.0
+            if risk_manager is not None:
+                last_trade = float((getattr(risk_manager, "_last_trade_time", {}) or {}).get(candidate, 0.0) or 0.0)
+                cooldown = float(getattr(risk_manager, "_cooldown_seconds", 0.0) or 0.0)
+            in_cooldown = cooldown > 0 and last_trade > 0 and (time.time() - last_trade) < cooldown
+            if key not in current_positions and candidate_rows == 0 and not in_cooldown:
+                symbol = candidate
+                open_rows_before = candidate_rows
+                break
+        if not symbol:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "error": "no_clean_probe_symbol",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_recovery_probe = result
+            return result
+
+        key = f"{exchange_id}:{symbol}"
+        price = _resolve_paper_fill_price(symbol, float(body.get("price", 0) or 0) or None)
+        if price <= 0:
+            result = {
+                "success": False,
+                "available": True,
+                "mode": "paper",
+                "symbol": symbol,
+                "error": "paper_probe_price_unavailable",
+                "stages": stages,
+                "timestamp": int(time.time()),
+            }
+            app.state.last_pipeline_recovery_probe = result
+            return result
+
+        signal = TradingSignal(
+            exchange=exchange_id,
+            symbol=symbol,
+            direction=direction,
+            score=1.0,
+            technical_score=0.75,
+            ml_score=0.25,
+            sentiment_score=0.0,
+            macro_score=0.0,
+            news_score=0.0,
+            orderbook_score=0.25,
+            regime="paper_recovery_probe",
+            regime_confidence=1.0,
+            price=price,
+            atr=max(price * 0.01, 1e-8),
+            stop_loss=price * 0.985 if direction == "long" else price * 1.015,
+            take_profit=price * 1.03 if direction == "long" else price * 0.97,
+            timestamp=int(time.time() * 1000),
+            quality_score=100,
+            session_name="paper_recovery_probe",
+            metadata={"source": "pipeline_recovery_probe", "paper": True, "atr_percentile": 50, "adx": 25},
+            reasons=["operator_recovery_probe"],
+        )
+
+        entry = None
+        try:
+            entry = await executor.execute_signal(signal, float(body.get("size", 0) or 0.0))
+            entry_ok = entry is not None and str(getattr(entry, "status", "")) in {"filled", "partially_filled"}
+            _stage("entry_order", entry_ok, str(getattr(entry, "status", "not_submitted")) if entry else "not_submitted")
+        except Exception as exc:
+            entry_ok = False
+            _stage("entry_order", False, sanitize_exception(exc))
+
+        open_rows = []
+        if entry_ok:
+            try:
+                open_rows = sqlite_store.query(
+                    "SELECT * FROM positions WHERE exchange=? AND symbol=? AND close_time_ns IS NULL ORDER BY id DESC",
+                    (exchange_id, symbol),
+                )
+                _stage(
+                    "sqlite_open_audit",
+                    len(open_rows) == open_rows_before + 1,
+                    f"open_rows_delta={len(open_rows) - open_rows_before}",
+                )
+            except Exception as exc:
+                _stage("sqlite_open_audit", False, sanitize_exception(exc))
+        else:
+            _stage("sqlite_open_audit", False, "entry_not_open")
+
+        restored_positions: dict[str, Any] = {}
+        recovery_result: dict[str, Any] = {}
+        if open_rows:
+            try:
+                fresh_risk = RiskManager(config, event_bus, sqlite_store=sqlite_store)
+                recovery_result = await fresh_risk.restore_open_positions_from_sqlite(open_rows)
+                restored_positions = dict(getattr(fresh_risk, "positions", {}) or {})
+                restored = restored_positions.get(key)
+                restored_ok = restored is not None and not bool(getattr(restored, "pending_fill", False))
+                _stage(
+                    "restore_risk_state",
+                    restored_ok,
+                    f"restored={int(recovery_result.get('restored', 0) or 0)}",
+                    recovery=recovery_result,
+                )
+                _stage(
+                    "dedupe_guard",
+                    len(restored_positions) == 1 and key in restored_positions,
+                    f"in_memory_keys={len(restored_positions)}",
+                )
+            except Exception as exc:
+                _stage("restore_risk_state", False, sanitize_exception(exc))
+                _stage("dedupe_guard", False, "restore_failed")
+        else:
+            _stage("restore_risk_state", False, "sqlite_open_row_missing")
+            _stage("dedupe_guard", False, "sqlite_open_row_missing")
+
+        close_result = None
+        if entry_ok:
+            try:
+                close_price = float(getattr(entry, "price", price) or price)
+                close_result = await executor.close_position(symbol, close_price, reason="paper_recovery_probe_cleanup")
+                _stage(
+                    "cleanup_close",
+                    close_result is not None and str(getattr(close_result, "status", "")) == "closed",
+                    str(getattr(close_result, "status", "close_failed")) if close_result else "close_failed",
+                )
+            except Exception as exc:
+                _stage("cleanup_close", False, sanitize_exception(exc))
+        else:
+            _stage("cleanup_close", True, "nothing_opened")
+
+        open_rows_after = _open_row_count(symbol)
+        no_orphan = key not in (getattr(risk_manager, "positions", {}) or {})
+        cleanup_ok = open_rows_after == open_rows_before and no_orphan
+        _stage(
+            "post_cleanup",
+            cleanup_ok,
+            f"open_rows_after={open_rows_after} orphan_position={not no_orphan}",
+        )
+        if not cleanup_ok and risk_manager is not None:
+            try:
+                await risk_manager.close_position(exchange_id, symbol, price)
+            except Exception:
+                pass
+
+        success = all(bool(stage.get("ok")) for stage in stages)
+        result = {
+            "success": success,
+            "available": True,
+            "mode": "paper",
+            "symbol": symbol,
+            "exchange": exchange_id,
+            "direction": direction,
+            "entry_order_id": str(getattr(entry, "order_id", "")) if entry is not None else "",
+            "exit_order_id": str(getattr(close_result, "order_id", "")) if close_result is not None else "",
+            "recovery": recovery_result,
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "stages": stages,
+            "timestamp": int(time.time()),
+        }
+        app.state.last_pipeline_recovery_probe = result
+        return result
+
     @app.post("/api/trade")
     async def api_trade(request: Request) -> dict[str, Any]:
         body = await request.json()
@@ -1922,6 +3085,11 @@ def build_app(
                 from execution.order_manager import OrderSide, OrderType
                 side = OrderSide.BUY if side_str == "BUY" else OrderSide.SELL
                 ot = OrderType.MARKET if order_type_str == "market" else OrderType.LIMIT
+                fill_price = 0.0
+                if ot == OrderType.MARKET:
+                    fill_price = _resolve_paper_fill_price(sym, price)
+                    if fill_price <= 0:
+                        return {"success": False, "error": "paper fill price unavailable"}
                 success, order, reason = await order_manager.place_order(
                     exchange=venue, symbol=sym, side=side, quantity=size,
                     price=price or 0, order_type=ot,
@@ -1932,8 +3100,95 @@ def build_app(
                 )
                 if not success:
                     return {"success": False, "error": reason}
-                return {"success": True, "order_id": getattr(order, "order_id", "unknown"), "paper": True}
+
+                # Paper market orders are execution intents, not passive order tickets:
+                # simulate an immediate fill so the UI, order ledger, and risk ledger
+                # converge.  Limit orders intentionally remain pending unless a
+                # dedicated paper matching engine records a later fill.
+                if ot != OrderType.MARKET:
+                    return {
+                        "success": True,
+                        "order_id": getattr(order, "order_id", "unknown"),
+                        "paper": True,
+                        "status": getattr(getattr(order, "status", None), "value", "pending"),
+                        "filled": 0.0,
+                        "price": price or 0.0,
+                    }
+
+                client_order_id = getattr(order, "client_order_id", "")
+                exchange_order_id = f"paper-{getattr(order, 'order_id', client_order_id)}"
+                await order_manager.confirm_order_submission(client_order_id, exchange_order_id)
+                filled_order = await order_manager.record_fill(
+                    client_order_id=client_order_id,
+                    fill_id=f"{exchange_order_id}-fill-1",
+                    quantity=size,
+                    price=fill_price,
+                    fee=0.0,
+                )
+
+                if risk_manager is not None:
+                    from engine.signal_generator import TradingSignal
+                    direction = "long" if side_str == "BUY" else "short"
+                    sl_pct = float(body.get("stop_loss_pct", 2)) / 100
+                    tp_pct = float(body.get("take_profit_pct", 4)) / 100
+                    sig = TradingSignal(
+                        exchange=venue, symbol=sym, direction=direction,
+                        price=fill_price, score=1.0, quality_score=100,
+                        stop_loss=fill_price * (1 - sl_pct) if direction == "long" else fill_price * (1 + sl_pct),
+                        take_profit=fill_price * (1 + tp_pct) if direction == "long" else fill_price * (1 - tp_pct),
+                        technical_score=0.0, ml_score=0.0, sentiment_score=0.0,
+                        macro_score=0.0, news_score=0.0, orderbook_score=0.0,
+                        regime="paper_manual", regime_confidence=1.0,
+                        atr=max(fill_price * 0.01, 1e-8),
+                        timestamp=int(time.time()),
+                        metadata={"source": "manual_ui", "paper": True, "order_id": getattr(order, "order_id", "")},
+                    )
+                    await risk_manager.open_position(sig, size * fill_price)
+
+                _exchange_cache.pop("positions", None)
+                _exchange_cache.pop("orders", None)
+
+                return {
+                    "success": True,
+                    "order_id": getattr(order, "order_id", "unknown"),
+                    "paper": True,
+                    "status": getattr(getattr(filled_order or order, "status", None), "value", "filled"),
+                    "filled": float(getattr(filled_order or order, "filled_quantity", size)),
+                    "price": fill_price,
+                }
             else:
+                manual_live_allowed = bool(auth_cfg.get("allow_manual_live_trading", False))
+                if not manual_live_allowed:
+                    return {
+                        "success": False,
+                        "error": "manual live trading is disabled; set monitoring.dashboard_api.auth.allow_manual_live_trading=true only after live preflight and operator confirmation",
+                    }
+
+                required_confirmation = f"PLACE {side_str} {sym}"
+                provided_confirmation = str(body.get("confirmation", "") or "").strip()
+                if provided_confirmation != required_confirmation:
+                    return {
+                        "success": False,
+                        "error": f"manual live trade requires typed confirmation: {required_confirmation}",
+                    }
+
+                if reconciliation_result is None:
+                    return {"success": False, "error": "manual live trade blocked: startup reconciliation has not run"}
+                recon_mismatches = list(getattr(reconciliation_result, "mismatches", []) or [])
+                recon_positions_without_sl = list(getattr(reconciliation_result, "positions_without_sl", []) or [])
+                if (
+                    not bool(getattr(reconciliation_result, "success", False))
+                    or bool(getattr(reconciliation_result, "safe_mode", False))
+                    or recon_mismatches
+                    or recon_positions_without_sl
+                ):
+                    return {"success": False, "error": "manual live trade blocked: reconciliation is not clean"}
+
+                if not bool(getattr(db_handler, "available", False)):
+                    return {"success": False, "error": "manual live trade blocked: audit DB unavailable"}
+                if risk_manager is None or _risk_kill_switch_active():
+                    return {"success": False, "error": "manual live trade blocked: risk manager unavailable or kill switch active"}
+
                 # Live mode: send order directly to the exchange via executor client
                 client = None
                 rate_limiter = None
@@ -2001,7 +3256,7 @@ def build_app(
                 }
         except Exception as exc:
             logger.error("Manual trade error: {}", exc)
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": sanitize_exception(exc)}
 
     # ── /api/positions/close-all — close all positions ────────────────────
     @app.post("/api/positions/close-all")
@@ -2009,8 +3264,12 @@ def build_app(
         if risk_manager is None:
             return {"success": False, "error": "risk_manager not available"}
         closed = await risk_manager.activate_kill_switch()
-        risk_manager.deactivate_kill_switch()
-        return {"success": True, "closed": len(closed)}
+        # Paper/demo UI convenience may clear the switch after flattening. In
+        # non-paper mode, never auto-deactivate the kill switch from this route;
+        # an operator must perform an explicit readiness/reconciliation release.
+        if config.paper_mode:
+            risk_manager.deactivate_kill_switch()
+        return {"success": True, "closed": len(closed), "kill_switch_active": bool(getattr(risk_manager, "kill_switch_active", False))}
 
     # ── /api/positions/close — close single position (frontend format) ───
     @app.post("/api/positions/close")
@@ -2032,62 +3291,68 @@ def build_app(
 
             close_price = float(pos.current_price)
 
-            # In live mode: close on exchange first
-            if not config.paper_mode:
-                for exc in (executors or []):
-                    ex_id = getattr(exc, "exchange_id", "")
-                    if ex_id != venue:
-                        continue
-                    client = getattr(exc, "_client", None)
-                    if client is None:
-                        continue
-                    try:
-                        rl = getattr(exc, "_rate_limiter", None)
-                        if rl:
-                            await rl.acquire()
-                        close_side = "sell" if pos.direction == "long" else "buy"
-                        t_close_start = time.monotonic()
-                        # Run close order + cancel protective orders concurrently
-                        close_coro = client.create_market_order(
-                            symbol=symbol, side=close_side, amount=abs(pos.size),
-                            params={"reduceOnly": True},
-                        )
-                        placer = getattr(exc, "_order_placer", None)
-                        if placer:
-                            async def _cancel_protective():
-                                try:
-                                    await placer.cancel_all_for_symbol(symbol)
-                                    placer.remove_tracking(symbol)
-                                except Exception:
-                                    pass
-                            await asyncio.gather(close_coro, _cancel_protective())
-                        else:
-                            await close_coro
-                        close_latency = time.monotonic() - t_close_start
-                        if metrics and hasattr(metrics, "record_order_latency"):
-                            metrics.record_order_latency(ex_id, "close", close_latency)
-                        # Invalidate cache after position change
-                        _exchange_cache.pop("positions", None)
-                        _exchange_cache.pop("orders", None)
-                        logger.info("Exchange-side close for {} {} qty={}", venue, symbol, pos.size)
-                    except Exception as exc_err:
-                        logger.error("Exchange close failed for {}: {}", symbol, exc_err)
-                        return {"success": False, "error": f"Exchange close failed: {exc_err}"}
+            close_executor = None
+            for exc in (executors or []):
+                ex_id = str(getattr(exc, "exchange_id", "") or "").lower()
+                if ex_id == venue.lower() and callable(getattr(exc, "close_position", None)):
+                    close_executor = exc
+                    break
+            if close_executor is None:
+                return {
+                    "success": False,
+                    "error": "executor close contract unavailable",
+                    "symbol": symbol,
+                    "venue": venue,
+                }
 
-            closed = await risk_manager.close_position(venue, symbol, close_price)
-            if closed is None:
-                return {"success": False, "error": "Position not found in risk manager"}
+            close_started = time.monotonic()
+            close_result = await close_executor.close_position(
+                symbol,
+                close_price,
+                reason="dashboard_close",
+            )
+            if close_result is None:
+                return {"success": False, "error": "executor close failed", "symbol": symbol, "venue": venue}
+
+            if metrics and hasattr(metrics, "record_order_latency"):
+                metrics.record_order_latency(venue, "close", time.monotonic() - close_started)
+            _exchange_cache.pop("positions", None)
+            _exchange_cache.pop("orders", None)
+
+            still_open = (
+                f"{venue}:{symbol}" in risk_manager.positions
+                or f"{venue.lower()}:{symbol}" in risk_manager.positions
+            )
+            closed_trades = list(getattr(risk_manager, "_closed_trades", []) or [])
+            realized_pnl = 0.0
+            if closed_trades:
+                last_trade = closed_trades[-1]
+                if (
+                    last_trade.get("symbol") == symbol
+                    and str(last_trade.get("exchange", "")).lower() == venue.lower()
+                ):
+                    realized_pnl = float(last_trade.get("pnl", 0.0) or 0.0)
+            if still_open:
+                return {
+                    "success": False,
+                    "error": "executor close sent but risk state still shows open; run reconciliation",
+                    "symbol": symbol,
+                    "venue": venue,
+                    "order_id": str(getattr(close_result, "order_id", "")),
+                }
 
             return {
                 "success": True,
                 "symbol": symbol,
                 "venue": venue,
-                "exit_price": close_price,
-                "realized_pnl": round(float(closed.pnl), 4),
+                "exit_price": round(float(getattr(close_result, "price", close_price) or close_price), 8),
+                "realized_pnl": round(realized_pnl, 4),
+                "order_id": str(getattr(close_result, "order_id", "")),
+                "paper_order_id": str(getattr(close_result, "order_id", "")) if config.paper_mode else "",
             }
         except Exception as exc:
             logger.error("Close position error: {}", exc)
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": sanitize_exception(exc)}
 
     # ── /api/positions/breakeven — set break-even on positions ────────────
     @app.post("/api/positions/breakeven")
@@ -2421,6 +3686,8 @@ def build_app(
     async def api_auto_toggle(request: Request) -> dict[str, Any]:
         body = await request.json()
         enabled = bool(body.get("enabled", False))
+        if enabled:
+            _require_live_auto_activation_allowed(body)
         if signal_generator is not None and hasattr(signal_generator, "set_auto_trading"):
             signal_generator.set_auto_trading(enabled)
             # Apply paper-mode-friendly settings when enabling auto trading
@@ -2782,7 +4049,11 @@ def build_app(
 
         # ── Auto-trading toggle ──
         if signal_generator and hasattr(signal_generator, "set_auto_trading") and "auto_trading_enabled" in body:
-            signal_generator.set_auto_trading(bool(body.get("auto_trading_enabled")))
+            auto_enabled = bool(body.get("auto_trading_enabled"))
+            currently_enabled = bool(getattr(signal_generator, "auto_trading_enabled", False))
+            if auto_enabled and not currently_enabled:
+                _require_live_auto_activation_allowed(body)
+            signal_generator.set_auto_trading(auto_enabled)
         if signal_generator and hasattr(signal_generator, "configure_agent"):
             signal_generator.configure_agent(payload={
                 "enabled": ai_cfg.get("enabled", True),
@@ -2972,7 +4243,7 @@ def build_app(
         except asyncio.TimeoutError:
             return {"success": False, "error": "exchange timeout (8s)"}
         except Exception as exc:
-            msg = str(exc)[:200]
+            msg = sanitize_exception(exc)[:200]
             logger.warning("test-keys FAIL venue={} key={}***: {}", venue, api_key[:4], msg)
             return {"success": False, "error": f"{type(exc).__name__}: {msg}"}
         finally:
@@ -2991,7 +4262,7 @@ def build_app(
             symbol = _validate_symbol(symbol)
             timeframe = _validate_timeframe(timeframe)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
         # Assemble a full snapshot from all data sources
         status = (await api_status())
         fg = (await api_feargreed())
@@ -3030,7 +4301,7 @@ def build_app(
             symbol = _validate_symbol(symbol)
             timeframe = _validate_timeframe(timeframe)
         except ValueError as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
+            return JSONResponse(status_code=400, content={"detail": sanitize_exception(exc)})
 
         async def _event_generator():
             while True:
@@ -3060,7 +4331,34 @@ def build_app(
 
             return StreamingResponse(_sse_fallback(), media_type="text/event-stream")
 
-    # ── §3 Spec: 9-layer confirmation status ──────────────────────────────
+    @app.get("/api/market-data/health")
+    async def api_market_data_health() -> dict[str, Any]:
+        """Return L0 market-data integrity status for dashboard and preflight."""
+        monitor = market_data_integrity
+        if monitor is not None and hasattr(monitor, "snapshot"):
+            try:
+                return monitor.snapshot()
+            except Exception as exc:
+                return {
+                    "enabled": False,
+                    "status": "ERROR",
+                    "healthy": False,
+                    "reason": sanitize_exception(exc),
+                    "feeds": [],
+                }
+        if signal_generator is not None and hasattr(signal_generator, "get_l0_status"):
+            payload = signal_generator.get_l0_status()
+            if isinstance(payload, dict):
+                return payload
+        return {
+            "enabled": False,
+            "status": "UNAVAILABLE",
+            "healthy": False,
+            "reason": "market_data_integrity_monitor_not_wired",
+            "feeds": [],
+        }
+
+    # ── §3 Spec: L0-L9 confirmation status plus optional L10 context ───────
     async def _build_layers_response() -> dict[str, Any]:
         """Heavy path — runs the full pipeline preview. Called only when
         the cache is cold or being refreshed; never inline on the request path
@@ -3080,7 +4378,7 @@ def build_app(
 
     @app.get("/api/layers")
     async def api_layers() -> dict[str, Any]:
-        """Return current state of the 9/10-layer confirmation pipeline.
+        """Return current state of the L0-L9/L10 confirmation pipeline.
 
         Uses stale-while-revalidate so the dashboard never blocks on a slow
         build. See the cache constants above for the budgets."""
@@ -3130,6 +4428,7 @@ def build_app(
                 return _layers_placeholder_response("pipeline build exceeded cold budget — refreshing in background")
 
     _LAYERS_DEFAULT_THRESHOLDS = {
+        "market_data_integrity": 1.0,
         "session_filter": 1.0,
         "htf_trend": 3.0,
         "technical_confluence": 30.0,
@@ -3143,16 +4442,51 @@ def build_app(
 
     def _build_layers_skeleton() -> list[dict[str, Any]]:
         return [
-            {"id": 1, "layer_index": "L0", "name": "Session Filter", "description": "Trading session & killzone enforcement"},
-            {"id": 2, "layer_index": "L1", "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
-            {"id": 3, "layer_index": "L2", "name": "Technical Confluence", "description": "RSI, MACD, BB, EMA alignment"},
-            {"id": 4, "layer_index": "L3", "name": "Smart Money Concepts", "description": "BOS/CHoCH + OB/FVG zones"},
-            {"id": 5, "layer_index": "L4", "name": "Volume Flow", "description": "Delta, CVD, VWAP deviation"},
-            {"id": 6, "layer_index": "L5", "name": "Regime Detection", "description": "Market regime (trending/ranging/breakout)"},
-            {"id": 7, "layer_index": "L6", "name": "ML Ensemble", "description": "Model prediction confidence"},
-            {"id": 8, "layer_index": "L7", "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
-            {"id": 9, "layer_index": "L8", "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
+            {"id": 0, "layer_index": "L0", "name": "Market Data Integrity", "description": "Freshness, sequence-gap, clock-drift, and orderbook sanity gate"},
+            {"id": 1, "layer_index": "L1", "name": "Session Filter", "description": "Trading session & killzone enforcement"},
+            {"id": 2, "layer_index": "L2", "name": "HTF Trend", "description": "Higher-timeframe weighted agreement"},
+            {"id": 3, "layer_index": "L3", "name": "Technical Confluence", "description": "RSI, MACD, BB, EMA alignment"},
+            {"id": 4, "layer_index": "L4", "name": "Smart Money Concepts", "description": "BOS/CHoCH + OB/FVG zones"},
+            {"id": 5, "layer_index": "L5", "name": "Volume Flow", "description": "Delta, CVD, VWAP deviation"},
+            {"id": 6, "layer_index": "L6", "name": "Regime Detection", "description": "Market regime (trending/ranging/breakout)"},
+            {"id": 7, "layer_index": "L7", "name": "ML Ensemble", "description": "Model prediction confidence"},
+            {"id": 8, "layer_index": "L8", "name": "Signal Quality", "description": "0-100 quality score gate (min 65)"},
+            {"id": 9, "layer_index": "L9", "name": "Risk Gate", "description": "Position sizing, DD phase, circuit breaker"},
         ]
+
+    def _build_preflight_status(reason: str | None = None) -> dict[str, Any]:
+        if reason:
+            raw_status = "PENDING"
+            detail = reason
+        elif signal_generator is None:
+            raw_status = "UNKNOWN"
+            detail = "signal generator unavailable"
+        else:
+            last = getattr(signal_generator, "_last_layer_status", {}) or {}
+            raw_status = str(last.get("preflight", "PENDING") or "PENDING").upper()
+            detail = str(last.get("preflight_detail", "") or "awaiting preflight")
+            if raw_status in ("UNKNOWN", "PENDING"):
+                estop = getattr(signal_generator, "_estop", None)
+                if estop is not None and bool(getattr(estop, "is_active", False)):
+                    raw_status = "FAIL"
+                    detail = f"ESTOP:{getattr(estop, 'reason', 'active')}"
+                else:
+                    raw_status = "PASS"
+                    detail = "runtime guards ready"
+
+        if raw_status == "BLOCKED":
+            raw_status = "FAIL"
+        score = 100.0 if raw_status == "PASS" else 0.0 if raw_status == "FAIL" else None
+        return {
+            "id": "preflight",
+            "layer_index": "PRE",
+            "name": "Preflight",
+            "description": "Runtime guards before L1-L10",
+            "status": raw_status,
+            "detail": detail,
+            "score": score,
+            "threshold": 1.0,
+        }
 
     def _layers_score_to_status(score: float | int | None) -> str:
         try:
@@ -3185,6 +4519,18 @@ def build_app(
             except (TypeError, ValueError):
                 thr = None
         return score, thr
+
+    def _layers_is_stale_detail(detail: str) -> bool:
+        text = str(detail or "").strip().lower()
+        if not text:
+            return True
+        return any(token in text for token in (
+            "waiting for first evaluation",
+            "waiting for first market-data heartbeat",
+            "awaiting evaluation",
+            "pipeline build exceeded",
+            "warming up",
+        ))
 
     async def _populate_layers_status(layers: list[dict[str, Any]]) -> None:
         if signal_generator is None:
@@ -3220,16 +4566,40 @@ def build_app(
             raw_status = str(last.get(key, "UNKNOWN") or "UNKNOWN").upper()
             detail = str(last.get(f"{key}_detail", "") or "")
 
+            if key == "market_data_integrity":
+                l0 = await api_market_data_health()
+                l0_status = str(l0.get("status", "UNKNOWN") or "UNKNOWN").upper()
+                if l0_status == "OK":
+                    raw_status = "PASS"
+                elif l0_status in {"DEGRADED", "WARMING"}:
+                    raw_status = "WEAK" if l0_status == "DEGRADED" else "PENDING"
+                elif l0_status in {"BLOCKED", "ERROR"}:
+                    raw_status = "FAIL"
+                elif raw_status == "UNKNOWN":
+                    raw_status = "PENDING"
+                feeds = int(l0.get("feed_count", 0) or 0)
+                healthy = int(l0.get("healthy_count", 0) or 0)
+                if _layers_is_stale_detail(detail):
+                    detail = f"{l0_status.lower()} feeds={healthy}/{feeds}"
+                layer["status"] = raw_status
+                layer["detail"] = detail
+                layer["score"] = 100.0 if raw_status == "PASS" else 50.0 if raw_status == "WEAK" else 0.0 if raw_status == "FAIL" else None
+                layer["threshold"] = _LAYERS_DEFAULT_THRESHOLDS.get(key)
+                layer["health"] = l0
+                continue
+
             if raw_status in ("UNKNOWN", "PENDING") and key in fallback_scores:
                 raw_status = _layers_score_to_status(fallback_scores.get(key))
-                if not detail:
+                if key == "ml_ensemble" and raw_status == "FAIL" and float(fallback_scores.get(key, 0) or 0) > 0:
+                    raw_status = "WEAK"
+                if _layers_is_stale_detail(detail):
                     detail = f"score={fallback_scores.get(key, 0)}"
 
             if key == "risk_gate" and raw_status in ("UNKNOWN", "PENDING"):
                 snap = risk_manager.get_risk_snapshot() if risk_manager is not None else {}
                 blocked = bool(snap.get("kill_switch_active", False) or snap.get("circuit_breaker_tripped", False))
                 raw_status = "FAIL" if blocked else "PASS"
-                if not detail:
+                if _layers_is_stale_detail(detail):
                     detail = "risk controls ready" if not blocked else "risk controls blocking new trades"
 
             if raw_status == "BLOCKED":
@@ -3268,8 +4638,9 @@ def build_app(
             else:
                 counts["other"] += 1
         return {
+            "preflight": _build_preflight_status(),
             "layers": layers,
-            "total": 9,
+            "total": len(layers),
             "counts": counts,
             "paper_mode": bool(getattr(signal_generator, "_is_paper_mode", lambda: True)()) if signal_generator is not None else True,
         }
@@ -3285,6 +4656,7 @@ def build_app(
             layer["score"] = None
             layer["threshold"] = _LAYERS_DEFAULT_THRESHOLDS.get(key)
         out = _finalize_layers_response(layers)
+        out["preflight"] = _build_preflight_status(reason)
         out["pending"] = True
         out["reason"] = reason
         return out
@@ -3364,12 +4736,16 @@ def build_app(
     @app.post("/api/agent/test")
     async def api_agent_test() -> dict[str, Any]:
         """Live-test the configured AI provider with a tiny round-trip prompt."""
-        if signal_generator is None or not hasattr(signal_generator, "_ai_agent") or signal_generator._ai_agent is None:
+        if signal_generator is None:
             return {"success": False, "reason": "agent_unavailable", "message": "AI agent is not attached."}
         try:
-            return await signal_generator._ai_agent.test_connection()
+            if hasattr(signal_generator, "test_agent_connection"):
+                return await signal_generator.test_agent_connection()
+            if hasattr(signal_generator, "_ai_agent") and signal_generator._ai_agent is not None:
+                return await signal_generator._ai_agent.test_connection()
+            return {"success": False, "reason": "agent_unavailable", "message": "AI agent is not attached."}
         except Exception as exc:
-            return {"success": False, "reason": "exception", "message": str(exc)[:240]}
+            return {"success": False, "reason": "exception", "message": sanitize_exception(exc)[:240]}
 
     @app.post("/api/agent/chat")
     async def api_agent_chat(request: Request) -> dict[str, Any]:
@@ -3412,6 +4788,7 @@ def build_app(
             signal_generator.set_auto_trading(False)
             return {"success": True, "action": action, "reply": "Auto trading paused."}
         if action == "resume_auto" and hasattr(signal_generator, "set_auto_trading"):
+            _require_live_auto_activation_allowed(body)
             signal_generator.set_auto_trading(True)
             return {"success": True, "action": action, "reply": "Auto trading resumed."}
         if action == "train_model" and hasattr(signal_generator, "retrain_model_now"):
@@ -3814,7 +5191,856 @@ def build_app(
 
     @app.get("/api/clientkey")
     async def api_clientkey() -> dict[str, Any]:
-        return {"key": api_key if api_key else ""}
+        """Return dashboard auth metadata without echoing the shared secret."""
+        return {"configured": bool(api_key), "auth_required": require_api_key}
+
+    @app.get("/api/live/readiness")
+    async def api_live_readiness() -> dict[str, Any]:
+        """Fail-closed live readiness checklist for operators and automation."""
+        checks: dict[str, dict[str, Any]] = {}
+
+        checks["mode"] = {
+            "ok": not bool(config.paper_mode),
+            "value": "paper" if config.paper_mode else "live",
+            "message": "live mode active" if not config.paper_mode else "paper mode active",
+        }
+
+        db_ok = bool(getattr(db_handler, "available", False))
+        sqlite_personal = bool(config.get_value("storage", "personal_sqlite_mode", default=False))
+        sqlite_ok = bool(sqlite_store is not None and getattr(sqlite_store, "available", False))
+        audit_ok = db_ok or (sqlite_personal and sqlite_ok)
+        checks["audit_db"] = {
+            "ok": audit_ok,
+            "mode": "postgresql" if db_ok else ("sqlite_personal" if sqlite_personal and sqlite_ok else "unavailable"),
+            "message": (
+                "PostgreSQL audit persistence available"
+                if db_ok
+                else (
+                    "Personal SQLite audit persistence available"
+                    if sqlite_personal and sqlite_ok
+                    else "Audit persistence unavailable"
+                )
+            ),
+        }
+
+        dash_ok = bool(require_api_key and api_key)
+        checks["dashboard_auth"] = {
+            "ok": dash_ok,
+            "message": "dashboard API key auth enabled" if dash_ok else "dashboard API key auth is not fully configured",
+        }
+
+        exchange_count = len(executors or [])
+        exchange_details: list[dict[str, Any]] = []
+        contract_details: list[dict[str, Any]] = []
+        live_clients = 0
+        for exc in (executors or []):
+            ex_id = str(getattr(exc, "exchange_id", type(exc).__name__))
+            contract = executor_contract_status(exc, require_order_controls=True, require_market_data=True)
+            contract_details.append(contract)
+            client = getattr(exc, "_client", None)
+            client_ok = client is not None
+            markets = getattr(client, "markets", None) if client is not None else None
+            # Markets are populated by ccxt.load_markets during executor init;
+            # requiring either loaded markets or an explicit initialized marker
+            # prevents a mere executor object from passing live readiness.
+            initialized = bool(client_ok and (markets or getattr(exc, "_running", False)))
+            if initialized:
+                live_clients += 1
+            exchange_details.append({
+                "exchange": ex_id,
+                "client": client_ok,
+                "initialized": initialized,
+                "markets_loaded": bool(markets),
+                "contract_ok": bool(contract.get("contract_ok", False)),
+                "contract_blockers": contract.get("blockers", []),
+            })
+        exchange_ok = exchange_count > 0 and live_clients == exchange_count
+        checks["exchange"] = {
+            "ok": exchange_ok,
+            "count": exchange_count,
+            "initialized_clients": live_clients,
+            "details": exchange_details,
+            "message": "exchange clients initialized" if exchange_ok else "one or more exchange clients are unavailable or uninitialized",
+        }
+        missing_contract = sorted({b for item in contract_details for b in item.get("blockers", [])})
+        contract_ok = exchange_count > 0 and all(item.get("contract_ok", False) for item in contract_details)
+        checks["executor_contract"] = {
+            "ok": contract_ok,
+            "details": contract_details,
+            "missing": missing_contract,
+            "message": (
+                "executor close/cancel/orderbook contract available"
+                if contract_ok
+                else f"executor contract missing: {', '.join(missing_contract) or 'executor'}"
+            ),
+        }
+
+        risk_snap = risk_manager.get_risk_snapshot() if risk_manager is not None and hasattr(risk_manager, "get_risk_snapshot") else {}
+        trading_state = str(risk_snap.get("trading_state", "UNKNOWN") or "UNKNOWN")
+        risk_ok = (
+            risk_manager is not None
+            and not _risk_kill_switch_active()
+            and bool(risk_snap.get("can_open_new_positions", True))
+        )
+        checks["risk"] = {
+            "ok": risk_ok,
+            "trading_state": trading_state,
+            "blockers": risk_snap.get("trading_state_blockers", []),
+            "message": "risk manager ready" if risk_ok else f"risk manager blocked ({trading_state.lower()})",
+        }
+
+        user_stream_ok = True
+        user_stream_connected = bool(getattr(user_stream, "connected", False)) if user_stream is not None else False
+        user_stream_message = "user data stream not required in paper mode"
+        if not config.paper_mode:
+            user_stream_ok = user_stream is not None and user_stream_connected
+            user_stream_message = "user data stream connected" if user_stream_ok else "user data stream is not connected"
+        checks["user_stream"] = {
+            "ok": user_stream_ok,
+            "connected": user_stream_connected,
+            "message": user_stream_message,
+        }
+
+        recon_ok = True
+        recon_message = "startup reconciliation clean"
+        recon_mismatches: list[Any] = []
+        recon_positions_without_sl: list[Any] = []
+        if not config.paper_mode:
+            if reconciliation_result is None:
+                recon_ok = False
+                recon_message = "startup reconciliation has not run"
+            else:
+                recon_success = bool(getattr(reconciliation_result, "success", False))
+                recon_safe_mode = bool(getattr(reconciliation_result, "safe_mode", False))
+                recon_mismatches = list(getattr(reconciliation_result, "mismatches", []) or [])
+                recon_positions_without_sl = list(getattr(reconciliation_result, "positions_without_sl", []) or [])
+                recon_ok = recon_success and not recon_safe_mode and not recon_mismatches and not recon_positions_without_sl
+                if not recon_ok:
+                    recon_message = "startup reconciliation failed, safe-mode is active, or protective-order gaps remain"
+        checks["reconciliation"] = {
+            "ok": recon_ok,
+            "message": recon_message,
+            "mismatches": recon_mismatches,
+            "positions_without_sl": recon_positions_without_sl,
+        }
+
+        blockers = [name for name, check in checks.items() if not check.get("ok")]
+        return {
+            "ready_for_live": not blockers,
+            "blockers": blockers,
+            "checks": checks,
+            "config_hash": str(getattr(app.state, "config_hash", "")),
+            "timestamp": int(time.time()),
+        }
+
+    @app.get("/api/entry-eligibility")
+    async def api_entry_eligibility(symbol: str | None = None, exchange: str | None = None) -> dict[str, Any]:
+        """Current entry/no-trade decision with a receipt-style audit payload."""
+        if signal_generator is None or not hasattr(signal_generator, "get_entry_eligibility"):
+            return {
+                "available": False,
+                "allowed": False,
+                "decision": "NO_ENTRY",
+                "reason": "signal_generator_unavailable",
+                "blockers": ["signal_generator_unavailable"],
+                "warnings": [],
+                "timestamp": int(time.time()),
+            }
+        try:
+            payload = signal_generator.get_entry_eligibility(symbol=symbol, exchange=exchange)
+            if isinstance(payload, dict):
+                payload.setdefault("available", True)
+                payload.setdefault("timestamp", int(time.time()))
+                return payload
+        except Exception as exc:
+            return {
+                "available": False,
+                "allowed": False,
+                "decision": "NO_ENTRY",
+                "reason": sanitize_exception(exc),
+                "blockers": ["entry_eligibility_error"],
+                "warnings": [],
+                "timestamp": int(time.time()),
+            }
+        return {
+            "available": False,
+            "allowed": False,
+            "decision": "NO_ENTRY",
+            "reason": "entry_eligibility_unavailable",
+            "blockers": ["entry_eligibility_unavailable"],
+            "warnings": [],
+            "timestamp": int(time.time()),
+        }
+
+    @app.get("/api/pipeline/readiness")
+    async def api_pipeline_readiness() -> dict[str, Any]:
+        """Unified paper/live readiness gate for the full trading pipeline."""
+        paper_mode = bool(config.paper_mode)
+        mode = "paper" if paper_mode else "live"
+        stages: list[dict[str, Any]] = []
+        entry_payload: dict[str, Any] = {
+            "available": False,
+            "allowed": False,
+            "decision": "NO_ENTRY",
+            "reason": "not_evaluated",
+            "blockers": [],
+            "warnings": [],
+        }
+
+        def _status(value: str) -> str:
+            s = str(value or "UNKNOWN").upper()
+            if s in {"OK", "READY", "HEALTHY", "PASS"}:
+                return "PASS"
+            if s in {"WARN", "WARNING", "WARMING", "DEGRADED", "SOFT"}:
+                return "WARN"
+            if s in {"BLOCK", "BLOCKED", "FAIL", "FAILED", "ERROR", "UNAVAILABLE"}:
+                return "BLOCK"
+            return "UNKNOWN"
+
+        def _add_stage(
+            stage_id: str,
+            name: str,
+            status: str,
+            detail: str,
+            *,
+            critical: bool = True,
+            metrics_payload: dict[str, Any] | None = None,
+        ) -> None:
+            stages.append({
+                "id": stage_id,
+                "name": name,
+                "status": _status(status),
+                "detail": str(detail or ""),
+                "critical": bool(critical),
+                "metrics": metrics_payload or {},
+            })
+
+        def _max_p95(bucket: Any, *, ignore_prefixes: tuple[str, ...] = ()) -> float:
+            if not isinstance(bucket, dict):
+                return 0.0
+            value = 0.0
+            for key, item in bucket.items():
+                if ignore_prefixes and str(key).startswith(ignore_prefixes):
+                    continue
+                if isinstance(item, dict):
+                    value = max(value, float(item.get("p95_ms", 0.0) or 0.0))
+            return value
+
+        # L0 market-data integrity.
+        try:
+            md = await api_market_data_health()
+            md_status = str(md.get("status", "UNKNOWN")).upper()
+            feeds = md.get("feeds", [])
+            feed_count = len(feeds) if isinstance(feeds, list) else int(md.get("feed_count", 0) or 0)
+            md_ok = bool(md.get("healthy", False)) or md_status in {"OK", "READY", "HEALTHY", "PASS"}
+            if md_ok:
+                stage_status = "PASS"
+            elif md_status in {"ERROR", "BLOCKED", "FAIL", "FAILED"}:
+                stage_status = "BLOCK"
+            else:
+                stage_status = "WARN"
+            _add_stage(
+                "market_data",
+                "Market Data L0",
+                stage_status,
+                f"{md_status.lower()} with {feed_count} feed(s)",
+                metrics_payload={
+                    "status": md_status,
+                    "feed_count": feed_count,
+                    "healthy": bool(md.get("healthy", False)),
+                    "reason": md.get("reason"),
+                },
+            )
+        except Exception as exc:
+            _add_stage("market_data", "Market Data L0", "BLOCK", sanitize_exception(exc))
+
+        # Event bus pressure and sequencing backbone.
+        try:
+            eb = await api_eventbus_stats()
+            if not eb.get("available", False):
+                _add_stage("event_bus", "Event Bus", "BLOCK", "event bus unavailable")
+            else:
+                queue_pct = float(eb.get("queue_pct", 0.0) or 0.0)
+                dropped = int(eb.get("dropped_count", 0) or 0)
+                running = bool(eb.get("running", True))
+                if not running or queue_pct >= 90.0:
+                    stage_status = "BLOCK"
+                elif queue_pct >= 70.0 or dropped > 0:
+                    stage_status = "WARN"
+                else:
+                    stage_status = "PASS"
+                _add_stage(
+                    "event_bus",
+                    "Event Bus",
+                    stage_status,
+                    f"queue {queue_pct:.1f}%, dropped {dropped}, topics {int(eb.get('subscribed_topics', 0) or 0)}",
+                    metrics_payload=eb,
+                )
+        except Exception as exc:
+            _add_stage("event_bus", "Event Bus", "BLOCK", sanitize_exception(exc))
+
+        # Candle/indicator manager.
+        try:
+            if data_manager is None:
+                _add_stage("data_manager", "Data Manager", "BLOCK", "data manager unavailable")
+            else:
+                running = bool(getattr(data_manager, "_running", False))
+                history = getattr(data_manager, "_candle_history", {}) or {}
+                series = sum(len(tf_map) for tf_map in history.values()) if isinstance(history, dict) else 0
+                _add_stage(
+                    "data_manager",
+                    "Data Manager",
+                    "PASS" if running else "BLOCK",
+                    f"{'running' if running else 'stopped'}, {series} candle series",
+                    metrics_payload={"running": running, "series": series},
+                )
+        except Exception as exc:
+            _add_stage("data_manager", "Data Manager", "BLOCK", sanitize_exception(exc))
+
+        # Strategy layer preview from the stale-while-revalidate cache only.
+        try:
+            cached_layers = _layers_cache.get("_")
+            if not cached_layers and hasattr(signal_generator, "get_quality_preview"):
+                preview_layers = _build_layers_skeleton()
+                await _populate_layers_status(preview_layers)
+                preview_payload = _finalize_layers_response(preview_layers)
+                _layers_cache["_"] = (time.monotonic(), preview_payload)
+                cached_layers = _layers_cache.get("_")
+            if cached_layers:
+                layer_payload = cached_layers[1] or {}
+                layer_list = list(layer_payload.get("layers", []) or [])
+                layer_stale = bool(layer_payload.get("stale", False))
+                layer_age = float(layer_payload.get("age_seconds", 0.0) or 0.0)
+                pending = [
+                    str(item.get("layer_index", item.get("id", "")))
+                    for item in layer_list
+                    if (
+                        str(item.get("status", "")).upper() in {"PENDING", "UNKNOWN", ""}
+                        or _layers_is_stale_detail(str(item.get("detail", "") or ""))
+                    )
+                ]
+                weak = [
+                    str(item.get("layer_index", item.get("id", "")))
+                    for item in layer_list
+                    if str(item.get("status", "")).upper() in {"FAIL", "BLOCK", "BLOCKED", "WARN"}
+                ]
+                if layer_stale:
+                    stage_status = "WARN"
+                    detail = f"{len(layer_list)} cached layer(s), stale {layer_age:.0f}s; entry gate uses fresh preview"
+                elif pending:
+                    stage_status = "WARN"
+                    detail = f"{len(layer_list)} cached layer(s), pending: {', '.join(pending[:4])}"
+                else:
+                    stage_status = "PASS"
+                    detail = f"{len(layer_list)} layer(s) evaluated"
+                    if weak:
+                        detail += f", no-trade: {', '.join(weak[:4])}"
+                _add_stage(
+                    "strategy_layers",
+                    "Strategy Layers",
+                    stage_status,
+                    detail,
+                    critical=False,
+                    metrics_payload={
+                        "layers": len(layer_list),
+                        "pending": pending[:8],
+                        "weak": weak[:8],
+                        "stale": layer_stale,
+                        "age_seconds": layer_age,
+                    },
+                )
+            else:
+                _add_stage(
+                    "strategy_layers",
+                    "Strategy Layers",
+                    "WARN",
+                    "layer preview cache warming",
+                    critical=False,
+                )
+        except Exception as exc:
+            _add_stage("strategy_layers", "Strategy Layers", "WARN", sanitize_exception(exc), critical=False)
+
+        # Signal loop and auto-trading state.
+        try:
+            auto = await api_auto_status()
+            if signal_generator is None:
+                _add_stage("signal_engine", "Signal Engine", "BLOCK", "signal generator unavailable")
+            else:
+                running_attr = getattr(signal_generator, "_running", None)
+                running = True if running_attr is None else bool(running_attr)
+                auto_enabled = bool(auto.get("enabled", auto.get("auto_trading_enabled", False)))
+                _add_stage(
+                    "signal_engine",
+                    "Signal Engine",
+                    "PASS" if running else "BLOCK",
+                    f"{'running' if running else 'stopped'}, auto {'on' if auto_enabled else 'off'}",
+                    metrics_payload={"running": running, "auto_trading_enabled": auto_enabled, "mode": auto.get("mode", mode)},
+                )
+        except Exception as exc:
+            _add_stage("signal_engine", "Signal Engine", "BLOCK", sanitize_exception(exc))
+
+        # Predictive model state.
+        try:
+            ml = await api_ml_status()
+            loaded = bool(ml.get("loaded", False))
+            feature_count = int(ml.get("feature_count", 0) or 0)
+            _add_stage(
+                "model",
+                "Model",
+                "PASS" if loaded else "WARN",
+                f"{ml.get('model_type', 'model')} {'loaded' if loaded else 'not loaded'}, {feature_count} feature(s)",
+                critical=False,
+                metrics_payload=ml,
+            )
+        except Exception as exc:
+            _add_stage("model", "Model", "WARN", sanitize_exception(exc), critical=False)
+
+        # AI/agent decision provider. Advisory is safe by default; direct mode is paper-gated.
+        try:
+            agent = await api_agent_status()
+            requested = str(agent.get("requested_mode", agent.get("mode", "off")) or "off").lower()
+            effective = str(agent.get("effective_mode", agent.get("mode", "off")) or "off").lower()
+            direct_requested = requested in {"direct", "full"} or effective == "direct"
+            attached = bool(agent.get("attached", False))
+            enabled = bool(agent.get("enabled", False))
+            if direct_requested and not paper_mode:
+                _add_stage(
+                    "ai_decision",
+                    "AI Decision",
+                    "BLOCK",
+                    "AI-direct requested outside paper mode",
+                    critical=True,
+                    metrics_payload=agent,
+                )
+            elif attached and enabled:
+                _add_stage(
+                    "ai_decision",
+                    "AI Decision",
+                    "PASS",
+                    f"{effective or requested} mode",
+                    critical=False,
+                    metrics_payload=agent,
+                )
+            else:
+                _add_stage(
+                    "ai_decision",
+                    "AI Decision",
+                    "WARN",
+                    "agent advisory unavailable; core strategy still active",
+                    critical=False,
+                    metrics_payload=agent,
+                )
+        except Exception as exc:
+            _add_stage("ai_decision", "AI Decision", "WARN", sanitize_exception(exc), critical=False)
+
+        # Risk gate.
+        try:
+            if risk_manager is None:
+                _add_stage("risk", "Risk Gate", "BLOCK", "risk manager unavailable")
+            else:
+                snap = risk_manager.get_risk_snapshot() if hasattr(risk_manager, "get_risk_snapshot") else {}
+                kill = _risk_kill_switch_active()
+                circuit = bool(snap.get("circuit_breaker_tripped", False)) if isinstance(snap, dict) else False
+                safe_mode = bool(getattr(getattr(risk_manager, "safe_mode", None), "is_active", False))
+                trading_state = str(snap.get("trading_state", "UNKNOWN") or "UNKNOWN") if isinstance(snap, dict) else "UNKNOWN"
+                can_open = bool(snap.get("can_open_new_positions", True)) if isinstance(snap, dict) else False
+                blocked = kill or circuit or safe_mode or not can_open
+                detail = "ready"
+                if kill:
+                    detail = "kill switch active"
+                elif circuit:
+                    detail = f"circuit breaker: {snap.get('circuit_breaker_reason', 'active')}"
+                elif safe_mode:
+                    detail = "safe mode active"
+                elif not can_open:
+                    detail = f"trading state {trading_state.lower()}"
+                _add_stage(
+                    "risk",
+                    "Risk Gate",
+                    "BLOCK" if blocked else "PASS",
+                    detail,
+                    metrics_payload=snap if isinstance(snap, dict) else {},
+                )
+        except Exception as exc:
+            _add_stage("risk", "Risk Gate", "BLOCK", sanitize_exception(exc))
+
+        # Entry eligibility is the current no-trade decision, not infrastructure readiness.
+        try:
+            entry_payload = await api_entry_eligibility()
+            entry_allowed = bool(entry_payload.get("allowed", False))
+            entry_reason = str(entry_payload.get("reason", "") or ("entry_allowed" if entry_allowed else "no_entry"))
+            entry_blockers = list(entry_payload.get("blockers", []) or [])
+            detail = "entry allowed" if entry_allowed else entry_reason
+            if entry_blockers and not entry_allowed:
+                detail = f"{entry_reason}; blockers {', '.join(str(item) for item in entry_blockers[:3])}"
+            _add_stage(
+                "entry_eligibility",
+                "Entry Eligibility",
+                "PASS" if entry_allowed else "WARN",
+                detail,
+                critical=False,
+                metrics_payload=entry_payload if isinstance(entry_payload, dict) else {},
+            )
+        except Exception as exc:
+            entry_payload = {
+                "available": False,
+                "allowed": False,
+                "decision": "NO_ENTRY",
+                "reason": sanitize_exception(exc),
+                "blockers": ["entry_eligibility_error"],
+                "warnings": [],
+            }
+            _add_stage("entry_eligibility", "Entry Eligibility", "WARN", sanitize_exception(exc), critical=False)
+
+        # Exchange executor contract.
+        try:
+            execs = list(executors or [])
+            details: list[dict[str, Any]] = []
+            live_clients = 0
+            paper_clients = 0
+            for exc in execs:
+                ex_id = str(getattr(exc, "exchange_id", type(exc).__name__))
+                contract = executor_contract_status(exc, require_order_controls=True, require_market_data=True)
+                client = getattr(exc, "_client", None)
+                markets = getattr(client, "markets", None) if client is not None else None
+                is_paper = bool(getattr(exc, "is_paper", False)) or "simulated" in type(exc).__name__.lower()
+                initialized = bool(client is not None and (markets or getattr(exc, "_running", False)))
+                if getattr(exc, "_hl_exchange", None) is not None:
+                    initialized = True
+                live_clients += 1 if initialized else 0
+                paper_clients += 1 if is_paper else 0
+                details.append({
+                    "exchange": ex_id,
+                    "paper": is_paper,
+                    "client": client is not None,
+                    "initialized": initialized,
+                    "contract": contract,
+                })
+            contract_ok = bool(execs and all(item.get("contract", {}).get("contract_ok", False) for item in details))
+            missing_contract = sorted({
+                blocker
+                for item in details
+                for blocker in item.get("contract", {}).get("blockers", [])
+            })
+            if not execs:
+                _add_stage("executor", "Executor", "BLOCK", "no exchange executor configured")
+            elif paper_mode and paper_clients < len(execs):
+                _add_stage(
+                    "executor",
+                    "Executor",
+                    "BLOCK",
+                    "paper mode has non-paper executor(s)",
+                    metrics_payload={"count": len(execs), "details": details},
+                )
+            elif not contract_ok:
+                _add_stage(
+                    "executor",
+                    "Executor",
+                    "BLOCK",
+                    f"contract missing {', '.join(missing_contract) or 'executor method'}",
+                    metrics_payload={"count": len(execs), "details": details},
+                )
+            elif paper_mode:
+                _add_stage(
+                    "executor",
+                    "Executor",
+                    "PASS",
+                    f"{paper_clients} simulated executor(s), contract ok",
+                    metrics_payload={"count": len(execs), "details": details},
+                )
+            elif live_clients == len(execs):
+                _add_stage(
+                    "executor",
+                    "Executor",
+                    "PASS",
+                    f"{live_clients}/{len(execs)} live client(s), contract ok",
+                    metrics_payload={"count": len(execs), "details": details},
+                )
+            else:
+                _add_stage(
+                    "executor",
+                    "Executor",
+                    "BLOCK",
+                    f"{live_clients}/{len(execs)} live client(s) initialized",
+                    metrics_payload={"count": len(execs), "details": details},
+                )
+        except Exception as exc:
+            _add_stage("executor", "Executor", "BLOCK", sanitize_exception(exc))
+
+        # Order manager and idempotency ledger.
+        try:
+            if order_manager is None:
+                _add_stage("order_manager", "Order Manager", "BLOCK", "order manager unavailable")
+            else:
+                stats = order_manager.get_stats() if hasattr(order_manager, "get_stats") else {}
+                _add_stage(
+                    "order_manager",
+                    "Order Manager",
+                    "PASS",
+                    f"{int(stats.get('open_orders', 0) or 0)} open, {int(stats.get('filled_orders', 0) or 0)} filled",
+                    metrics_payload=stats,
+                )
+        except Exception as exc:
+            _add_stage("order_manager", "Order Manager", "BLOCK", sanitize_exception(exc))
+
+        # Durable audit trail.
+        try:
+            db_ok = bool(getattr(db_handler, "available", False))
+            sqlite_personal = bool(config.get_value("storage", "personal_sqlite_mode", default=False))
+            sqlite_ok = bool(sqlite_store is not None and getattr(sqlite_store, "available", False))
+            audit_ok = db_ok or (sqlite_personal and sqlite_ok)
+            if audit_ok:
+                persistence_status = "PASS"
+            else:
+                persistence_status = "BLOCK" if not paper_mode else "WARN"
+            detail = "postgresql audit db" if db_ok else ("personal sqlite audit db" if sqlite_personal and sqlite_ok else "audit persistence unavailable")
+            _add_stage(
+                "persistence",
+                "Persistence",
+                persistence_status,
+                detail,
+                critical=not paper_mode,
+                metrics_payload={"postgresql": db_ok, "sqlite_personal": sqlite_personal, "sqlite": sqlite_ok},
+            )
+        except Exception as exc:
+            _add_stage("persistence", "Persistence", "BLOCK" if not paper_mode else "WARN", sanitize_exception(exc), critical=not paper_mode)
+
+        # Local startup recovery guard for SQLite personal mode.
+        try:
+            recovery = {}
+            if risk_manager is not None and hasattr(risk_manager, "get_startup_recovery_status"):
+                recovery = risk_manager.get_startup_recovery_status()
+            elif hasattr(app.state, "sqlite_recovery_result"):
+                recovery = dict(getattr(app.state, "sqlite_recovery_result") or {})
+            errors = list(recovery.get("errors", []) or [])
+            ledger = _build_recovery_ledger_audit()
+            ledger_issues = (
+                int(ledger.get("duplicate_count", 0) or 0)
+                + int(ledger.get("orphan_count", 0) or 0)
+                + int(ledger.get("phantom_count", 0) or 0)
+            ) if ledger.get("available", False) else 0
+            restored = int(recovery.get("restored", 0) or 0)
+            attempted = int(recovery.get("attempted", 0) or 0)
+            skipped = int(recovery.get("skipped", 0) or 0)
+            disabled = bool(recovery.get("disabled", False))
+            over_limit = bool(recovery.get("over_limit", False))
+            if ledger_issues:
+                stage_status = "WARN"
+                detail = (
+                    f"ledger dup={int(ledger.get('duplicate_count', 0) or 0)} "
+                    f"orphan={int(ledger.get('orphan_count', 0) or 0)} "
+                    f"phantom={int(ledger.get('phantom_count', 0) or 0)}"
+                )
+            elif errors:
+                stage_status = "BLOCK" if not paper_mode else "WARN"
+                detail = f"sqlite recovery error(s): {len(errors)}"
+            elif over_limit:
+                stage_status = "WARN"
+                detail = f"restored {restored}/{attempted}, above max position limit"
+            elif skipped:
+                stage_status = "PASS"
+                detail = f"restored {restored}/{attempted}; ledger clean"
+            elif disabled:
+                stage_status = "WARN" if not paper_mode else "PASS"
+                detail = "position recovery disabled"
+            else:
+                stage_status = "PASS"
+                detail = f"restored {restored}/{attempted} open position(s)"
+            _add_stage(
+                "startup_recovery",
+                "Startup Recovery",
+                stage_status,
+                detail,
+                critical=not paper_mode,
+                metrics_payload={**recovery, "ledger": ledger, "skipped_at_startup": skipped},
+            )
+        except Exception as exc:
+            _add_stage("startup_recovery", "Startup Recovery", "WARN", sanitize_exception(exc), critical=False)
+
+        # User stream and reconciliation are live-critical, informational in paper.
+        try:
+            stream_connected = bool(getattr(user_stream, "connected", False)) if user_stream is not None else False
+            if paper_mode:
+                _add_stage("user_stream", "User Stream", "PASS", "not required in paper mode", critical=False)
+            else:
+                _add_stage(
+                    "user_stream",
+                    "User Stream",
+                    "PASS" if stream_connected else "BLOCK",
+                    "connected" if stream_connected else "not connected",
+                    metrics_payload={"connected": stream_connected},
+                )
+        except Exception as exc:
+            _add_stage("user_stream", "User Stream", "BLOCK" if not paper_mode else "WARN", sanitize_exception(exc), critical=not paper_mode)
+
+        try:
+            if paper_mode:
+                _add_stage("reconciliation", "Reconciliation", "PASS", "not required in paper mode", critical=False)
+            elif reconciliation_result is None:
+                _add_stage("reconciliation", "Reconciliation", "BLOCK", "startup reconciliation has not run")
+            else:
+                mismatches = list(getattr(reconciliation_result, "mismatches", []) or [])
+                missing_sl = list(getattr(reconciliation_result, "positions_without_sl", []) or [])
+                recon_ok = (
+                    bool(getattr(reconciliation_result, "success", False))
+                    and not bool(getattr(reconciliation_result, "safe_mode", False))
+                    and not mismatches
+                    and not missing_sl
+                )
+                _add_stage(
+                    "reconciliation",
+                    "Reconciliation",
+                    "PASS" if recon_ok else "BLOCK",
+                    "clean" if recon_ok else "mismatch or protective-order gap",
+                    metrics_payload={"mismatches": len(mismatches), "positions_without_sl": len(missing_sl)},
+                )
+        except Exception as exc:
+            _add_stage("reconciliation", "Reconciliation", "BLOCK" if not paper_mode else "WARN", sanitize_exception(exc), critical=not paper_mode)
+
+        # Alerts and recent logs.
+        try:
+            am = getattr(app.state, "alert_manager", None)
+            if am is None:
+                _add_stage("alerts", "Alerts", "WARN", "alert manager unavailable", critical=False)
+            else:
+                alert_status = am.get_status() if hasattr(am, "get_status") else {}
+                channels = int(alert_status.get("channels", 0) or 0)
+                _add_stage(
+                    "alerts",
+                    "Alerts",
+                    "PASS" if channels > 0 else "WARN",
+                    f"{channels} channel(s)",
+                    critical=False,
+                    metrics_payload=alert_status,
+                )
+        except Exception as exc:
+            _add_stage("alerts", "Alerts", "WARN", sanitize_exception(exc), critical=False)
+
+        try:
+            recent = list(_log_buffer)[-50:]
+            errors = sum(1 for row in recent if str(row.get("level", "")).upper() in {"ERROR", "CRITICAL"})
+            _add_stage(
+                "logs",
+                "Logs",
+                "WARN" if errors else "PASS",
+                f"{errors} recent error(s)",
+                critical=False,
+                metrics_payload={"recent": len(recent), "errors": errors},
+            )
+        except Exception as exc:
+            _add_stage("logs", "Logs", "WARN", sanitize_exception(exc), critical=False)
+
+        # Latency telemetry across feed, decision, risk/execution and order ack paths.
+        try:
+            lat = metrics.get_latency_percentiles() if metrics and hasattr(metrics, "get_latency_percentiles") else {}
+            feed_p95 = _max_p95(lat.get("feed_lag", {})) if isinstance(lat, dict) else 0.0
+            order_p95 = _max_p95(lat.get("order_latency", {})) if isinstance(lat, dict) else 0.0
+            decision_p95 = _max_p95(lat.get("decision_latency", {})) if isinstance(lat, dict) else 0.0
+            pipeline_bucket = lat.get("pipeline_latency", {}) if isinstance(lat, dict) else {}
+            pipeline_p95 = _max_p95(
+                pipeline_bucket,
+                ignore_prefixes=("paper_fill_probe",),
+            ) if isinstance(lat, dict) else 0.0
+            sample_count = 0
+            if isinstance(lat, dict):
+                for bucket in ("feed_lag", "order_latency", "decision_latency"):
+                    for item in (lat.get(bucket, {}) or {}).values():
+                        if isinstance(item, dict):
+                            sample_count += int(item.get("count", 0) or 0)
+                for key, item in (pipeline_bucket or {}).items():
+                    if str(key).startswith("paper_fill_probe"):
+                        continue
+                    if isinstance(item, dict):
+                        sample_count += int(item.get("count", 0) or 0)
+            has_samples = sample_count > 0
+            worst = max(feed_p95, order_p95, decision_p95, pipeline_p95)
+            if not has_samples:
+                stage_status = "WARN"
+            elif order_p95 >= 2500.0 or feed_p95 >= 5000.0 or pipeline_p95 >= 1000.0:
+                stage_status = "BLOCK" if not paper_mode else "WARN"
+            elif order_p95 >= 750.0 or feed_p95 >= 1000.0 or pipeline_p95 >= 200.0:
+                stage_status = "WARN"
+            else:
+                stage_status = "PASS"
+            _add_stage(
+                "latency",
+                "Latency",
+                stage_status,
+                "warming" if not has_samples else f"worst p95 {worst:.0f}ms",
+                critical=not paper_mode,
+                metrics_payload={
+                    "sample_count": sample_count,
+                    "feed_p95_ms": feed_p95,
+                    "order_p95_ms": order_p95,
+                    "decision_p95_ms": decision_p95,
+                    "pipeline_p95_ms": pipeline_p95,
+                },
+            )
+        except Exception as exc:
+            _add_stage("latency", "Latency", "WARN", sanitize_exception(exc), critical=False)
+
+        # Final live gate mirrors /api/live/readiness but does not block paper mode.
+        live_payload: dict[str, Any] = {}
+        try:
+            live_payload = await api_live_readiness()
+            live_ready = bool(live_payload.get("ready_for_live", False))
+            if paper_mode:
+                _add_stage("live_gate", "Live Gate", "PASS", "paper mode active", critical=False, metrics_payload=live_payload)
+            else:
+                _add_stage(
+                    "live_gate",
+                    "Live Gate",
+                    "PASS" if live_ready else "BLOCK",
+                    "ready for live" if live_ready else f"blocked: {', '.join(live_payload.get('blockers', []) or [])}",
+                    metrics_payload=live_payload,
+                )
+        except Exception as exc:
+            live_payload = {"ready_for_live": False, "error": sanitize_exception(exc)}
+            _add_stage("live_gate", "Live Gate", "BLOCK" if not paper_mode else "WARN", sanitize_exception(exc), critical=not paper_mode)
+
+        summary = {"pass": 0, "warn": 0, "block": 0, "unknown": 0, "total": len(stages)}
+        for stage in stages:
+            key = str(stage.get("status", "UNKNOWN")).lower()
+            if key in summary:
+                summary[key] += 1
+            else:
+                summary["unknown"] += 1
+
+        critical_blockers = [stage["id"] for stage in stages if stage.get("critical", True) and stage.get("status") == "BLOCK"]
+        warnings = [stage["id"] for stage in stages if stage.get("status") in {"WARN", "UNKNOWN"}]
+        if critical_blockers:
+            overall = "BLOCKED"
+        elif warnings:
+            overall = "WARMING"
+        else:
+            overall = "READY"
+
+        can_trade_paper = not critical_blockers
+        can_trade_live = (not paper_mode) and can_trade_paper and bool(live_payload.get("ready_for_live", False))
+        entry_allowed_now = bool(entry_payload.get("allowed", False)) and can_trade_paper
+        can_enter_paper = can_trade_paper and entry_allowed_now
+        can_enter_live = can_trade_live and entry_allowed_now
+        return {
+            "available": True,
+            "mode": mode,
+            "status": overall,
+            "engine_ready_paper": can_trade_paper,
+            "engine_ready_live": can_trade_live,
+            "can_trade_paper": can_trade_paper,
+            "can_trade_live": can_trade_live,
+            "entry_allowed_now": entry_allowed_now,
+            "can_enter_paper": can_enter_paper,
+            "can_enter_live": can_enter_live,
+            "entry_blockers": list(entry_payload.get("blockers", []) or []),
+            "entry_receipt": entry_payload,
+            "blockers": critical_blockers,
+            "warnings": warnings,
+            "summary": summary,
+            "stages": stages,
+            "live_readiness": live_payload,
+            "config_hash": str(getattr(app.state, "config_hash", "")),
+            "timestamp": int(time.time()),
+        }
 
     @app.get("/api/health/detailed")
     async def api_health_detailed() -> dict[str, Any]:
@@ -3840,7 +6066,7 @@ def build_app(
             }
         except Exception as exc:
             logger.debug("health/detailed error: {}", exc)
-            return {"overall": "error", "components": {}, "error": str(exc)}
+            return {"overall": "error", "components": {}, "error": sanitize_exception(exc)}
 
     @app.get("/api/alerts/status")
     async def api_alerts_status() -> dict[str, Any]:
@@ -3972,7 +6198,7 @@ def build_app(
                 "reason": result.reason,
             }
         except Exception as exc:
-            return {"ok": False, "reason": str(exc)}
+            return {"ok": False, "reason": sanitize_exception(exc)}
 
     return app
 
@@ -4178,10 +6404,10 @@ async def run_dashboard(config: Config, app: Any) -> None:
     sock.listen(2048)
     sock.setblocking(False)
 
-    server_config = uvicorn.Config(app, fd=sock.fileno(), log_level="warning")
+    server_config = uvicorn.Config(app, log_level="warning")
     server = uvicorn.Server(server_config)
     logger.info("Dashboard API starting on http://{}:{}", host, port)
     try:
-        await server.serve()
+        await server.serve(sockets=[sock])
     finally:
         sock.close()

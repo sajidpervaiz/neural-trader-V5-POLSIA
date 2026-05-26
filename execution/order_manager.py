@@ -4,12 +4,14 @@ and self-trade prevention.
 """
 
 import asyncio
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
+
+from core.error_handling import sanitize_exception
 
 from core.config import Config
 from core.event_bus import EventBus
@@ -17,6 +19,13 @@ from core.circuit_breaker import CircuitBreaker
 from core.persistent_idempotency import PersistentIdempotencyManager
 from core.retry import RetryPolicy
 from execution.order_splitter import TWAPExecutor, IcebergExecutor
+from execution.order_validation import (
+    validate_order_side,
+    validate_order_type,
+    validate_price,
+    validate_quantity,
+    validate_symbol,
+)
 from execution.shadow_sl import ShadowStopManager
 
 
@@ -188,6 +197,7 @@ class OrderManager:
         )
 
         self._lock = asyncio.Lock()
+        self._order_lock = asyncio.Lock()
         self._running = False
         self._audit_log_path = audit_log_path
         self._order_state_path = order_state_path
@@ -388,7 +398,7 @@ class OrderManager:
             return fallback, metadata
 
         try:
-            from execution.binance_executor import OrderSide as RouterOrderSide
+            from execution.legacy_cex_common import OrderSide as RouterOrderSide
 
             router_side = RouterOrderSide.BUY if side == OrderSide.BUY else RouterOrderSide.SELL
             decision = await self.smart_router.route_order(
@@ -432,14 +442,14 @@ class OrderManager:
             fallback = self._default_exchange()
             logger.warning("Smart routing failed: {} — falling back to {}", exc, fallback)
             metadata["routing_mode"] = "fallback_error"
-            metadata["routing_error"] = str(exc)
+            metadata["routing_error"] = sanitize_exception(exc)
             metadata["requested_exchange"] = exchange
             return fallback, metadata
 
     def generate_client_order_id(self, exchange: str, symbol: str, side: OrderSide) -> str:
         """Generate unique client order ID"""
         timestamp_ms = int(time.time() * 1000)
-        unique_part = str(uuid.uuid4())[:8]
+        unique_part = secrets.token_hex(8)
         return f"{exchange}-{symbol}-{side.value[0]}-{timestamp_ms}-{unique_part}"
 
     async def place_order(
@@ -459,21 +469,54 @@ class OrderManager:
         Returns:
             (success: bool, order: Order, reason: str)
         """
-        async with self._lock:
-            # Check circuit breaker
-            cb_open = False
-            if hasattr(self.circuit_breaker, 'get_state'):
-                cb_open = self.circuit_breaker.get_state().value == "OPEN"
-            elif hasattr(self.circuit_breaker, 'tripped'):
-                cb_open = self.circuit_breaker.tripped
-            if cb_open:
-                return False, None, "circuit_breaker_open"
+        # Validate caller input before acquiring the order idempotency lock.
+        try:
+            validate_symbol(symbol)
+        except ValueError:
+            return False, None, "invalid_symbol"
+        try:
+            validate_quantity(quantity)
+        except ValueError:
+            return False, None, "invalid_quantity"
+        try:
+            validate_order_side(side)
+        except ValueError:
+            return False, None, "invalid_side"
+        try:
+            validate_order_type(order_type)
+        except ValueError:
+            return False, None, "invalid_order_type"
+        try:
+            validate_price(price, order_type)
+        except ValueError:
+            return False, None, "invalid_price"
 
-            # Use caller-provided client order ID when supplied; otherwise generate one.
-            if not client_order_id:
-                client_order_id = self.generate_client_order_id(exchange, symbol, side)
+        if not isinstance(side, OrderSide):
+            side = OrderSide(str(side).strip().lower())
+        if not isinstance(order_type, OrderType):
+            order_type = OrderType(str(order_type).strip().lower())
 
-            # Check idempotency
+        # Check circuit breaker
+        cb_open = False
+        if hasattr(self.circuit_breaker, 'get_state'):
+            cb_open = self.circuit_breaker.get_state().value == "OPEN"
+        elif hasattr(self.circuit_breaker, 'tripped'):
+            cb_open = self.circuit_breaker.tripped
+        if cb_open:
+            return False, None, "circuit_breaker_open"
+
+        # Use caller-provided client order ID when supplied; otherwise generate one.
+        if not client_order_id:
+            client_order_id = self.generate_client_order_id(exchange, symbol, side)
+
+        # Self-trade prevention metadata/routing may involve external exchange/router I/O;
+        # keep that await outside the idempotency critical section.
+        metadata = dict(metadata or {})
+        exchange, metadata = await self._resolve_exchange(exchange, symbol, side, quantity, metadata)
+
+        async with self._order_lock:
+            # Check idempotency and store the newly-created order atomically so
+            # concurrent retries with the same client_order_id cannot create duplicates.
             if self.idempotency.check_and_set(client_order_id):
                 cached_order = self.client_order_map.get(client_order_id)
                 if cached_order:
@@ -481,8 +524,6 @@ class OrderManager:
                     return True, cached_order, "idempotent_retry"
 
             # Self-trade prevention
-            metadata = dict(metadata or {})
-            exchange, metadata = await self._resolve_exchange(exchange, symbol, side, quantity, metadata)
             self_trade_reason = self._check_self_trade(exchange, symbol, side)
             if self_trade_reason:
                 logger.warning(f"Self-trade prevented for {symbol}: {self_trade_reason}")
@@ -499,7 +540,7 @@ class OrderManager:
                 )
 
             # Create order
-            order_id = f"ord_{uuid.uuid4().hex[:12]}_{int(time.time() * 1000)}"
+            order_id = f"ord_{secrets.token_hex(16)}"
             order = Order(
                 order_id=order_id,
                 client_order_id=client_order_id,

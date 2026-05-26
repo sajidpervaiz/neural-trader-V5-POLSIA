@@ -347,15 +347,27 @@ class VariationalExecutor:
         if signal.exchange != "variational":
             return
 
-        approved, reason, size, pos = await self.risk_manager.approve_and_open(signal)
+        approved, reason, size, pos = await self.risk_manager.approve_and_open(
+            signal,
+            reserve_until_fill=True,
+        )
         if not approved:
             logger.debug("Variational signal rejected for {}: {}", signal.symbol, reason)
             return
 
         result = await self.execute_signal(signal, size)
         if result is None:
-            # Execution failed — release the reserved position
-            await self.risk_manager.close_position("variational", signal.symbol, signal.price)
+            # Execution failed before a confirmed fill; remove the reservation
+            # without recording fake PnL.
+            await self.risk_manager.cancel_reserved_position("variational", signal.symbol)
+            return
+
+        await self.risk_manager.rebase_position_to_fill(
+            "variational",
+            signal.symbol,
+            result.price,
+            result.quantity,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle

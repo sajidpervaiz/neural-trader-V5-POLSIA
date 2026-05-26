@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import quote
 
 from loguru import logger
+
+from core.error_handling import sanitize_exception
 
 try:
     import asyncpg
@@ -125,14 +128,26 @@ class DBHandler:
         # only loguru sees the failure (legacy behaviour).
         self._event_bus = event_bus
         pg = config.get_value("storage", "postgres") or {}
-        self._dsn = (
-            f"postgresql://{pg.get('user', 'trader')}:{pg.get('password', '')}@"
-            f"{pg.get('host', 'localhost')}:{pg.get('port', 5432)}/"
-            f"{pg.get('database', 'neural_trader')}"
-        )
+        user = str(pg.get("user", "trader") or "trader")
+        password = str(pg.get("password", "") or "")
+        host = str(pg.get("host", "localhost") or "localhost")
+        port = int(pg.get("port", 5432) or 5432)
+        database = str(pg.get("database", "neural_trader") or "neural_trader")
+        # Use the real configured password for asyncpg, but keep a separate
+        # redacted DSN for diagnostics. URL-encode credentials so special
+        # characters in POSTGRES_PASSWORD do not break live DB auth.
+        encoded_user = quote(user, safe="")
+        encoded_password = quote(password, safe="")
+        encoded_database = quote(database, safe="")
+        auth = f"{encoded_user}:{encoded_password}@" if password else f"{encoded_user}@"
+        redacted_auth = f"{encoded_user}:***@" if password else f"{encoded_user}@"
+        self._dsn = f"postgresql://{auth}{host}:{port}/{encoded_database}"
+        self._redacted_dsn = f"postgresql://{redacted_auth}{host}:{port}/{encoded_database}"
         self._pool_size = int(pg.get("pool_size", 10))
         self._timescale = bool(pg.get("timescaledb", True))
         self._connected_once = False  # for distinguishing initial fail vs reconnect fail
+        self._personal_sqlite_mode = bool(config.get_value("storage", "personal_sqlite_mode", default=False))
+
 
     async def connect(self, timeout: float = 10.0) -> None:
         if self._pool is not None:
@@ -159,6 +174,14 @@ class DBHandler:
                 self._emit_alert("ALERT_WARNING", "db_reconnected",
                                  "Database connection RESTORED after outage")
         except Exception as exc:
+            self._pool = None
+            if self._personal_sqlite_mode:
+                logger.warning(
+                    "PostgreSQL unavailable: {} - explicit personal SQLite mode is active; "
+                    "continuing with local durable persistence.",
+                    sanitize_exception(exc),
+                )
+                return
             # Loud-and-loud: was previously a single warning. Now CRITICAL +
             # ALERT_CRITICAL event so monitoring and audit (when bus is wired)
             # see it. The bot still continues — but the operator knows audit
@@ -172,7 +195,7 @@ class DBHandler:
             self._emit_alert(
                 "ALERT_CRITICAL",
                 "db_unavailable" if not self._connected_once else "db_disconnected",
-                f"PostgreSQL unreachable: {str(exc)[:160]}",
+                f"PostgreSQL unreachable: {sanitize_exception(exc)[:160]}",
             )
 
     def _emit_alert(self, level: str, alert_type: str, message: str) -> None:

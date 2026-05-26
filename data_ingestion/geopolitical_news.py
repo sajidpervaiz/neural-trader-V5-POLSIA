@@ -128,6 +128,9 @@ class GeoPoliticalNewsFeed:
             self._session = aiohttp.ClientSession(
                 timeout=_FEED_TIMEOUT,
                 headers={"User-Agent": _USER_AGENT, "Accept": "application/rss+xml, application/xml, text/xml, */*"},
+                # Avoid aiohttp/aiodns "exception in shielded future" stderr
+                # tracebacks when one public RSS host has flaky DNS.
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
             )
         return self._session
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from execution.executor_contract import executor_contract_status
 from execution.exchange_factory import create_all_executors, create_executor
 
 
@@ -38,6 +39,8 @@ def test_factory_returns_runtime_compatible_executors_for_bybit_and_okx() -> Non
     assert {executor.exchange_id for executor in executors} == {"bybit", "okx"}
     for executor in executors:
         assert callable(getattr(executor, "run", None))
+        status = executor_contract_status(executor)
+        assert status["contract_ok"], status
 
 
 def test_factory_injects_order_manager_into_cex_executor_instances() -> None:
@@ -60,3 +63,24 @@ def test_factory_injects_order_manager_into_cex_executor_instances() -> None:
     assert bybit is not None
     assert getattr(binance, "_order_manager", None) is order_manager
     assert getattr(bybit, "_order_manager", None) is order_manager
+
+
+def test_executor_contract_status_blocks_missing_safety_methods() -> None:
+    class IncompleteExecutor:
+        exchange_id = "incomplete"
+
+        async def run(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def execute_signal(self, signal, size):
+            return None
+
+    status = executor_contract_status(IncompleteExecutor())
+
+    assert not status["contract_ok"]
+    assert "close_position" in status["blockers"]
+    assert "cancel_order" in status["blockers"]
+    assert "get_orderbook_snapshot" in status["blockers"]

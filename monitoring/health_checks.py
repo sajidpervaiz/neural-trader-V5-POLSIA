@@ -9,6 +9,8 @@ import asyncio
 import time
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 
 class HealthStatus(Enum):
     HEALTHY = "HEALTHY"
@@ -130,7 +132,7 @@ class HealthChecker:
                 component=name,
                 status=HealthStatus.UNHEALTHY,
                 latency_ms=(time.time() - start_time) * 1000,
-                message=str(e),
+                message=sanitize_exception(e),
                 last_check=time.time(),
             )
 

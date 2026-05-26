@@ -10,6 +10,7 @@ from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
 from execution.cex_executor import CEXExecutor, OrderResult
+from execution.legacy_cex_common import L2DepthLevel, OrderbookSnapshot
 from execution.order_manager import OrderManager
 from execution.risk_manager import RiskManager
 
@@ -113,6 +114,7 @@ class HyperliquidExecutor(CEXExecutor):
         is_buy = signal.direction == "long"
 
         try:
+            submit_started = time.perf_counter()
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self._hl_exchange.market_open(
@@ -122,6 +124,7 @@ class HyperliquidExecutor(CEXExecutor):
                     slippage=0.01,  # 1 % max slippage
                 ),
             )
+            self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
 
             status = result.get("status", "unknown")
             if status != "ok":
@@ -158,8 +161,7 @@ class HyperliquidExecutor(CEXExecutor):
                 timestamp=int(time.time() * 1000),
             )
             if reserved_pos is not None:
-                reserved_pos.current_price = fill_px
-                reserved_pos.size = fill_sz
+                self._apply_fill_to_position(reserved_pos, signal, fill_px, fill_sz)
             else:
                 await self.risk_manager.open_position(signal, fill_sz * fill_px)
             await self.event_bus.publish("ORDER_FILLED", result)
@@ -189,6 +191,66 @@ class HyperliquidExecutor(CEXExecutor):
         except Exception as exc:
             logger.error("Hyperliquid close error: {}", exc)
             return False
+
+    async def close_position(
+        self,
+        symbol: str,
+        price: float,
+        *,
+        reason: str = "manual_close",
+    ) -> OrderResult | None:
+        positions = getattr(self.risk_manager, "positions", {}) or {}
+        pos = positions.get(f"{self.exchange_id}:{symbol}")
+        if pos is None:
+            logger.warning("Hyperliquid close skipped: no tracked position for {}", symbol)
+            return None
+
+        requested_price = float(price or 0.0)
+        if requested_price <= 0:
+            requested_price = float(getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0)
+        quantity = abs(float(getattr(pos, "size", 0.0) or 0.0))
+        if quantity <= 0 or requested_price <= 0:
+            logger.warning("Hyperliquid close invalid qty/price for {} qty={} price={}", symbol, quantity, requested_price)
+            return None
+
+        direction = str(getattr(pos, "direction", "long") or "long").lower()
+        is_paper = bool(getattr(self.config, "paper_mode", False))
+        if not is_paper:
+            ok = await self._close_position_live(symbol, quantity)
+            if not ok:
+                return None
+
+        closed = await self.risk_manager.close_position(self.exchange_id, symbol, requested_price)
+        if closed is None:
+            logger.critical("Hyperliquid close succeeded for {} but risk state was not closed", symbol)
+            await self.event_bus.publish("ALERT_CRITICAL", {
+                "type": "executor_close_risk_sync_failed",
+                "exchange": self.exchange_id,
+                "symbol": symbol,
+                "reason": reason,
+                "ts": int(time.time()),
+            })
+
+        result = OrderResult(
+            order_id=f"hl_close_{int(time.time() * 1000)}",
+            exchange=self.exchange_id,
+            symbol=symbol,
+            direction=direction,
+            price=requested_price,
+            quantity=quantity,
+            status="filled",
+            is_paper=is_paper,
+            timestamp=int(time.time()),
+            raw={"reason": reason, "contract_close": True},
+        )
+        if closed is not None:
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": closed,
+                "reason": reason,
+                "price": requested_price,
+                "order_id": result.order_id,
+            })
+        return result
 
     # ── Cancel order ──────────────────────────────────────────────────────
 
@@ -330,3 +392,21 @@ class HyperliquidExecutor(CEXExecutor):
         except Exception as exc:
             logger.error("Hyperliquid orderbook error: {}", exc)
             return {}
+
+    async def get_orderbook_snapshot(self, symbol: str, depth: int = 10) -> OrderbookSnapshot:
+        data = await self.get_orderbook(symbol, depth=depth)
+        bids = [
+            L2DepthLevel(price=float(level.get("price", 0.0)), quantity=float(level.get("quantity", 0.0)))
+            for level in data.get("bids", [])[:depth]
+        ]
+        asks = [
+            L2DepthLevel(price=float(level.get("price", 0.0)), quantity=float(level.get("quantity", 0.0)))
+            for level in data.get("asks", [])[:depth]
+        ]
+        return OrderbookSnapshot(
+            symbol=symbol,
+            timestamp_ms=int(time.time() * 1000),
+            bids=bids,
+            asks=asks,
+            sequence=0,
+        )

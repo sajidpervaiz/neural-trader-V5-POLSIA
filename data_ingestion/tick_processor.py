@@ -1,20 +1,21 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
 from loguru import logger
 
+from core.rust_loader import load_neural_trader_rust
 from data_ingestion.normalizer import Tick, Candle
 
 
-try:
-    import neural_trader_rust as _rust
-    _RUST_AVAILABLE = True
-    logger.info("Rust tick processor loaded (neural_trader_rust)")
-except ImportError:
-    _RUST_AVAILABLE = False
-    logger.info("Rust module unavailable — using Python tick processor")
+_rust, _RUST_SOURCE = load_neural_trader_rust()
+_RUST_AVAILABLE = _rust is not None
+if _RUST_AVAILABLE:
+    logger.info("Rust tick processor loaded ({})", _RUST_SOURCE)
+else:
+    logger.info("Rust module unavailable; using Python tick processor ({})", _RUST_SOURCE)
 
 
 class CandleAggregator:
@@ -125,9 +126,20 @@ class TickBatchParser:
     def parse_batch(self, exchange: str, raw_ticks: list[dict]) -> list[Tick]:
         if _RUST_AVAILABLE:
             try:
+                raw_json = json.dumps(raw_ticks, separators=(",", ":"))
+                parsed = _rust.TickParser.parse_batch(exchange, raw_json)
                 return [
-                    Tick(**t)
-                    for t in _rust.TickParser.parse_batch(exchange, raw_ticks)
+                    Tick(
+                        exchange=str(t.get("exchange", exchange)),
+                        symbol=str(t["symbol"]),
+                        timestamp_us=int(t.get("timestamp_us") or int(t.get("timestamp_ns", 0) or 0) // 1000),
+                        price=float(t["price"]),
+                        volume=float(t.get("volume", 0.0)),
+                        side=str(t.get("side", "")),
+                        trade_id=str(t.get("trade_id", "")),
+                    )
+                    for t in parsed
+                    if t.get("symbol") is not None and t.get("price") is not None
                 ]
             except Exception as exc:
                 logger.debug("Rust batch parse error: {}", exc)

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import json
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -262,7 +262,7 @@ class PaperLedger:
     @staticmethod
     def make_trade_id() -> str:
         ts = datetime.now(tz=timezone.utc).strftime("%H%M%S")
-        return f"PT-{uuid.uuid4().hex[:8]}-{ts}"
+        return f"PT-{secrets.token_hex(4)}-{ts}"
 
     def get_stats(self) -> dict[str, Any]:
         closed = [t for t in self.trades.values() if t.status == "CLOSED"]

@@ -27,6 +27,10 @@ except Exception:
 
 from loguru import logger
 
+from core.logging_utils import configure_sensitive_logging_redaction
+
+configure_sensitive_logging_redaction()
+
 from core.config import Config
 from core.event_bus import EventBus
 from core.dispatcher import Dispatcher
@@ -38,6 +42,7 @@ from data_ingestion.news_feed import NewsFeed
 from data_ingestion.geopolitical_news import GeoPoliticalNewsFeed
 from data_ingestion.oi_feed import OpenInterestFeed
 from data_ingestion.orderbook_feed import OrderbookFeed
+from data_ingestion.market_data_integrity import MarketDataIntegrityMonitor
 from data_ingestion.vix_proxy import VIXProxy
 from data_ingestion.user_stream import UserDataStream
 
@@ -95,10 +100,37 @@ def _requires_live_confirmation(config: Config) -> bool:
     return not all(bool(venue_cfg.get("testnet", False)) for venue_cfg in enabled_venues)
 
 
+def _enforce_live_audit_db_available(
+    config: Config,
+    db: DBHandler,
+    sqlite_store: SQLiteStore | None = None,
+) -> None:
+    """Fail closed in live mode unless durable audit persistence is explicit."""
+    if config.paper_mode:
+        return
+    if getattr(db, "available", False):
+        return
+    sqlite_personal = bool(config.get_value("storage", "personal_sqlite_mode", default=False))
+    sqlite_ok = bool(sqlite_store is not None and getattr(sqlite_store, "available", False))
+    if sqlite_personal and sqlite_ok:
+        logger.warning(
+            "PostgreSQL audit DB unavailable; explicit personal SQLite mode is active at {}. "
+            "This is durable local persistence for personal use, not clustered HA storage.",
+            getattr(sqlite_store, "path", "data/neural_trader.db"),
+        )
+        return
+    logger.critical(
+        "LIVE TRADING BLOCKED: PostgreSQL audit database is unavailable. "
+        "Set storage.personal_sqlite_mode=true only if you intentionally accept local SQLite persistence."
+    )
+    sys.exit(1)
+
+
 def _setup_logging(config: Config) -> None:
     log_dir = Path(config.get_value("system", "log_dir") or "logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.remove()
+    configure_sensitive_logging_redaction()
     logger.add(
         sys.stdout,
         level=config.log_level,
@@ -142,7 +174,9 @@ async def _run_bot(components: dict[str, Any]) -> None:
     db = DBHandler(config, event_bus=event_bus)
     components["db"] = db
     cache = Cache(config)
-    sqlite_store = SQLiteStore()
+    storage_cfg = config.get_value("storage", default={}) or {}
+    sqlite_cfg = storage_cfg.get("sqlite", {}) if isinstance(storage_cfg, dict) else {}
+    sqlite_store = SQLiteStore(sqlite_cfg.get("path", "data/neural_trader.db"))
     metrics = Metrics(config, event_bus)
     health_checker = HealthChecker(check_interval=30)
     components["health_checker"] = health_checker
@@ -169,6 +203,7 @@ async def _run_bot(components: dict[str, Any]) -> None:
     event_bus.subscribe("CANDLE", _persist_candle)
     # ── Database ──────────────────────────────────────────────────────────
     await db.connect()
+    _enforce_live_audit_db_available(config, db, sqlite_store)
 
     # ── Trade persistence (production audit trail) ────────────────────────
     trade_persistence: TradePersistence | None = None
@@ -210,6 +245,8 @@ async def _run_bot(components: dict[str, Any]) -> None:
     components["news_feed"] = news_feed
     orderbook_feed = OrderbookFeed(config, event_bus)
     components["orderbook_feed"] = orderbook_feed
+    market_data_integrity = MarketDataIntegrityMonitor(config, event_bus)
+    components["market_data_integrity"] = market_data_integrity
 
     # Geopolitical scorer + RSS feed (Layer 10 additive contributor — opt-in via
     # signals.geopolitical_weight; defaults to 0.0 so existing flows are unchanged).
@@ -244,7 +281,41 @@ async def _run_bot(components: dict[str, Any]) -> None:
             "POST /api/auto/toggle {{\"enabled\": true}} to start trading.",
         )
     risk_mgr = RiskManager(config, event_bus, sqlite_store=sqlite_store)
+    sqlite_recovery_result: dict[str, Any] | None = None
+    restore_positions = bool(
+        config.get_value("execution", "restore_positions_on_startup", default=True)
+    )
+    if restore_positions and getattr(sqlite_store, "available", False):
+        try:
+            sqlite_recovery_result = await risk_mgr.restore_open_positions_from_sqlite()
+            components["sqlite_recovery_result"] = sqlite_recovery_result
+            logger.info(
+                "SQLite position recovery: restored={} skipped={} errors={}",
+                sqlite_recovery_result.get("restored", 0),
+                sqlite_recovery_result.get("skipped", 0),
+                len(sqlite_recovery_result.get("errors", []) or []),
+            )
+        except Exception as exc:
+            sqlite_recovery_result = {
+                "source": "sqlite",
+                "success": False,
+                "error": str(exc),
+                "attempted": 0,
+                "restored": 0,
+            }
+            components["sqlite_recovery_result"] = sqlite_recovery_result
+            logger.error("SQLite position recovery failed: {}", exc)
+    else:
+        sqlite_recovery_result = {
+            "source": "sqlite",
+            "success": True,
+            "disabled": True,
+            "attempted": 0,
+            "restored": 0,
+        }
+        components["sqlite_recovery_result"] = sqlite_recovery_result
     signal_gen.set_risk_manager(risk_mgr)  # wire for accurate position counting
+    signal_gen.set_market_data_integrity(market_data_integrity)
     order_mgr = OrderManager(config, event_bus, risk_mgr._circuit_breaker)
     components["order_mgr"] = order_mgr
 
@@ -345,11 +416,13 @@ async def _run_bot(components: dict[str, Any]) -> None:
         metrics=metrics,
         geopolitical_feed=geopolitical_feed,
         periodic_reconciler=periodic_reconciler,
+        market_data_integrity=market_data_integrity,
     )
 
     if app is not None:
         app.state.health_checker = health_checker
         app.state.alert_manager = alert_manager
+        app.state.sqlite_recovery_result = sqlite_recovery_result
 
     # ── ModelRetrainer (periodic background retrain of the ML model) ──────
     model_retrainer = None
@@ -392,7 +465,11 @@ async def _run_bot(components: dict[str, Any]) -> None:
         stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _signal_handler)
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            # Windows event loops do not implement add_signal_handler().
+            signal.signal(sig, _signal_handler)
 
     # ── ARMS-V2.1: Periodic risk tasks ────────────────────────────────────
     async def _periodic_liq_check(rm: RiskManager, stop_ev: asyncio.Event) -> None:
@@ -453,6 +530,7 @@ async def _run_bot(components: dict[str, Any]) -> None:
         symbols=config.get_value("exchanges", "binance", "symbols") or ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"],
         timeframes=["1m", "5m", "15m", "1h", "4h", "1d"],
         data_manager=data_manager,
+        market_data_integrity=market_data_integrity,
     )
     components["paper_feed"] = paper_feed
     _seed_only = not config.paper_mode  # live mode: seed only, WS provides data
@@ -498,8 +576,10 @@ async def _run_bot(components: dict[str, Any]) -> None:
         asyncio.create_task(news_feed.run(), name="news_feed"),
         asyncio.create_task(geopolitical_feed.run(), name="geopolitical_feed"),
         asyncio.create_task(orderbook_feed.run(), name="orderbook_feed"),
+        asyncio.create_task(market_data_integrity.run(), name="market_data_integrity"),
         asyncio.create_task(telegram.run(), name="telegram"),
         asyncio.create_task(order_mgr.run(), name="order_manager"),
+        asyncio.create_task(metrics.run(), name="metrics"),
         asyncio.create_task(user_stream.run(), name="user_data_stream"),
         asyncio.create_task(_periodic_liq_check(risk_mgr, stop_event), name="liq_check"),
         asyncio.create_task(_periodic_funding_check(risk_mgr, stop_event), name="funding_recheck"),
@@ -599,7 +679,7 @@ async def _final_cleanup(components: dict[str, Any]) -> None:
     # 5. Stop remaining components in the same order as the previous graceful path.
     cleanup_order = [
         "dispatcher", "ws_manager", "funding_feed", "oi_feed", "sentiment",
-        "news_feed", "geopolitical_feed", "orderbook_feed", "dex_feed", "vix_proxy", "telegram",
+        "news_feed", "geopolitical_feed", "orderbook_feed", "market_data_integrity", "dex_feed", "vix_proxy", "telegram",
         "order_mgr", "alert_dispatcher", "paper_feed",
     ]
     for name in cleanup_order:

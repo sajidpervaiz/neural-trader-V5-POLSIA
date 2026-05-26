@@ -177,6 +177,9 @@ class IcebergExecutor:
     def should_split(self, size_usd: float) -> bool:
         return size_usd >= self._threshold
 
+    def get_active_orders(self) -> dict[str, SplitOrder]:
+        return dict(self._active_orders)
+
     def create_split(
         self, order_id: str, symbol: str, direction: str, total_size: float,
     ) -> SplitOrder:

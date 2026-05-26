@@ -40,6 +40,8 @@ class Metrics:
         self._running = False
         self._feed_lag_samples: list[tuple[str, float]] = []  # (exchange, lag_s)
         self._order_latency_samples: list[tuple[str, str, float]] = []  # (exchange, type, lat_s)
+        self._decision_latency_samples: list[tuple[str, str, bool, float]] = []  # (provider, action, approved, lat_s)
+        self._pipeline_latency_samples: list[tuple[str, str, str, float]] = []  # (stage, exchange, symbol, lat_s)
         self._max_samples = 500
 
         if _PROMETHEUS:
@@ -108,6 +110,18 @@ class Metrics:
                 ["exchange", "order_type"],
                 buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
             )
+            self.decision_latency = Histogram(
+                "neuraltrader_decision_latency_seconds",
+                "Trade decision provider latency",
+                ["provider", "action", "approved"],
+                buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0],
+            )
+            self.pipeline_latency = Histogram(
+                "neuraltrader_pipeline_latency_seconds",
+                "End-to-end trading pipeline stage latency",
+                ["stage", "exchange", "symbol"],
+                buckets=[0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0],
+            )
             self.clock_drift = Gauge(
                 "neuraltrader_clock_drift_ms",
                 "Clock drift between bot and exchange in ms",
@@ -156,7 +170,7 @@ class Metrics:
                 "open_positions", "equity", "daily_pnl",
                 "funding_rate", "open_interest_usd", "vix_proxy",
                 "rust_tick_latency", "dex_quote_latency",
-                "ws_feed_lag", "order_execution_latency", "clock_drift",
+                "ws_feed_lag", "order_execution_latency", "decision_latency", "pipeline_latency", "clock_drift",
                 "service_health",
                 "alerts_total", "alerts_suppressed_total",
                 "circuit_breaker_trips_total", "safe_mode_active",
@@ -165,22 +179,46 @@ class Metrics:
             ]:
                 setattr(self, name, _noop())
 
+    def _payload_get(self, payload: Any, key: str, default: Any = None) -> Any:
+        if isinstance(payload, dict):
+            return payload.get(key, default)
+        return getattr(payload, key, default)
+
+    def _record_feed_lag(self, exchange: str, receive_time_us: Any, timestamp_us: Any) -> None:
+        try:
+            recv = int(receive_time_us or 0)
+            ts = int(timestamp_us or 0)
+        except (TypeError, ValueError):
+            return
+        if recv <= 0 or ts <= 0:
+            return
+        raw_lag_s = (recv - ts) / 1_000_000.0
+        if -1.0 < raw_lag_s < 10.0:  # sanity bounds
+            ex = str(exchange or "unknown")
+            self.clock_drift.labels(exchange=ex).set(round(raw_lag_s * 1000.0, 3))
+            lag_s = max(0.0, raw_lag_s)
+            self.ws_feed_lag.labels(exchange=ex).observe(lag_s)
+            self._feed_lag_samples.append((ex, lag_s))
+            if len(self._feed_lag_samples) > self._max_samples:
+                self._feed_lag_samples = self._feed_lag_samples[-self._max_samples:]
+
     async def _handle_tick(self, payload: Any) -> None:
         tick = payload
         if hasattr(tick, "exchange") and hasattr(tick, "symbol"):
             self.ticks_total.labels(exchange=tick.exchange, symbol=tick.symbol).inc()
-            # Track WebSocket feed lag
-            recv = getattr(tick, "receive_time_us", 0)
-            ts = getattr(tick, "timestamp_us", 0)
-            if recv > 0 and ts > 0:
-                lag_s = (recv - ts) / 1_000_000.0
-                if -1.0 < lag_s < 10.0:  # sanity bounds
-                    self.ws_feed_lag.labels(exchange=tick.exchange).observe(lag_s)
-                    # Keep rolling stats for /api/latency
-                    self._feed_lag_samples.append((tick.exchange, lag_s))
-            # Trim rolling buffer
-            if len(self._feed_lag_samples) > self._max_samples:
-                self._feed_lag_samples = self._feed_lag_samples[-self._max_samples:]
+            self._record_feed_lag(
+                str(tick.exchange),
+                getattr(tick, "receive_time_us", 0),
+                getattr(tick, "timestamp_us", 0),
+            )
+
+    async def _handle_orderbook_update(self, payload: Any) -> None:
+        exchange = str(self._payload_get(payload, "exchange", "unknown") or "unknown")
+        self._record_feed_lag(
+            exchange,
+            self._payload_get(payload, "receive_time_us", 0),
+            self._payload_get(payload, "timestamp_us", 0),
+        )
 
     def record_order_latency(self, exchange: str, order_type: str, latency_s: float) -> None:
         """Record order execution latency (called from trade endpoints)."""
@@ -188,6 +226,32 @@ class Metrics:
         self._order_latency_samples.append((exchange, order_type, latency_s))
         if len(self._order_latency_samples) > self._max_samples:
             self._order_latency_samples = self._order_latency_samples[-self._max_samples:]
+
+    def record_decision_latency(self, provider: str, action: str, approved: bool, latency_s: float) -> None:
+        """Record latency for AI/ML/rules decision providers."""
+        provider_name = str(provider or "unknown")
+        action_name = str(action or "unknown")
+        approved_label = "true" if approved else "false"
+        lat = max(0.0, float(latency_s or 0.0))
+        self.decision_latency.labels(
+            provider=provider_name,
+            action=action_name,
+            approved=approved_label,
+        ).observe(lat)
+        self._decision_latency_samples.append((provider_name, action_name, bool(approved), lat))
+        if len(self._decision_latency_samples) > self._max_samples:
+            self._decision_latency_samples = self._decision_latency_samples[-self._max_samples:]
+
+    def record_pipeline_latency(self, stage: str, exchange: str, symbol: str, latency_s: float) -> None:
+        """Record a named stage in the tick-to-ack trading path."""
+        stage_name = str(stage or "unknown")
+        exchange_name = str(exchange or "unknown")
+        symbol_name = str(symbol or "unknown")
+        lat = max(0.0, float(latency_s or 0.0))
+        self.pipeline_latency.labels(stage=stage_name, exchange=exchange_name, symbol=symbol_name).observe(lat)
+        self._pipeline_latency_samples.append((stage_name, exchange_name, symbol_name, lat))
+        if len(self._pipeline_latency_samples) > self._max_samples:
+            self._pipeline_latency_samples = self._pipeline_latency_samples[-self._max_samples:]
 
     @staticmethod
     def _percentile_ms(values: list[float], pct: float) -> float:
@@ -204,7 +268,7 @@ class Metrics:
     def get_latency_stats(self) -> dict[str, Any]:
         """REQ-MON-002: per-bucket latency stats with p50/p95/p99 percentiles."""
         import statistics
-        result: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
+        result: dict[str, Any] = {"feed_lag": {}, "order_latency": {}, "decision_latency": {}, "pipeline_latency": {}}
 
         by_exchange: dict[str, list[float]] = {}
         for ex, lag in self._feed_lag_samples:
@@ -232,12 +296,40 @@ class Metrics:
                 "p99_ms": self._percentile_ms(lats, 99),
                 "max_ms": round(max(lats) * 1000, 0) if lats else 0,
             }
+
+        by_decision: dict[str, list[float]] = {}
+        for provider, action, approved, lat in self._decision_latency_samples:
+            key = f"{provider}_{action}_{'approved' if approved else 'blocked'}"
+            by_decision.setdefault(key, []).append(lat)
+        for key, lats in by_decision.items():
+            result["decision_latency"][key] = {
+                "count": len(lats),
+                "avg_ms": round(statistics.mean(lats) * 1000, 1) if lats else 0,
+                "p50_ms": self._percentile_ms(lats, 50),
+                "p95_ms": self._percentile_ms(lats, 95),
+                "p99_ms": self._percentile_ms(lats, 99),
+                "max_ms": round(max(lats) * 1000, 1) if lats else 0,
+            }
+
+        by_pipeline: dict[str, list[float]] = {}
+        for stage, exchange, symbol, lat in self._pipeline_latency_samples:
+            key = f"{stage}_{exchange}_{symbol}"
+            by_pipeline.setdefault(key, []).append(lat)
+        for key, lats in by_pipeline.items():
+            result["pipeline_latency"][key] = {
+                "count": len(lats),
+                "avg_ms": round(statistics.mean(lats) * 1000, 1) if lats else 0,
+                "p50_ms": self._percentile_ms(lats, 50),
+                "p95_ms": self._percentile_ms(lats, 95),
+                "p99_ms": self._percentile_ms(lats, 99),
+                "max_ms": round(max(lats) * 1000, 1) if lats else 0,
+            }
         return result
 
     def get_latency_percentiles(self) -> dict[str, Any]:
         """Compact percentiles-only payload for the dashboard chip strip."""
         full = self.get_latency_stats()
-        compact: dict[str, Any] = {"feed_lag": {}, "order_latency": {}}
+        compact: dict[str, Any] = {"feed_lag": {}, "order_latency": {}, "decision_latency": {}, "pipeline_latency": {}}
         for ex, stats in full["feed_lag"].items():
             compact["feed_lag"][ex] = {
                 "p50_ms": stats["p50_ms"],
@@ -247,6 +339,20 @@ class Metrics:
             }
         for key, stats in full["order_latency"].items():
             compact["order_latency"][key] = {
+                "p50_ms": stats["p50_ms"],
+                "p95_ms": stats["p95_ms"],
+                "p99_ms": stats["p99_ms"],
+                "count": stats["count"],
+            }
+        for key, stats in full["decision_latency"].items():
+            compact["decision_latency"][key] = {
+                "p50_ms": stats["p50_ms"],
+                "p95_ms": stats["p95_ms"],
+                "p99_ms": stats["p99_ms"],
+                "count": stats["count"],
+            }
+        for key, stats in full["pipeline_latency"].items():
+            compact["pipeline_latency"][key] = {
                 "p50_ms": stats["p50_ms"],
                 "p95_ms": stats["p95_ms"],
                 "p99_ms": stats["p99_ms"],
@@ -271,6 +377,26 @@ class Metrics:
                 symbol=order.symbol,
                 is_paper=str(order.is_paper),
             ).inc()
+
+    async def _handle_decision_latency(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        self.record_decision_latency(
+            provider=str(payload.get("provider", "unknown") or "unknown"),
+            action=str(payload.get("action", "unknown") or "unknown"),
+            approved=bool(payload.get("approved", False)),
+            latency_s=float(payload.get("latency_s", 0.0) or 0.0),
+        )
+
+    async def _handle_pipeline_latency(self, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        self.record_pipeline_latency(
+            stage=str(payload.get("stage", "unknown") or "unknown"),
+            exchange=str(payload.get("exchange", "unknown") or "unknown"),
+            symbol=str(payload.get("symbol", "unknown") or "unknown"),
+            latency_s=float(payload.get("latency_s", 0.0) or 0.0),
+        )
 
     async def _handle_funding(self, payload: Any) -> None:
         if isinstance(payload, list):
@@ -303,6 +429,9 @@ class Metrics:
         self.kill_switch_active.set(1)
 
     async def run(self) -> None:
+        if self._running:
+            logger.debug("Metrics collector already running; duplicate start ignored")
+            return
         self._running = True
         mon_cfg = self.config.get_value("monitoring", "prometheus") or {}
         if mon_cfg.get("enabled", True) and _PROMETHEUS:
@@ -314,8 +443,11 @@ class Metrics:
                 logger.warning("Prometheus server failed: {}", exc)
 
         self.event_bus.subscribe("TICK", self._handle_tick)
+        self.event_bus.subscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
         self.event_bus.subscribe("SIGNAL", self._handle_signal)
         self.event_bus.subscribe("ORDER_FILLED", self._handle_order)
+        self.event_bus.subscribe("DECISION_LATENCY", self._handle_decision_latency)
+        self.event_bus.subscribe("PIPELINE_LATENCY", self._handle_pipeline_latency)
         self.event_bus.subscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.subscribe("OPEN_INTEREST", self._handle_oi)
         self.event_bus.subscribe("VOLATILITY_INDEX", self._handle_vix)
@@ -329,8 +461,11 @@ class Metrics:
     async def stop(self) -> None:
         self._running = False
         self.event_bus.unsubscribe("TICK", self._handle_tick)
+        self.event_bus.unsubscribe("ORDERBOOK_UPDATE", self._handle_orderbook_update)
         self.event_bus.unsubscribe("SIGNAL", self._handle_signal)
         self.event_bus.unsubscribe("ORDER_FILLED", self._handle_order)
+        self.event_bus.unsubscribe("DECISION_LATENCY", self._handle_decision_latency)
+        self.event_bus.unsubscribe("PIPELINE_LATENCY", self._handle_pipeline_latency)
         self.event_bus.unsubscribe("FUNDING_RATE", self._handle_funding)
         self.event_bus.unsubscribe("OPEN_INTEREST", self._handle_oi)
         self.event_bus.unsubscribe("VOLATILITY_INDEX", self._handle_vix)

@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 from enum import Enum
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from execution.order_manager import (
     OrderManager,
     OrderSide as OMSide,
@@ -17,11 +19,60 @@ from execution.order_manager import (
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 _ORDER_MANAGER: Optional[OrderManager] = None
+_CONFIG: Any = None
+_RISK_MANAGER: Any = None
+_DB_HANDLER: Any = None
 
 
-def configure_order_routes(order_manager: Optional[OrderManager]) -> None:
-    global _ORDER_MANAGER
+def configure_order_routes(
+    order_manager: Optional[OrderManager],
+    *,
+    config: Any = None,
+    risk_manager: Any = None,
+    db_handler: Any = None,
+) -> None:
+    global _ORDER_MANAGER, _CONFIG, _RISK_MANAGER, _DB_HANDLER
     _ORDER_MANAGER = order_manager
+    _CONFIG = config
+    _RISK_MANAGER = risk_manager
+    _DB_HANDLER = db_handler
+
+
+def _paper_mode() -> bool:
+    return bool(getattr(_CONFIG, "paper_mode", True))
+
+
+def _risk_kill_switch_active() -> bool:
+    if _RISK_MANAGER is None:
+        return True
+    for attr in ("kill_switch_active", "killed"):
+        value = getattr(_RISK_MANAGER, attr, None)
+        if isinstance(value, bool):
+            return value
+    try:
+        snap = _RISK_MANAGER.get_risk_snapshot()
+        if isinstance(snap, dict):
+            return bool(snap.get("kill_switch_active", False))
+    except Exception:
+        return True
+    return False
+
+
+def _require_legacy_order_mutation_allowed() -> None:
+    """Fail closed for legacy order mutation routes in non-paper mode.
+
+    Live order entry must go through /api/trade, which has typed operator
+    confirmation, audit DB gating, and explicit exchange-client handling.
+    Keeping these backward-compatible routes read-only in live prevents a weaker
+    control plane from bypassing live safeguards.
+    """
+    if _paper_mode():
+        return
+    if not bool(getattr(_DB_HANDLER, "available", False)):
+        raise HTTPException(status_code=503, detail="live_order_routes_require_audit_db")
+    if _risk_kill_switch_active():
+        raise HTTPException(status_code=423, detail="live_order_routes_blocked_by_kill_switch")
+    raise HTTPException(status_code=403, detail="legacy order mutation routes disabled in live mode; use /api/trade with typed confirmation")
 
 
 class OrderSide(str, Enum):
@@ -121,6 +172,7 @@ async def create_order(
     Create a new order.
     """
     try:
+        _require_legacy_order_mutation_allowed()
         manager = _require_order_manager()
         side = OMSide.BUY if request.side == OrderSide.BUY else OMSide.SELL
         om_type = _map_order_type(request.order_type)
@@ -149,7 +201,7 @@ async def create_order(
         raise
     except Exception as e:
         logger.error(f"Error creating order: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/place", response_model=OrderResponse)
@@ -185,7 +237,7 @@ async def get_orders(
 
     except Exception as e:
         logger.error(f"Error fetching orders: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/batch")
@@ -209,7 +261,7 @@ async def create_batch_orders(
 
     except Exception as e:
         logger.error(f"Error creating batch orders: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/open", response_model=List[OrderResponse])
@@ -229,7 +281,7 @@ async def get_open_orders(
 
     except Exception as e:
         logger.error(f"Error fetching open orders: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.delete("/open")
@@ -241,6 +293,7 @@ async def cancel_all_open_orders(
     Cancel all open orders, optionally filtered.
     """
     try:
+        _require_legacy_order_mutation_allowed()
         manager = _require_order_manager()
         open_orders = manager.get_open_orders(exchange=venue)
         if symbol:
@@ -261,7 +314,7 @@ async def cancel_all_open_orders(
 
     except Exception as e:
         logger.error(f"Error cancelling open orders: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -276,7 +329,7 @@ async def twap_status():
         manager = _require_order_manager()
         return manager.get_twap_snapshot()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/iceberg-status")
@@ -285,8 +338,11 @@ async def iceberg_status():
     try:
         manager = _require_order_manager()
         return manager.get_iceberg_snapshot()
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.warning("Iceberg status unavailable: {}", sanitize_exception(e))
+        return {"available": False, "active_count": 0, "orders": {}, "error": sanitize_exception(e)}
 
 
 @router.get("/shadow-sl")
@@ -296,7 +352,7 @@ async def shadow_sl_status():
         manager = _require_order_manager()
         return manager.get_shadow_sl_snapshot()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/{order_id}", response_model=OrderResponse)
@@ -315,7 +371,7 @@ async def get_order(order_id: str):
         raise
     except Exception as e:
         logger.error(f"Error fetching order {order_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.delete("/{order_id}")
@@ -324,6 +380,7 @@ async def cancel_order(order_id: str, venue: str = Query(...)):
     Cancel an order.
     """
     try:
+        _require_legacy_order_mutation_allowed()
         manager = _require_order_manager()
         order = next(
             (
@@ -347,4 +404,4 @@ async def cancel_order(order_id: str, venue: str = Query(...)):
         raise
     except Exception as e:
         logger.error(f"Error cancelling order {order_id}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))

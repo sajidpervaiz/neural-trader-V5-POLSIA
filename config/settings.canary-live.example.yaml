@@ -1,0 +1,68 @@
+# Canary live configuration template for NUERAL-TRADER-5.
+# Copy this file to a gitignored local path (for example config/settings.canary-live.yaml)
+# and provide all secrets via environment variables. Do NOT commit the copied live file.
+
+system:
+  paper_mode: false
+  log_level: INFO
+  log_dir: logs
+
+exchanges:
+  binance:
+    enabled: true
+    demo: false
+    testnet: false
+    api_key: ${BINANCE_API_KEY:-}
+    api_secret: ${BINANCE_API_SECRET:-}
+    symbols:
+      - BTC/USDT:USDT
+    default_leverage: 1
+    rate_limit: true
+    options:
+      defaultType: future
+
+storage:
+  postgres:
+    host: localhost
+    port: 5432
+    database: neural_trader
+    user: trader
+    password: ${POSTGRES_PASSWORD}
+    pool_size: 5
+    timescaledb: true
+
+monitoring:
+  dashboard_api:
+    host: 127.0.0.1
+    port: 8000
+    allow_origins:
+      - http://127.0.0.1:8000
+      - http://localhost:8000
+    auth:
+      require_api_key: true
+      api_key: ${DASHBOARD_API_KEY:-}
+      rate_limit_per_min: 120
+      # Keep false for first canary. Manual dashboard orders are dangerous in live.
+      allow_manual_live_trading: false
+  reconciliation:
+    interval_seconds: 60
+
+risk:
+  initial_equity: 1000
+  max_open_positions: 1
+  risk_per_trade_pct: 0.001
+  max_daily_loss_pct: 0.01
+  max_drawdown_pct: 0.03
+  default_leverage: 1
+  require_stop_loss: true
+  min_liquidity_usd: 100000
+
+signals:
+  min_score_threshold: 0.80
+  min_contributing_factors: 3
+  geopolitical_weight: 0.0
+
+auto_trading:
+  enabled: false
+  mode: canary_live
+  require_operator_enable: true

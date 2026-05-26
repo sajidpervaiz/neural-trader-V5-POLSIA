@@ -10,6 +10,8 @@ import orjson
 import websockets
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 from data_ingestion.normalizer import Normalizer
@@ -131,12 +133,22 @@ class CEXWebSocketManager:
                 prev = self._last_sequence.get(seq_key, 0)
                 if prev > 0 and seq > prev + 1:
                     gap = seq - prev - 1
+                    tick.sequence_gap = gap
                     self._gap_count[exchange] = self._gap_count.get(exchange, 0) + gap
+                    await self.event_bus.publish("MARKET_DATA_GAP", {
+                        "exchange": exchange,
+                        "symbol": tick.symbol,
+                        "expected": prev + 1,
+                        "actual": seq,
+                        "gap": gap,
+                        "ts": int(time.time()),
+                    })
                     logger.warning(
                         "{} {} sequence gap: expected {} got {} (gap={})",
                         exchange, tick.symbol, prev + 1, seq, gap,
                     )
                 self._last_sequence[seq_key] = seq
+                tick.sequence = seq
 
             await self.event_bus.publish("TICK", tick)
 
@@ -214,7 +226,8 @@ class CEXWebSocketManager:
             except Exception as exc:
                 if disconnect_started_at is None:
                     disconnect_started_at = time.time()
-                logger.exception("{} WebSocket unexpected error: {}", exchange, exc)
+                logger.error("{} WebSocket unexpected error: {}", exchange, sanitize_exception(exc))
+                logger.opt(exception=True).debug("{} WebSocket unexpected error stack trace", exchange)
 
             # If still down beyond the threshold, emit ALERT_CRITICAL once.
             # The bot keeps trying — the alert just makes the outage visible.

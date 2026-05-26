@@ -6,7 +6,29 @@ system:
   log_dir: logs
   timezone: UTC
 
+# ── L0 Market Data Integrity ─────────────────────────────────────────────────
+market_data_integrity:
+  enabled: true
+  enforce_signal_gate: true
+  tick_stale_seconds: 10.0
+  orderbook_stale_seconds: 90.0
+  signal_event_stale_seconds: 5.0
+  candle_stale_multiple: 2.5
+  max_clock_drift_seconds: 2.0
+  gap_quarantine_seconds: 30.0
+  check_interval_seconds: 1.0
+
 # ── Exchange configurations ───────────────────────────────────────────────────
+data_ingestion:
+  ws_prolonged_disconnect_seconds: 30.0
+  orderbook_feed:
+    mode: hybrid
+    depth: 20
+    update_speed_ms: 250
+    rest_poll_interval_seconds: 30.0
+    ws_reconnect_min_seconds: 1.0
+    ws_reconnect_max_seconds: 30.0
+
 exchanges:
   binance:
     enabled: true
@@ -61,6 +83,8 @@ exchanges:
 # ── DEX configurations ────────────────────────────────────────────────────────
 dex:
   enabled: true
+  poll_interval_seconds: 30
+  max_backoff_seconds: 300
 
   networks:
     ethereum:
@@ -215,7 +239,9 @@ signals:
 
 ai_agent:
   enabled: true
-  mode: full
+  # advisory = AI records approve/reduce/reject guidance without blocking trades.
+  # direct = AI may block/reduce, but SignalGenerator only enforces it in paper mode.
+  mode: advisory
   provider: claude
   model: claude-sonnet-4-6
   api_key: "${ANTHROPIC_API_KEY:-}"
@@ -235,7 +261,33 @@ backtest:
   monte_carlo_runs: 1000
 
 # ── Storage ───────────────────────────────────────────────────────────────────
+execution:
+  simulated_exchange:
+    enabled: true
+    ack_latency_ms: 15.0
+    fill_latency_ms: 35.0
+    partial_fill_probability: 0.0
+    partial_fill_ratio: 0.5
+    partial_fill_completion_ms: 250.0
+    reject_probability: 0.0
+    max_slippage_bps: 50.0
+    synthetic_spread_bps: 2.0
+    synthetic_orderbook_depth_usd: 1000000
+    default_price: 50000
+  restore_orders_on_startup: false
+  restore_positions_on_startup: true
+  wait_for_fill:
+    max_retries: 3
+    wait_seconds: 5.0
+    market_on_timeout: true
+
 storage:
+  # Personal production mode can run without PostgreSQL/Redis while keeping a
+  # durable local audit trail. Keep PostgreSQL for HA/multi-node deployments.
+  personal_sqlite_mode: true
+  sqlite:
+    path: data/neural_trader.db
+
   postgres:
     host: "${POSTGRES_HOST:-localhost}"
     port: 5432
@@ -374,7 +426,7 @@ monitoring:
       - "http://localhost"
       - "http://127.0.0.1"
     auth:
-      require_api_key: false
+      require_api_key: true
       api_key: "${DASHBOARD_API_KEY}"
       rate_limit_per_min: 120
   telegram:

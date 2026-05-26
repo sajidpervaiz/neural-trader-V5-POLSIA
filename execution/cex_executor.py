@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -8,10 +9,41 @@ from typing import Any
 import ccxt.async_support as ccxt
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
+
+def _client_order_id(signal: "TradingSignal", suffix: str = "") -> str:
+    """Deterministic, exchange-safe client order ID.
+
+    Binance accepts up to 36 chars of [A-Za-z0-9_-]. We hash the signal's
+    stable fields so a retry from the same signal hashes to the same ID and
+    the exchange rejects duplicate submissions on its side. The suffix
+    distinguishes iceberg children / re-submits.
+    """
+    sig_time = int(getattr(signal, "timestamp", 0) or 0)
+    raw = (
+        f"{signal.exchange}|{signal.symbol}|{signal.direction}|"
+        f"{sig_time}|{round(float(signal.price), 8)}|{suffix}"
+    )
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"nt5-{digest}"
+
+
+def _client_order_params(exchange_id: str, signal: "TradingSignal", suffix: str = "") -> dict[str, str]:
+    client_id = _client_order_id(signal, suffix)
+    if exchange_id == "binance":
+        return {"newClientOrderId": client_id}
+    if exchange_id == "bybit":
+        return {"orderLinkId": client_id}
+    if exchange_id == "okx":
+        return {"clOrdId": client_id}
+    return {"clientOrderId": client_id}
+
 from core.config import Config
 from core.event_bus import EventBus
 from core.safe_mode import SafeModeReason
 from engine.signal_generator import TradingSignal
+from execution.legacy_cex_common import L2DepthLevel, OrderbookSnapshot
 from execution.order_manager import OrderManager, OrderSide, OrderType
 from execution.rate_limiter import RateLimiter
 from execution.risk_manager import RiskManager
@@ -67,6 +99,54 @@ class CEXExecutor:
         # If a set_leverage call fails or echoes a different value, the actual
         # leverage as reported by the exchange is recorded here.
         self._actual_leverage: dict[str, int] = {}
+
+    @staticmethod
+    def _apply_fill_to_position(pos: Any, signal: TradingSignal, fill_price: float, filled_qty: float) -> None:
+        old_entry = getattr(pos, "entry_price", signal.price)
+        old_sl = getattr(pos, "stop_loss", None)
+        old_tp = getattr(pos, "take_profit", None)
+        if all(isinstance(v, (int, float)) for v in (old_entry, old_sl, old_tp)):
+            sl_distance = abs(float(old_entry) - float(old_sl))
+            tp_distance = abs(float(old_tp) - float(old_entry))
+            if signal.is_long:
+                pos.stop_loss = fill_price - sl_distance
+                pos.take_profit = fill_price + tp_distance
+            else:
+                pos.stop_loss = fill_price + sl_distance
+                pos.take_profit = fill_price - tp_distance
+        pos.entry_price = fill_price
+        pos.current_price = fill_price
+        pos.highest_since_entry = fill_price
+        pos.lowest_since_entry = fill_price
+        pos.size = filled_qty
+        if hasattr(pos, "pending_fill"):
+            pos.pending_fill = False
+
+    def _publish_pipeline_latency(self, signal: TradingSignal, stage: str, latency_s: float) -> None:
+        try:
+            payload = {
+                "stage": str(stage),
+                "exchange": getattr(signal, "exchange", self.exchange_id),
+                "symbol": getattr(signal, "symbol", "unknown"),
+                "latency_s": max(0.0, float(latency_s)),
+                "ts": time.time(),
+            }
+            publish_nowait = getattr(self.event_bus, "publish_nowait", None)
+            if callable(publish_nowait):
+                publish_nowait("PIPELINE_LATENCY", payload)
+            else:
+                asyncio.create_task(self.event_bus.publish("PIPELINE_LATENCY", payload))
+        except Exception as exc:
+            logger.debug("{} pipeline latency publish failed: {}", self.exchange_id, exc)
+
+    def _exchange_symbol(self, symbol: str) -> str:
+        normalizer = getattr(self, "_normalize_symbol", None)
+        if callable(normalizer):
+            try:
+                return str(normalizer(symbol))
+            except Exception:
+                return symbol
+        return symbol
 
     async def _init_client(self) -> None:
         if self._client is not None:
@@ -217,6 +297,7 @@ class CEXExecutor:
         per side ≈ 20bps round-trip). Without the commission, paper-mode
         backtests showed fictional profits on strategies that lose money live.
         """
+        submit_started = time.perf_counter()
         bt = self.config.get_value("backtest") or {}
         slippage = float(bt.get("slippage_pct", 0.0002))
         commission = float(bt.get("commission_pct", 0.0005))  # taker default
@@ -235,10 +316,12 @@ class CEXExecutor:
         )
         await self._record_paper_order_in_manager(signal, fill_price, result.quantity)
         await self.event_bus.publish("ORDER_FILLED", result)
+        self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
         return result
 
     async def _paper_execute(self, signal: TradingSignal, size: float) -> OrderResult:
+        submit_started = time.perf_counter()
         bt = self.config.get_value("backtest") or {}
         slippage = float(bt.get("slippage_pct", 0.0002))
         commission = float(bt.get("commission_pct", 0.0005))
@@ -270,6 +353,7 @@ class CEXExecutor:
             pos.lowest_since_entry = fill_price
         await self._record_paper_order_in_manager(signal, fill_price, result.quantity)
         await self.event_bus.publish("ORDER_FILLED", result)
+        self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
         logger.info("Paper order filled: {} {}/{} @ {:.2f}", signal.direction.upper(), signal.exchange, signal.symbol, fill_price)
         return result
 
@@ -360,11 +444,20 @@ class CEXExecutor:
 
             if is_emergency:
                 await self._rate_limiter.acquire()
+                submit_started = time.perf_counter()
                 order = await self._client.create_market_order(
-                    symbol=signal.symbol, side=side, amount=amount, params={},
+                    symbol=signal.symbol,
+                    side=side,
+                    amount=amount,
+                    params=_client_order_params(self.exchange_id, signal, "emergency"),
                 )
+                self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
             else:
-                limit_params: dict[str, Any] = {}
+                limit_params: dict[str, Any] = _client_order_params(
+                    self.exchange_id,
+                    signal,
+                    "entry",
+                )
                 if self._post_only:
                     limit_params["postOnly"] = True
                 notional = size
@@ -378,10 +471,12 @@ class CEXExecutor:
                     )
                 else:
                     await self._rate_limiter.acquire()
+                    submit_started = time.perf_counter()
                     order = await self._client.create_limit_order(
                         symbol=signal.symbol, side=side, amount=amount,
                         price=signal.price, params=limit_params,
                     )
+                    self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
                     order = await self._wait_for_fill(signal, order, amount)
 
             fill_price = float(order.get("average", order.get("price", signal.price)))
@@ -419,19 +514,31 @@ class CEXExecutor:
                 direction=signal.direction,
                 price=fill_price,
                 quantity=filled_qty,
-                status=order.get("status", "unknown"),
+                status=str(order.get("status", "unknown") or "unknown").lower(),
                 is_paper=False,
                 timestamp=int(time.time()),
                 raw=order,
             )
             if result.status in ("filled", "closed"):
-                # Use pre-reserved position if available, otherwise open fresh
+                # Commit the reservation to the real fill price — this updates
+                # entry_price, slides SL/TP by the strategy's intended distance,
+                # persists to SQLite, and flips pending_fill off.
                 if reserved_pos is not None:
-                    pos = reserved_pos
-                    pos.current_price = fill_price
-                    pos.size = filled_qty
+                    pos = await self.risk_manager.rebase_position_to_fill(
+                        signal.exchange, signal.symbol, fill_price, filled_qty,
+                    )
+                    if pos is None:
+                        # Reservation vanished (e.g. kill switch). Bail.
+                        logger.error(
+                            "Reservation missing on rebase for {}/{} — "
+                            "aborting protective-order placement",
+                            signal.exchange, signal.symbol,
+                        )
+                        return result
                 else:
                     pos = await self.risk_manager.open_position(signal, filled_qty * fill_price)
+                    if pos is not None:
+                        self._apply_fill_to_position(pos, signal, fill_price, filled_qty)
                 await self.event_bus.publish("ORDER_FILLED", result)
 
                 # ── Place exchange-side SL/TP (crash protection) ──────────
@@ -461,7 +568,7 @@ class CEXExecutor:
                         await self.event_bus.publish("ALERT_WARNING", {
                             "type": "sl_fallback_local",
                             "symbol": signal.symbol,
-                            "error": str(exc),
+                            "error": sanitize_exception(exc),
                             "needs_ack": True,
                             "exchange": signal.exchange,
                             "direction": signal.direction,
@@ -485,16 +592,25 @@ class CEXExecutor:
                         await self.event_bus.publish("ALERT_CRITICAL", {
                             "type": "sl_placement_failed",
                             "symbol": signal.symbol,
-                            "error": str(exc),
+                            "error": sanitize_exception(exc),
                             "emergency_close_ok": closed_ok,
                         })
-            elif result.status == "partially_filled" and filled_qty > 0:
+            elif filled_qty > 0:
                 if reserved_pos is not None:
-                    pos = reserved_pos
-                    pos.current_price = fill_price
-                    pos.size = filled_qty
+                    pos = await self.risk_manager.rebase_position_to_fill(
+                        signal.exchange, signal.symbol, fill_price, filled_qty,
+                    )
+                    if pos is None:
+                        logger.error(
+                            "Reservation missing on partial rebase for {}/{} — "
+                            "aborting protective-order placement",
+                            signal.exchange, signal.symbol,
+                        )
+                        return result
                 else:
                     pos = await self.risk_manager.open_position(signal, filled_qty * fill_price)
+                    if pos is not None:
+                        self._apply_fill_to_position(pos, signal, fill_price, filled_qty)
                 await self.event_bus.publish("ORDER_PARTIALLY_FILLED", result)
                 # Place protective orders for partial fill qty
                 if self._order_placer:
@@ -516,7 +632,7 @@ class CEXExecutor:
                         await self.event_bus.publish("ALERT_WARNING", {
                             "type": "sl_fallback_local_partial",
                             "symbol": signal.symbol,
-                            "error": str(exc),
+                            "error": sanitize_exception(exc),
                             "needs_ack": True,
                             "exchange": signal.exchange,
                             "direction": signal.direction,
@@ -538,15 +654,58 @@ class CEXExecutor:
                         await self.event_bus.publish("ALERT_CRITICAL", {
                             "type": "sl_placement_failed_partial",
                             "symbol": signal.symbol,
-                            "error": str(exc),
+                            "error": sanitize_exception(exc),
                             "emergency_close_ok": closed_ok,
                         })
             else:
                 logger.warning("{} order not filled: status={}", self.exchange_id, result.status)
+                cancel_uncertain = False
+                if reserved_pos is not None and result.status in ("open", "new") and self._client is not None:
+                    try:
+                        await self._rate_limiter.acquire()
+                        await self._client.cancel_order(result.order_id, signal.symbol)
+                        logger.info(
+                            "{} cancelled unfilled live order {} before rolling back reservation",
+                            self.exchange_id, result.order_id,
+                        )
+                    except Exception as exc:
+                        cancel_uncertain = True
+                        logger.critical(
+                            "{} could not cancel unfilled live order {} for {} before reservation rollback: {}",
+                            self.exchange_id, result.order_id, signal.symbol, exc,
+                        )
+                        try:
+                            self.risk_manager._circuit_breaker.trip(
+                                f"untracked_open_order_cancel_failed:{signal.symbol}"
+                            )
+                        except Exception:
+                            pass
+                        await self.event_bus.publish("ALERT_CRITICAL", {
+                            "type": "untracked_open_order_cancel_failed",
+                            "exchange": self.exchange_id,
+                            "symbol": signal.symbol,
+                            "order_id": result.order_id,
+                            "status": result.status,
+                            "error": sanitize_exception(exc),
+                            "needs_ack": True,
+                            "ts": int(time.time()),
+                        })
                 await self.event_bus.publish("ORDER_FAILED", result)
+                if reserved_pos is not None:
+                    if cancel_uncertain:
+                        # A real exchange order may still be live. Keep the
+                        # pending reservation so _handle_signal does not drop
+                        # tracking; reconciliation/operator intervention must
+                        # decide final state.
+                        return result
+                    # Status is e.g. cancelled/rejected and cancellation is
+                    # verified or unnecessary — allow _handle_signal to roll
+                    # the reservation back through cancel_reserved_position.
+                    return None
             return result
         except Exception as exc:
-            logger.exception("{} live order failed: {}", self.exchange_id, exc)
+            logger.error("{} live order failed: {}", self.exchange_id, sanitize_exception(exc))
+            logger.opt(exception=True).debug("{} live order stack trace", self.exchange_id)
             return None
 
     async def _place_iceberg(
@@ -571,11 +730,17 @@ class CEXExecutor:
         avg_price_accum = 0.0
         for i in range(chunks):
             try:
+                child_params = {
+                    **limit_params,
+                    **_client_order_params(self.exchange_id, signal, f"iceberg-{i}"),
+                }
                 await self._rate_limiter.acquire()
+                submit_started = time.perf_counter()
                 child = await self._client.create_limit_order(
                     symbol=signal.symbol, side=side, amount=chunk_amt,
-                    price=signal.price, params=limit_params,
+                    price=signal.price, params=child_params,
                 )
+                self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
                 child = await self._wait_for_fill(signal, child, chunk_amt)
                 child_orders.append(child)
                 f = float(child.get("filled", 0) or 0)
@@ -643,14 +808,40 @@ class CEXExecutor:
             )
             return order
 
-        # Cancel the limit order and fall back to market
+        # Cancel the limit order and fall back to market only after cancellation
+        # is confirmed. If cancellation is uncertain, a fallback market order can
+        # double exposure when the original limit later fills.
         try:
             await self._rate_limiter.acquire()
             await self._client.cancel_order(order_id, signal.symbol)
             logger.info("{} cancelled unfilled limit order {}, placing market order",
                         self.exchange_id, order_id)
         except Exception as exc:
-            logger.warning("{} cancel failed (may already be filled): {}", self.exchange_id, exc)
+            logger.critical(
+                "{} cancel of unfilled limit order {} is uncertain; blocking market fallback: {}",
+                self.exchange_id, order_id, exc,
+            )
+            try:
+                self.risk_manager._circuit_breaker.trip(
+                    f"entry_cancel_uncertain:{signal.symbol}"
+                )
+            except Exception:
+                pass
+            await self.event_bus.publish("ALERT_CRITICAL", {
+                "type": "entry_cancel_uncertain_no_market_fallback",
+                "exchange": self.exchange_id,
+                "symbol": signal.symbol,
+                "order_id": order_id,
+                "error": sanitize_exception(exc),
+                "needs_ack": True,
+                "ts": int(time.time()),
+            })
+            try:
+                await self._rate_limiter.acquire()
+                final_state = await self._client.fetch_order(order_id, signal.symbol)
+                return final_state
+            except Exception:
+                return order
 
         if self._client is None:
             return order
@@ -675,10 +866,193 @@ class CEXExecutor:
 
         side = "buy" if signal.is_long else "sell"
         await self._rate_limiter.acquire()
+        fallback_params = _client_order_params(self.exchange_id, signal, suffix="timeout-market")
+        submit_started = time.perf_counter()
         market_order = await self._client.create_market_order(
-            symbol=signal.symbol, side=side, amount=remaining, params={},
+            symbol=signal.symbol, side=side, amount=remaining, params=fallback_params,
         )
+        self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
         return market_order
+
+    async def cancel_order(self, order_id: str, symbol: str) -> bool:
+        """Cancel an exchange order through the same runtime executor contract."""
+        if bool(getattr(self.config, "paper_mode", False)):
+            logger.info("[PAPER] {} cancel order {} {}", self.exchange_id, order_id, symbol)
+            return True
+        if self._client is None:
+            logger.error("{} cancel_order failed: client unavailable", self.exchange_id)
+            return False
+        try:
+            await self._rate_limiter.acquire()
+            await self._client.cancel_order(order_id, self._exchange_symbol(symbol))
+            logger.info("{} cancelled order {} {}", self.exchange_id, order_id, symbol)
+            return True
+        except Exception as exc:
+            logger.error("{} cancel_order failed for {} {}: {}", self.exchange_id, symbol, order_id, sanitize_exception(exc))
+            return False
+
+    async def get_orderbook_snapshot(self, symbol: str, depth: int = 10) -> OrderbookSnapshot:
+        """Fetch an L2 snapshot using the shared router/contract shape."""
+        if self._client is None:
+            await self._init_client()
+        if self._client is None:
+            raise RuntimeError(f"{self.exchange_id} client unavailable")
+        await self._rate_limiter.acquire()
+        orderbook = await self._client.fetch_order_book(self._exchange_symbol(symbol), limit=depth)
+        bids = [
+            L2DepthLevel(price=float(level[0]), quantity=float(level[1]))
+            for level in orderbook.get("bids", [])[:depth]
+            if len(level) >= 2
+        ]
+        asks = [
+            L2DepthLevel(price=float(level[0]), quantity=float(level[1]))
+            for level in orderbook.get("asks", [])[:depth]
+            if len(level) >= 2
+        ]
+        return OrderbookSnapshot(
+            symbol=symbol,
+            timestamp_ms=int(time.time() * 1000),
+            bids=bids,
+            asks=asks,
+            sequence=int(orderbook.get("timestamp") or 0),
+        )
+
+    async def close_position(
+        self,
+        symbol: str,
+        price: float,
+        *,
+        reason: str = "manual_close",
+    ) -> OrderResult | None:
+        """Close one tracked position with a reduce-only exchange order first.
+
+        The dashboard, kill-switch helpers, and paper simulator should all use
+        this contract instead of reaching into executor._client directly.
+        """
+        positions = getattr(self.risk_manager, "positions", {}) or {}
+        pos = positions.get(f"{self.exchange_id}:{symbol}")
+        if pos is None:
+            logger.warning("{} close_position skipped: no tracked position for {}", self.exchange_id, symbol)
+            return None
+
+        requested_price = float(price or 0.0)
+        if requested_price <= 0:
+            requested_price = float(getattr(pos, "current_price", 0.0) or getattr(pos, "entry_price", 0.0) or 0.0)
+        quantity = abs(float(getattr(pos, "size", 0.0) or 0.0))
+        if quantity <= 0 or requested_price <= 0:
+            logger.warning("{} close_position invalid qty/price for {} qty={} price={}", self.exchange_id, symbol, quantity, requested_price)
+            return None
+
+        direction = str(getattr(pos, "direction", "long") or "long").lower()
+        close_side = "sell" if direction == "long" else "buy"
+
+        if bool(getattr(self.config, "paper_mode", False)):
+            closed = await self.risk_manager.close_position(self.exchange_id, symbol, requested_price)
+            if closed is None:
+                return None
+            result = OrderResult(
+                order_id=f"paper_close_{self.exchange_id}_{int(time.time() * 1000)}",
+                exchange=self.exchange_id,
+                symbol=symbol,
+                direction=direction,
+                price=float(getattr(closed, "current_price", requested_price) or requested_price),
+                quantity=quantity,
+                status="filled",
+                is_paper=True,
+                timestamp=int(time.time()),
+                raw={"reason": reason, "contract_close": True},
+            )
+            await self.event_bus.publish("POSITION_CLOSED", {
+                "position": closed,
+                "reason": reason,
+                "price": result.price,
+                "order_id": result.order_id,
+            })
+            return result
+
+        if self._client is None:
+            logger.error("{} close_position failed: client unavailable", self.exchange_id)
+            return None
+
+        exchange_symbol = self._exchange_symbol(symbol)
+        try:
+            async def _cancel_protective_orders() -> None:
+                placer = getattr(self, "_order_placer", None)
+                if placer is None:
+                    return
+                try:
+                    await placer.cancel_all_for_symbol(symbol)
+                    if exchange_symbol != symbol:
+                        await placer.cancel_all_for_symbol(exchange_symbol)
+                    placer.remove_tracking(symbol)
+                    if exchange_symbol != symbol:
+                        placer.remove_tracking(exchange_symbol)
+                except Exception as exc:
+                    logger.warning("{} protective-order cleanup failed for {}: {}", self.exchange_id, symbol, sanitize_exception(exc))
+
+            await self._rate_limiter.acquire()
+            close_started = time.perf_counter()
+            close_coro = self._client.create_market_order(
+                symbol=exchange_symbol,
+                side=close_side,
+                amount=quantity,
+                params={"reduceOnly": True},
+            )
+            if getattr(self, "_order_placer", None) is not None:
+                order, _ = await asyncio.gather(close_coro, _cancel_protective_orders())
+            else:
+                order = await close_coro
+
+            fill_price = float(order.get("average") or order.get("price") or requested_price)
+            filled_qty = float(order.get("filled") or quantity)
+            status = str(order.get("status", "unknown") or "unknown").lower()
+            result = OrderResult(
+                order_id=str(order.get("id", f"close_{int(time.time() * 1000)}")),
+                exchange=self.exchange_id,
+                symbol=symbol,
+                direction=direction,
+                price=fill_price,
+                quantity=filled_qty,
+                status=status,
+                is_paper=False,
+                timestamp=int(time.time()),
+                raw={
+                    **order,
+                    "reason": reason,
+                    "contract_close": True,
+                    "close_latency_s": time.perf_counter() - close_started,
+                },
+            )
+
+            closed = await self.risk_manager.close_position(self.exchange_id, symbol, fill_price)
+            if closed is None:
+                logger.critical(
+                    "{} exchange close succeeded for {} but risk state was not closed",
+                    self.exchange_id,
+                    symbol,
+                )
+                await self.event_bus.publish("ALERT_CRITICAL", {
+                    "type": "executor_close_risk_sync_failed",
+                    "exchange": self.exchange_id,
+                    "symbol": symbol,
+                    "order_id": result.order_id,
+                    "reason": reason,
+                    "ts": int(time.time()),
+                })
+            else:
+                await self.event_bus.publish("POSITION_CLOSED", {
+                    "position": closed,
+                    "reason": reason,
+                    "price": fill_price,
+                    "order_id": result.order_id,
+                })
+
+            logger.info("{} close_position {} {} qty={} @ {}", self.exchange_id, close_side, symbol, filled_qty, fill_price)
+            return result
+        except Exception as exc:
+            logger.error("{} close_position failed for {}: {}", self.exchange_id, symbol, sanitize_exception(exc))
+            logger.opt(exception=True).debug("{} close_position stack trace", self.exchange_id)
+            return None
 
     async def _handle_signal(self, payload: Any) -> None:
         signal: TradingSignal = payload
@@ -694,14 +1068,20 @@ class CEXExecutor:
             await self._paper_execute_with_pos(signal, size, pos)
         else:
             # For live: approve + reserve slot atomically, then execute on exchange
-            approved, reason, size, pos = await self.risk_manager.approve_and_open(signal)
+            approved, reason, size, pos = await self.risk_manager.approve_and_open(
+                signal,
+                reserve_until_fill=True,
+            )
             if not approved:
                 logger.debug("Signal rejected for {}/{}: {}", signal.exchange, signal.symbol, reason)
                 return
             result = await self._live_execute(signal, size, pos)
             if result is None:
-                # Exchange failed — release the reserved position
-                await self.risk_manager.close_position(signal.exchange, signal.symbol, signal.price)
+                # Exchange order never reached a fill — drop the reservation
+                # WITHOUT logging a fake closed trade or touching equity.
+                await self.risk_manager.cancel_reserved_position(
+                    signal.exchange, signal.symbol,
+                )
 
     async def _handle_stop_loss(self, payload: Any) -> None:
         exchange = payload.get("exchange", "")

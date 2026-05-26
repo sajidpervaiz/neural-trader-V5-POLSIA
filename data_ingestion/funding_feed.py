@@ -8,6 +8,8 @@ from typing import Any
 import aiohttp
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 
@@ -245,7 +247,8 @@ class FundingRateFeed:
                     logger.info("Detected {} funding arbitrage opportunities", len(opportunities))
                 logger.debug("Fetched {} funding rates", len(rates))
             except Exception as exc:
-                logger.exception("Funding rate feed error: {}", exc)
+                logger.error("Funding rate feed error: {}", sanitize_exception(exc))
+                logger.opt(exception=True).debug("Funding rate feed stack trace")
             await asyncio.sleep(interval)
 
     async def stop(self) -> None:

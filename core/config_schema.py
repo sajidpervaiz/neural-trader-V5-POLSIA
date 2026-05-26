@@ -137,6 +137,84 @@ class BacktestConfig(BaseModel):
     monte_carlo_runs: int = Field(1000, ge=100, le=100_000)
 
 
+class SimulatedExchangeConfig(BaseModel):
+    enabled: bool = True
+    ack_latency_ms: float = Field(15.0, ge=0)
+    fill_latency_ms: float = Field(35.0, ge=0)
+    partial_fill_probability: float = Field(0.0, ge=0, le=1)
+    partial_fill_ratio: float = Field(0.5, gt=0, le=1)
+    partial_fill_completion_ms: float = Field(250.0, ge=0)
+    reject_probability: float = Field(0.0, ge=0, le=1)
+    max_slippage_bps: float = Field(50.0, ge=0)
+    synthetic_spread_bps: float = Field(2.0, ge=0)
+    synthetic_orderbook_depth_usd: float = Field(1_000_000.0, gt=0)
+    default_price: float = Field(50_000.0, gt=0)
+
+
+class ExecutionConfig(BaseModel):
+    simulated_exchange: SimulatedExchangeConfig = Field(default_factory=SimulatedExchangeConfig)
+    wait_for_fill: dict[str, Any] = Field(default_factory=dict)
+    restore_orders_on_startup: bool | None = None
+    restore_positions_on_startup: bool = True
+    maker_first: bool = True
+    post_only: bool = True
+    iceberg_threshold_usd: float = Field(10_000.0, ge=0)
+    iceberg_chunks: int = Field(4, ge=1)
+
+    model_config = {"extra": "allow"}
+
+
+class MarketDataIntegrityConfig(BaseModel):
+    enabled: bool = True
+    enforce_signal_gate: bool = True
+    tick_stale_seconds: float = Field(10.0, gt=0)
+    orderbook_stale_seconds: float = Field(90.0, gt=0)
+    signal_event_stale_seconds: float = Field(5.0, gt=0)
+    candle_stale_multiple: float = Field(2.5, ge=1.0)
+    max_clock_drift_seconds: float = Field(2.0, ge=0)
+    gap_quarantine_seconds: float = Field(30.0, ge=0)
+    check_interval_seconds: float = Field(1.0, gt=0)
+
+
+class OrderbookFeedConfig(BaseModel):
+    mode: str = "hybrid"
+    depth: int = Field(20, ge=5, le=20)
+    update_speed_ms: int = Field(250, ge=100, le=500)
+    rest_poll_interval_seconds: float = Field(30.0, gt=0)
+    ws_reconnect_min_seconds: float = Field(1.0, gt=0)
+    ws_reconnect_max_seconds: float = Field(30.0, gt=0)
+
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        value = v.lower()
+        allowed = {"rest", "ws", "websocket", "ws_partial", "hybrid"}
+        if value not in allowed:
+            raise ValueError(f"orderbook_feed.mode must be one of {allowed}")
+        return value
+
+    @field_validator("depth")
+    @classmethod
+    def _valid_depth(cls, v: int) -> int:
+        if v not in {5, 10, 20}:
+            raise ValueError("orderbook_feed.depth must be one of 5, 10, 20")
+        return v
+
+    @field_validator("update_speed_ms")
+    @classmethod
+    def _valid_speed(cls, v: int) -> int:
+        if v not in {100, 250, 500}:
+            raise ValueError("orderbook_feed.update_speed_ms must be one of 100, 250, 500")
+        return v
+
+
+class DataIngestionConfig(BaseModel):
+    ws_prolonged_disconnect_seconds: float = Field(30.0, gt=0)
+    orderbook_feed: OrderbookFeedConfig = Field(default_factory=OrderbookFeedConfig)
+
+    model_config = {"extra": "allow"}
+
+
 class StoragePostgresConfig(BaseModel):
     host: str = "localhost"
     port: int = 5432
@@ -159,6 +237,8 @@ class StorageRedisConfig(BaseModel):
 class StorageConfig(BaseModel):
     postgres: StoragePostgresConfig = Field(default_factory=StoragePostgresConfig)
     redis: StorageRedisConfig = Field(default_factory=StorageRedisConfig)
+    personal_sqlite_mode: bool = False
+    sqlite: dict[str, Any] = Field(default_factory=lambda: {"path": "data/neural_trader.db"})
 
 
 class MonitoringDashboardAuth(BaseModel):
@@ -189,6 +269,9 @@ class AppConfig(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     signals: SignalsConfig = Field(default_factory=SignalsConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    market_data_integrity: MarketDataIntegrityConfig = Field(default_factory=MarketDataIntegrityConfig)
+    data_ingestion: DataIngestionConfig = Field(default_factory=DataIngestionConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 

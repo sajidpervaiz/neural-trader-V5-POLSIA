@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from enum import Enum
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from execution.order_manager import OrderManager
 from execution.risk_manager import RiskManager
@@ -234,7 +236,7 @@ async def get_trading_mode():
 
     except Exception as e:
         logger.error(f"Error fetching trading mode: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/trading-mode")
@@ -305,7 +307,7 @@ async def set_trading_mode(
         raise
     except Exception as e:
         logger.error(f"Error setting trading mode: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/algo", response_model=AlgoConfig)
@@ -325,7 +327,7 @@ async def get_algo_config():
 
     except Exception as e:
         logger.error(f"Error fetching algo config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/algo", response_model=AlgoConfig)
@@ -348,7 +350,7 @@ async def set_algo_config(
 
     except Exception as e:
         logger.error(f"Error setting algo config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/venues", response_model=List[VenueConfig])
@@ -388,7 +390,7 @@ async def get_venue_configs():
 
     except Exception as e:
         logger.error(f"Error fetching venue configs: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/venues/{venue}/toggle")
@@ -408,7 +410,7 @@ async def toggle_venue(
 
     except Exception as e:
         logger.error(f"Error toggling venue {venue}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/all")
@@ -436,7 +438,7 @@ async def get_all_config():
 
     except Exception as e:
         logger.error(f"Error fetching all config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/reload")
@@ -451,7 +453,7 @@ async def reload_config():
 
     except Exception as e:
         logger.error(f"Error reloading config: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/history")
@@ -469,4 +471,4 @@ async def get_config_history(
 
     except Exception as e:
         logger.error(f"Error fetching config history: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))

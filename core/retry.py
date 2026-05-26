@@ -5,7 +5,7 @@ Retry Policy with exponential backoff and jitter.
 import asyncio
 import functools
 import inspect
-import random
+import secrets
 import time
 from typing import Callable, Optional, Type, List
 from loguru import logger
@@ -73,7 +73,7 @@ class RetryPolicy:
         delay = min(delay, self.max_delay)
 
         if self.jitter:
-            delay = delay * (0.5 + random.random() * 0.5)
+            delay = delay * (0.5 + secrets.randbelow(500_000) / 1_000_000)
 
         return delay
 

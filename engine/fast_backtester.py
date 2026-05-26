@@ -10,11 +10,15 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-try:
-    import neural_trader_rust as _rust
-    _RUST_AVAILABLE = True
-except ImportError:
-    _RUST_AVAILABLE = False
+from core.rust_loader import load_neural_trader_rust
+
+
+_rust, _RUST_SOURCE = load_neural_trader_rust()
+_RUST_AVAILABLE = _rust is not None
+if _RUST_AVAILABLE:
+    logger.info("Rust fast backtester loaded ({})", _RUST_SOURCE)
+else:
+    logger.info("Rust fast backtester unavailable; using Python path ({})", _RUST_SOURCE)
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from typing import Any, Callable, Coroutine
 
 from loguru import logger
+
+from core.error_handling import sanitize_exception
 
 
 Handler = Callable[..., Coroutine[Any, Any, None]]
@@ -23,6 +26,10 @@ SERIAL_EVENTS = frozenset({
     "FILL_CONFIRMED", "POSITION_CLOSED",
 })
 
+ORDERED_KEY_EVENTS = frozenset({
+    "TICK", "CANDLE", "ORDERBOOK_UPDATE", "MARKET_DATA_GAP",
+})
+
 
 class EventBus:
     def __init__(self) -> None:
@@ -30,6 +37,8 @@ class EventBus:
         self._queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=10_000)
         self._running = False
         self._background_tasks: set[asyncio.Task] = set()
+        self._ordered_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._publish_sequence: int = 0
         self._dropped_count: int = 0
         self._backpressure_warned: bool = False
 
@@ -51,10 +60,12 @@ class EventBus:
             self._backpressure_warned = True
         elif qsize < 5_000:
             self._backpressure_warned = False
+        self._stamp_payload(event_type, payload)
         await self._queue.put((event_type, payload))
 
     def publish_nowait(self, event_type: str, payload: Any = None) -> None:
         try:
+            self._stamp_payload(event_type, payload)
             self._queue.put_nowait((event_type, payload))
         except asyncio.QueueFull:
             if event_type in CRITICAL_EVENTS:
@@ -72,6 +83,70 @@ class EventBus:
                 self._dropped_count += 1
                 logger.warning("EventBus queue full — dropping event '{}' (total dropped: {})", event_type, self._dropped_count)
 
+    @staticmethod
+    def _payload_order_key(payload: Any) -> str:
+        exchange = ""
+        symbol = ""
+        if isinstance(payload, dict):
+            exchange = str(payload.get("exchange", "") or "")
+            symbol = str(payload.get("symbol", "") or "")
+        else:
+            exchange = str(getattr(payload, "exchange", "") or "")
+            symbol = str(getattr(payload, "symbol", "") or "")
+        if exchange or symbol:
+            return f"{exchange}:{symbol}"
+        return ""
+
+    def _next_sequence(self) -> int:
+        self._publish_sequence += 1
+        return self._publish_sequence
+
+    def _stamp_payload(self, event_type: str, payload: Any) -> None:
+        if payload is None:
+            return
+        sequence = self._next_sequence()
+        trace: dict[str, Any] = {
+            "event_type": event_type,
+            "event_sequence": sequence,
+            "event_id": f"{event_type}:{sequence}",
+            "event_published_ts": time.time(),
+        }
+        order_key = self._payload_order_key(payload)
+        if order_key:
+            trace["order_key"] = order_key
+        try:
+            if isinstance(payload, dict):
+                meta = payload.setdefault("_event_meta", {})
+                if isinstance(meta, dict):
+                    meta.update(trace)
+                return
+            metadata = getattr(payload, "metadata", None)
+            if isinstance(metadata, dict):
+                event_trace = metadata.setdefault("event_trace", {})
+                if isinstance(event_trace, dict):
+                    event_trace.update(trace)
+            for key, value in trace.items():
+                setattr(payload, key, value)
+        except Exception:
+            return
+
+    async def _dispatch_handlers_concurrent(self, event_type: str, payload: Any) -> None:
+        handlers = self._handlers.get(event_type, [])
+        tasks: list[asyncio.Task] = []
+        for handler in handlers:
+            task = asyncio.create_task(self._safe_call(handler, payload))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _dispatch_ordered(self, event_type: str, payload: Any, order_key: str) -> None:
+        lock_key = (event_type, order_key)
+        lock = self._ordered_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            await self._dispatch_handlers_concurrent(event_type, payload)
+
     async def _dispatch(self, event_type: str, payload: Any) -> None:
         """Dispatch an event to its handlers."""
         handlers = self._handlers.get(event_type, [])
@@ -81,9 +156,18 @@ class EventBus:
                 try:
                     await handler(payload)
                 except Exception as exc:
-                    logger.exception("EventBus handler error in '{}': {}", handler.__qualname__, exc)
+                    logger.error("EventBus handler error in '{}': {}", handler.__qualname__, sanitize_exception(exc))
+                    logger.opt(exception=True).debug("EventBus handler stack trace in '{}'", handler.__qualname__)
+        elif event_type in ORDERED_KEY_EVENTS:
+            order_key = self._payload_order_key(payload)
+            if order_key:
+                task = asyncio.create_task(self._dispatch_ordered(event_type, payload, order_key))
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            else:
+                await self._dispatch_handlers_concurrent(event_type, payload)
         else:
-            # Concurrent execution for non-critical events (TICK, etc.)
+            # Concurrent execution for non-critical, non-ordered events.
             for handler in handlers:
                 task = asyncio.create_task(self._safe_call(handler, payload))
                 self._background_tasks.add(task)
@@ -94,7 +178,8 @@ class EventBus:
         try:
             await handler(payload)
         except Exception as exc:
-            logger.exception("EventBus handler error in '{}': {}", handler.__qualname__, exc)
+            logger.error("EventBus handler error in '{}': {}", handler.__qualname__, sanitize_exception(exc))
+            logger.opt(exception=True).debug("EventBus handler stack trace in '{}'", handler.__qualname__)
 
     async def run(self) -> None:
         self._running = True
@@ -127,5 +212,7 @@ class EventBus:
             "subscribed_topics": len(self._handlers),
             "subscriber_counts": {topic: len(hs) for topic, hs in self._handlers.items()},
             "background_tasks": len(self._background_tasks),
+            "publish_sequence": int(self._publish_sequence),
+            "ordered_lanes": len(self._ordered_locks),
             "running": bool(self._running),
         }

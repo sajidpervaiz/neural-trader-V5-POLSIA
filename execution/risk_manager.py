@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,7 @@ import numpy as np
 from loguru import logger
 
 from core.config import Config
+from core.error_handling import sanitize_exception
 from core.event_bus import EventBus
 from core.safe_mode import SafeModeManager
 from engine.signal_generator import TradingSignal
@@ -33,6 +35,11 @@ class Position:
     breakeven_moved: bool = False
     highest_since_entry: float = 0.0
     lowest_since_entry: float = float("inf")
+    # True while a live-mode position has been reserved by approve_and_open
+    # but the exchange order has not yet filled. process_tick must skip
+    # SL/TP exit logic for pending fills — pos.entry_price still references
+    # the signal price, not the actual fill price.
+    pending_fill: bool = False
 
     @property
     def is_long(self) -> bool:
@@ -124,6 +131,12 @@ class CircuitBreaker:
         return False
 
 
+TRADING_STATE_ACTIVE = "ACTIVE"
+TRADING_STATE_REDUCING = "REDUCING"
+TRADING_STATE_HALTED = "HALTED"
+TRADING_STATES = {TRADING_STATE_ACTIVE, TRADING_STATE_REDUCING, TRADING_STATE_HALTED}
+
+
 class RiskManager:
     def __init__(self, config: Config, event_bus: EventBus, safe_mode: SafeModeManager | None = None, sqlite_store: Any | None = None) -> None:
         self.config = config
@@ -196,6 +209,12 @@ class RiskManager:
         self._max_orders_per_window = int(risk_cfg.get("max_orders_per_window", 5))
         self._order_window_seconds = float(risk_cfg.get("order_window_seconds", 10.0))
         self._recent_order_times: list[float] = []
+        self._operator_trading_state = self._normalize_trading_state(
+            risk_cfg.get("initial_trading_state", TRADING_STATE_ACTIVE)
+        )
+        self._operator_trading_state_reason = "initial"
+        self._operator_trading_state_operator = "system"
+        self._operator_trading_state_ts = time.time()
 
         # ── ARMS-V2.1: Drawdown recovery protocol (4 phases) ─────────────
         self._drawdown_phases = {
@@ -900,6 +919,106 @@ class RiskManager:
         except Exception as exc:
             logger.debug("RISK_DECISION publish failed: {}", exc)
 
+    def _publish_pipeline_latency(self, signal: TradingSignal, stage: str, latency_s: float) -> None:
+        try:
+            payload = {
+                "stage": str(stage),
+                "exchange": getattr(signal, "exchange", "unknown"),
+                "symbol": getattr(signal, "symbol", "unknown"),
+                "latency_s": max(0.0, float(latency_s)),
+                "ts": time.time(),
+            }
+            publish_nowait = getattr(self.event_bus, "publish_nowait", None)
+            if callable(publish_nowait):
+                publish_nowait("PIPELINE_LATENCY", payload)
+            else:
+                asyncio.create_task(self.event_bus.publish("PIPELINE_LATENCY", payload))
+        except Exception as exc:
+            logger.debug("risk latency telemetry publish failed: {}", exc)
+
+    @staticmethod
+    def _normalize_trading_state(state: Any) -> str:
+        normalized = str(state or TRADING_STATE_ACTIVE).strip().upper()
+        if normalized not in TRADING_STATES:
+            return TRADING_STATE_ACTIVE
+        return normalized
+
+    def set_trading_state(
+        self,
+        state: str,
+        *,
+        reason: str = "operator_request",
+        operator: str = "system",
+    ) -> dict[str, Any]:
+        """Set the operator-requested trading state.
+
+        ACTIVE allows new entries, REDUCING blocks new entries while keeping
+        closes/cancels available, and HALTED blocks new entries until released.
+        Automatic blockers such as kill switch, circuit breaker, and safe mode
+        still take priority over this requested state.
+        """
+        normalized = self._normalize_trading_state(state)
+        if str(state or "").strip().upper() not in TRADING_STATES:
+            raise ValueError(f"invalid_trading_state:{state}")
+        previous = self._operator_trading_state
+        self._operator_trading_state = normalized
+        self._operator_trading_state_reason = str(reason or "operator_request")
+        self._operator_trading_state_operator = str(operator or "system")
+        self._operator_trading_state_ts = time.time()
+        payload = self.get_trading_state()
+        payload["previous_requested_state"] = previous
+        try:
+            self.event_bus.publish_nowait("TRADING_STATE_CHANGED", payload)
+        except Exception as exc:
+            logger.debug("TRADING_STATE_CHANGED publish failed: {}", exc)
+        logger.warning(
+            "Trading state requested: {} -> {} by {} ({})",
+            previous,
+            normalized,
+            self._operator_trading_state_operator,
+            self._operator_trading_state_reason,
+        )
+        return payload
+
+    def get_trading_state(self) -> dict[str, Any]:
+        blockers: list[str] = []
+        requested = self._operator_trading_state
+        safe_mode_active = bool(getattr(self.safe_mode, "is_active", False))
+        if requested == TRADING_STATE_HALTED:
+            blockers.append("operator_halted")
+        elif requested == TRADING_STATE_REDUCING:
+            blockers.append("operator_reducing")
+        if self._killed:
+            blockers.append("kill_switch")
+        if self._equity_unreconciled:
+            blockers.append("equity_unreconciled")
+        if self._circuit_breaker.tripped:
+            blockers.append(f"circuit_breaker:{self._circuit_breaker.trip_reason}")
+        if safe_mode_active:
+            try:
+                reasons = ",".join(r.value for r in self.safe_mode.active_reasons)
+            except Exception:
+                reasons = "active"
+            blockers.append(f"safe_mode:{reasons}")
+
+        if self._killed or self._equity_unreconciled or requested == TRADING_STATE_HALTED:
+            effective = TRADING_STATE_HALTED
+        elif self._circuit_breaker.tripped or safe_mode_active or requested == TRADING_STATE_REDUCING:
+            effective = TRADING_STATE_REDUCING
+        else:
+            effective = TRADING_STATE_ACTIVE
+
+        return {
+            "state": effective,
+            "requested_state": requested,
+            "reason": self._operator_trading_state_reason,
+            "operator": self._operator_trading_state_operator,
+            "changed_at": self._operator_trading_state_ts,
+            "can_open_new_positions": effective == TRADING_STATE_ACTIVE,
+            "can_reduce_positions": effective in {TRADING_STATE_ACTIVE, TRADING_STATE_REDUCING},
+            "blockers": blockers,
+        }
+
     def update_funding_rate(self, symbol: str, rate: float) -> None:
         """Update current funding rate for a symbol (in decimal, e.g., 0.0001)."""
         self._current_funding_rates[symbol] = rate
@@ -915,7 +1034,8 @@ class RiskManager:
         # ── Safe mode gate — never open new trades while blind ────────────
         if self.safe_mode.is_active:
             reasons = ", ".join(r.value for r in self.safe_mode.active_reasons)
-            return False, f"safe_mode_active ({reasons})", 0.0
+            state = self.get_trading_state()
+            return False, f"trading_state_{state['state'].lower()} (safe_mode:{reasons})", 0.0
 
         # File-based kill switch — manual override (cached to avoid hot-path I/O)
         now = time.time()
@@ -926,6 +1046,12 @@ class RiskManager:
             logger.critical("Kill switch FILE detected: {}", self._kill_switch_file)
             self._killed = True
             return False, "kill_switch_file_detected", 0.0
+
+        trading_state = self.get_trading_state()
+        if trading_state["state"] != TRADING_STATE_ACTIVE:
+            blockers = ",".join(trading_state.get("blockers", []) or [])
+            suffix = f" ({blockers})" if blockers else ""
+            return False, f"trading_state_{trading_state['state'].lower()}{suffix}", 0.0
 
         if self._circuit_breaker.tripped:
             return False, f"circuit_breaker: {self._circuit_breaker.trip_reason}", 0.0
@@ -1003,8 +1129,12 @@ class RiskManager:
 
         # ── Position sizing ───────────────────────────────────────────────
         size = self.calculate_position_size(signal)
-        if size <= 0:
-            return False, "position_size_zero", 0.0
+        # NaN doesn't satisfy <= 0 (NaN > 0 is False AND NaN <= 0 is False, so
+        # the prior simple guard let NaN propagate into ccxt order placement
+        # where it produces opaque exchange errors). Catch all non-positive
+        # and non-finite values up front.
+        if not math.isfinite(size) or size <= 0:
+            return False, "position_size_invalid", 0.0
 
         # SG-Sz: apply the signal-intrinsic size multiplier computed by
         # signal_generator (session × MTF × transition × quality_boost ×
@@ -1105,7 +1235,7 @@ class RiskManager:
         if not ok:
             return False, reason, 0.0
 
-        if size <= 0:
+        if not math.isfinite(size) or size <= 0:
             return False, "position_size_zero (after ARMS adjustments)", 0.0
 
         # V6.0: Total portfolio exposure check (after all sizing adjustments)
@@ -1123,13 +1253,22 @@ class RiskManager:
 
         return True, "approved", size
 
-    async def approve_and_open(self, signal: TradingSignal) -> tuple[bool, str, float, Position | None]:
+    async def approve_and_open(
+        self,
+        signal: TradingSignal,
+        reserve_until_fill: bool = False,
+    ) -> tuple[bool, str, float, Position | None]:
         """Atomically approve signal + open position under lock.
         Prevents race where two signals for same symbol both pass approve_signal
         before either calls open_position.
+        If reserve_until_fill is true, the position is a live execution
+        reservation and price-driven exit logic is disabled until the caller
+        commits it with rebase_position_to_fill or rolls it back with
+        cancel_reserved_position.
         Returns (approved, reason, size, position_or_None).
         """
         async with self._lock:
+            risk_started = time.perf_counter()
             # Portfolio-level order rate limit
             now = time.time()
             cutoff = now - self._order_window_seconds
@@ -1137,10 +1276,12 @@ class RiskManager:
             if len(self._recent_order_times) >= self._max_orders_per_window:
                 reason = f"portfolio_rate_limit ({self._max_orders_per_window} orders in {self._order_window_seconds}s)"
                 self._publish_risk_decision(signal, approved=False, reason=reason, size=0.0)
+                self._publish_pipeline_latency(signal, "risk_gate", time.perf_counter() - risk_started)
                 return False, reason, 0.0, None
 
             approved, reason, size = self.approve_signal(signal)
             self._publish_risk_decision(signal, approved=approved, reason=reason, size=size)
+            self._publish_pipeline_latency(signal, "risk_gate", time.perf_counter() - risk_started)
             if not approved:
                 return False, reason, 0.0, None
             # Open position inline (already holding lock, skip open_position's lock)
@@ -1157,6 +1298,7 @@ class RiskManager:
                 open_time=int(time.time()),
                 highest_since_entry=signal.price,
                 lowest_since_entry=signal.price,
+                pending_fill=reserve_until_fill,
             )
             key = f"{signal.exchange}:{signal.symbol}"
             self._positions[key] = pos
@@ -1201,6 +1343,100 @@ class RiskManager:
             sl = max(sl, max_sl)  # For shorts, move SL further UP (higher = wider)
 
         return sl, tp
+
+    async def rebase_position_to_fill(
+        self,
+        exchange: str,
+        symbol: str,
+        fill_price: float,
+        filled_quantity: float,
+    ) -> Position | None:
+        """Commit a position reserved by approve_and_open to its actual fill.
+
+        Rebases entry/extrema prices, slides SL/TP by the same risk distance
+        the strategy chose at signal time (preserving the intended R:R), and
+        persists to SQLite (approve_and_open intentionally did not). Clears
+        the pending_fill flag so process_tick will start enforcing exits.
+        """
+        if fill_price <= 0 or filled_quantity <= 0:
+            logger.error(
+                "rebase_position_to_fill rejected for {}/{}: invalid fill "
+                "(price={}, qty={})",
+                exchange, symbol, fill_price, filled_quantity,
+            )
+            return None
+        async with self._lock:
+            key = f"{exchange}:{symbol}"
+            pos = self._positions.get(key)
+            if pos is None:
+                logger.warning(
+                    "rebase_position_to_fill: no reserved position for {}/{}",
+                    exchange, symbol,
+                )
+                return None
+            sl_distance = abs(pos.entry_price - pos.stop_loss)
+            tp_distance = abs(pos.take_profit - pos.entry_price)
+            if pos.is_long:
+                pos.stop_loss = fill_price - sl_distance
+                pos.take_profit = fill_price + tp_distance
+            else:
+                pos.stop_loss = fill_price + sl_distance
+                pos.take_profit = fill_price - tp_distance
+            pos.entry_price = fill_price
+            pos.current_price = fill_price
+            pos.highest_since_entry = fill_price
+            pos.lowest_since_entry = fill_price
+            pos.size = filled_quantity
+            pos.pending_fill = False
+            if self._sqlite_store and not getattr(pos, "_db_id", None):
+                try:
+                    db_id = self._sqlite_store.insert_position(
+                        exchange, symbol, pos.direction,
+                        fill_price, filled_quantity,
+                        is_paper=self.config.paper_mode,
+                    )
+                    pos._db_id = db_id
+                except Exception as e:
+                    logger.warning(
+                        "SQLite insert_position failed for {}/{}: {}",
+                        exchange, symbol, e,
+                    )
+            logger.info(
+                "Position committed @ fill: {}/{} {} qty={:.6f} @ {:.4f} "
+                "SL={:.4f} TP={:.4f}",
+                exchange, symbol, pos.direction,
+                filled_quantity, fill_price, pos.stop_loss, pos.take_profit,
+            )
+            return pos
+
+    async def cancel_reserved_position(
+        self, exchange: str, symbol: str
+    ) -> Position | None:
+        """Roll back an approve_and_open reservation when the exchange order
+        never reached a filled state. Removes the in-memory entry without
+        recording a closed trade and without touching equity — there is no
+        real position to close.
+        """
+        async with self._lock:
+            key = f"{exchange}:{symbol}"
+            pos = self._positions.pop(key, None)
+            if pos is None:
+                return None
+            if not pos.pending_fill:
+                logger.error(
+                    "cancel_reserved_position called on non-pending position "
+                    "{}/{} — refusing to drop without close accounting",
+                    exchange, symbol,
+                )
+                # Restore so we don't lose accounting for a real position.
+                self._positions[key] = pos
+                return None
+            logger.warning(
+                "Reserved position cancelled (exchange order did not fill) "
+                "{}/{} {} signal_price={:.4f}",
+                exchange, symbol, pos.direction, pos.entry_price,
+            )
+            return pos
 
     async def open_position(self, signal: TradingSignal, size: float) -> Position:
         async with self._lock:
@@ -1533,6 +1769,7 @@ class RiskManager:
         }
 
     def get_risk_snapshot(self) -> dict[str, Any]:
+        trading_state = self.get_trading_state()
         return {
             "equity": float(self._equity),
             "open_positions": len(self._positions),
@@ -1547,6 +1784,12 @@ class RiskManager:
             "circuit_breaker_tripped": self._circuit_breaker.tripped,
             "circuit_breaker_reason": self._circuit_breaker.trip_reason,
             "kill_switch_active": self._killed,
+            "trading_state": trading_state["state"],
+            "requested_trading_state": trading_state["requested_state"],
+            "trading_state_reason": trading_state["reason"],
+            "trading_state_blockers": trading_state["blockers"],
+            "can_open_new_positions": trading_state["can_open_new_positions"],
+            "can_reduce_positions": trading_state["can_reduce_positions"],
             "current_drawdown_pct": self.current_drawdown_pct(),
             "drawdown_phase": self._current_dd_phase,
             "consecutive_profitable": self._consecutive_profitable,
@@ -1561,6 +1804,12 @@ class RiskManager:
             key = f"{exchange}:{symbol}"
             pos = self._positions.get(key)
             if pos is None:
+                return
+            # Reserved-but-not-yet-filled positions still carry the signal
+            # price as entry_price. Running SL/TP/trailing logic against
+            # them produces phantom exits — wait for rebase_position_to_fill
+            # to flip pending_fill before enforcing exits.
+            if pos.pending_fill:
                 return
             pos.update_price(price)
 
@@ -1723,6 +1972,149 @@ class RiskManager:
     @property
     def equity(self) -> float:
         return self._equity
+
+    def _fallback_recovery_bounds(self, direction: str, entry_price: float) -> tuple[float, float]:
+        risk_cfg = self.config.get_value("risk") or {}
+        stop_pct = max(0.0001, float(risk_cfg.get("stop_loss_pct", 0.015) or 0.015))
+        rr_ratio = max(0.1, float(getattr(self, "_rr_ratio", 2.0) or 2.0))
+        distance = entry_price * stop_pct
+        if direction == "short":
+            return entry_price + distance, entry_price - distance * rr_ratio
+        return entry_price - distance, entry_price + distance * rr_ratio
+
+    async def restore_open_positions_from_sqlite(
+        self,
+        rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Restore open persisted positions into RiskManager after a restart.
+
+        SQLite stores the minimum durable position ledger. On cold start we
+        rebuild in-memory risk state from rows whose close_time_ns is NULL so
+        duplicate-entry checks and dashboard position state are correct before
+        any new signal can trade.
+        """
+        result: dict[str, Any] = {
+            "source": "sqlite",
+            "success": True,
+            "attempted": 0,
+            "restored": 0,
+            "skipped": 0,
+            "errors": [],
+            "positions": [],
+            "max_open_positions": int(self._max_open),
+        }
+        if rows is None:
+            if self._sqlite_store is None or not hasattr(self._sqlite_store, "get_open_positions"):
+                result["success"] = False
+                result["error"] = "sqlite_store_unavailable"
+                self._startup_recovery_result = result
+                return result
+            rows = list(self._sqlite_store.get_open_positions() or [])
+
+        async with self._lock:
+            result["attempted"] = len(rows)
+            for row in rows:
+                try:
+                    exchange = str(row.get("exchange", "") or "").lower()
+                    symbol = str(row.get("symbol", "") or "")
+                    direction = str(row.get("direction", "") or "").lower()
+                    entry_price = float(row.get("entry_price", 0.0) or 0.0)
+                    size = float(row.get("size", 0.0) or 0.0)
+                    if not exchange or not symbol or direction not in {"long", "short"}:
+                        raise ValueError("invalid position identity")
+                    if entry_price <= 0 or size <= 0:
+                        raise ValueError("invalid position price_or_size")
+
+                    key = f"{exchange}:{symbol}"
+                    if key in self._positions:
+                        existing = self._positions[key]
+                        if not getattr(existing, "_db_id", None) and row.get("id") is not None:
+                            existing._db_id = row.get("id")
+                        result["skipped"] += 1
+                        continue
+
+                    stop_loss = float(row.get("stop_loss", 0.0) or 0.0)
+                    take_profit = float(row.get("take_profit", 0.0) or 0.0)
+                    if stop_loss <= 0 or take_profit <= 0:
+                        stop_loss, take_profit = self._fallback_recovery_bounds(direction, entry_price)
+
+                    open_time_raw = int(row.get("open_time_ns", 0) or 0)
+                    open_time = int(open_time_raw / 1_000_000_000) if open_time_raw > 10_000_000_000 else int(open_time_raw)
+                    if open_time <= 0:
+                        open_time = int(time.time())
+
+                    pos = Position(
+                        exchange=exchange,
+                        symbol=symbol,
+                        direction=direction,
+                        size=size,
+                        entry_price=entry_price,
+                        current_price=entry_price,
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                        open_time=open_time,
+                        highest_since_entry=entry_price,
+                        lowest_since_entry=entry_price,
+                        pending_fill=False,
+                    )
+                    if row.get("id") is not None:
+                        pos._db_id = row.get("id")
+                    self._positions[key] = pos
+                    self._last_trade_time.setdefault(symbol, float(open_time))
+                    result["restored"] += 1
+                    result["positions"].append({
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "size": size,
+                        "entry_price": entry_price,
+                        "db_id": row.get("id"),
+                    })
+                except Exception as exc:
+                    result["success"] = False
+                    result["errors"].append({
+                        "id": row.get("id"),
+                        "symbol": row.get("symbol"),
+                        "error": sanitize_exception(exc),
+                    })
+
+            result["open_positions_after"] = len(self._positions)
+            result["over_limit"] = len(self._positions) > self._max_open
+            self._startup_recovery_result = result
+
+        if result["restored"]:
+            logger.warning(
+                "SQLite startup recovery restored {} open position(s)",
+                result["restored"],
+            )
+            try:
+                self.event_bus.publish_nowait("POSITIONS_RECOVERED", {
+                    "source": result.get("source"),
+                    "success": result.get("success"),
+                    "attempted": result.get("attempted"),
+                    "restored": result.get("restored"),
+                    "skipped": result.get("skipped"),
+                    "errors": list(result.get("errors", []) or []),
+                    "positions": list(result.get("positions", []) or []),
+                    "open_positions_after": result.get("open_positions_after"),
+                    "over_limit": result.get("over_limit"),
+                })
+            except Exception:
+                pass
+        return result
+
+    def get_startup_recovery_status(self) -> dict[str, Any]:
+        return dict(getattr(self, "_startup_recovery_result", {
+            "source": "sqlite",
+            "success": True,
+            "attempted": 0,
+            "restored": 0,
+            "skipped": 0,
+            "errors": [],
+            "positions": [],
+            "open_positions_after": len(self._positions),
+            "over_limit": False,
+        }))
 
     async def _handle_tick(self, payload: Any) -> None:
         tick = payload

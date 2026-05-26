@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import contextvars
 import json
+import secrets
 import sys
-import uuid
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from core.logging_utils import configure_sensitive_logging_redaction, redact_sensitive_data
 
 
 # Context-local correlation ID
@@ -25,7 +27,8 @@ _correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 def new_correlation_id(prefix: str = "") -> str:
     """Generate a new correlation ID and set it in context."""
-    cid = f"{prefix}{uuid.uuid4().hex[:12]}" if prefix else uuid.uuid4().hex[:12]
+    unique_part = secrets.token_hex(6)
+    cid = f"{prefix}{unique_part}" if prefix else unique_part
     _correlation_id.set(cid)
     return cid
 
@@ -51,7 +54,7 @@ def _json_formatter(record: dict[str, Any]) -> str:
         "module": record["name"],
         "function": record["function"],
         "line": record["line"],
-        "message": record["message"],
+        "message": redact_sensitive_data(record["message"]),
     }
 
     cid = _correlation_id.get()
@@ -93,6 +96,7 @@ def setup_structured_logging(
     log_path.mkdir(parents=True, exist_ok=True)
 
     logger.remove()
+    configure_sensitive_logging_redaction()
 
     # Stdout — human-readable by default, JSON if requested
     if json_stdout:

@@ -377,6 +377,76 @@ class TestOrderCleanup:
             assert ("binance", "ex_restore") in reader.exchange_order_map
 
 
+class TestCEXClientOrderIds:
+    """P0: live CEX orders must carry deterministic exchange-side IDs."""
+
+    def _signal(self):
+        from engine.signal_generator import TradingSignal
+
+        return TradingSignal(
+            exchange="binance",
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            score=0.9,
+            technical_score=0.9,
+            ml_score=0.9,
+            sentiment_score=0.0,
+            macro_score=0.0,
+            news_score=0.0,
+            orderbook_score=0.0,
+            regime="trending_up",
+            regime_confidence=0.8,
+            price=50_000.0,
+            atr=500.0,
+            stop_loss=49_250.0,
+            take_profit=51_500.0,
+            timestamp=1_700_000_000,
+        )
+
+    def test_client_order_param_keys_are_exchange_specific(self) -> None:
+        from execution.cex_executor import _client_order_params
+
+        signal = self._signal()
+
+        assert set(_client_order_params("binance", signal, "entry")) == {"newClientOrderId"}
+        assert set(_client_order_params("bybit", signal, "entry")) == {"orderLinkId"}
+        assert set(_client_order_params("okx", signal, "entry")) == {"clOrdId"}
+
+    @pytest.mark.asyncio
+    async def test_live_limit_order_uses_deterministic_client_order_id(self) -> None:
+        from execution.cex_executor import CEXExecutor, _client_order_id
+
+        config = MagicMock()
+        config.paper_mode = False
+        config.get_value.return_value = {
+            "wait_for_fill": {"max_retries": 0, "market_on_timeout": False},
+        }
+        bus = MagicMock()
+        bus.publish = AsyncMock()
+        risk_manager = MagicMock()
+        risk_manager.rebase_position_to_fill = AsyncMock(
+            return_value=MagicMock(stop_loss=49_250.0, take_profit=51_500.0)
+        )
+        executor = CEXExecutor(config, bus, risk_manager, exchange_id="binance")
+        executor._fill_max_retries = 0
+        executor._fill_market_on_timeout = False
+        executor._client = MagicMock()
+        executor._client.create_limit_order = AsyncMock(return_value={
+            "id": "ex-order-1",
+            "status": "closed",
+            "filled": 0.1,
+            "average": 50_010.0,
+        })
+
+        signal = self._signal()
+        result = await executor._live_execute(signal, size=5_000.0, reserved_pos=object())
+
+        assert result is not None
+        create_call = executor._client.create_limit_order.await_args.kwargs
+        assert create_call["params"]["newClientOrderId"] == _client_order_id(signal, "entry")
+        assert create_call["params"]["postOnly"] is True
+
+
 class TestSmartOrderRouterLockScope:
     """P2: SmartOrderRouter must not hold lock during network I/O."""
 

@@ -15,10 +15,12 @@ On boot:
 from __future__ import annotations
 
 import time
-import uuid
+import secrets
 from typing import Any
 
 from loguru import logger
+
+from core.error_handling import sanitize_exception
 
 from core.config import Config
 from core.event_bus import EventBus
@@ -27,11 +29,23 @@ from execution.exchange_order_placer import ExchangeOrderPlacer, ProtectiveOrder
 from execution.startup_validation import _sum_stable_usd
 
 
+def _canonical_position_key(symbol: str, exchange: str = "binance") -> str:
+    """Normalize exchange/internal position keys for reconciliation.
+
+    Internal RiskManager keys are usually "exchange:symbol" while CCXT position
+    payloads expose only "symbol". Compare on a canonical exchange-prefixed key
+    to avoid false SafeMode trips for the same live position.
+    """
+    sym = str(symbol or "")
+    ex = str(exchange or "binance")
+    prefix = f"{ex}:"
+    return sym if sym.startswith(prefix) else f"{prefix}{sym}"
+
+
 class ReconciliationResult:
     """Result of startup reconciliation."""
-
     def __init__(self) -> None:
-        self.reconciliation_id: str = uuid.uuid4().hex[:12]
+        self.reconciliation_id: str = secrets.token_hex(6)
         self.success = False
         self.safe_mode = False
         self.exchange_positions: list[dict] = []
@@ -274,13 +288,16 @@ class StartupReconciler:
             # Build lookup: (exchange, symbol) → db row
             db_lookup: dict[str, dict] = {}
             for db_pos in db_positions:
-                key = f"{db_pos.get('exchange', 'binance')}:{db_pos.get('symbol', '')}"
+                key = _canonical_position_key(
+                    str(db_pos.get('symbol', '')),
+                    str(db_pos.get('exchange', 'binance')),
+                )
                 db_lookup[key] = db_pos
 
             # Build lookup of exchange positions
             exch_keys: set[str] = set()
             for ep in result.exchange_positions:
-                key = f"binance:{ep['symbol']}"
+                key = _canonical_position_key(ep['symbol'], 'binance')
                 exch_keys.add(key)
 
                 if key in db_lookup:
@@ -395,6 +412,30 @@ class StartupReconciler:
         from execution.order_manager import Order, OrderStatus, OrderSide, OrderType
 
         restored = 0
+        # Exchange truth wins at startup: remove stale locally-restored open
+        # orders that no longer exist on exchange before adding current orders.
+        exchange_ids = {str(eo.get("id", "")) for eo in result.exchange_open_orders if eo.get("id")}
+        stale_local_ids: list[str] = []
+        for local_id, local_order in list(self._order_manager.orders.items()):
+            status_val = str(getattr(getattr(local_order, "status", ""), "value", getattr(local_order, "status", ""))).lower()
+            exch_id = str(getattr(local_order, "exchange_order_id", "") or getattr(local_order, "order_id", "") or "")
+            if (
+                (status_val in {"open", "pending", "submitted", "new"} and exch_id and exch_id not in exchange_ids)
+                or exch_id.startswith("paper-")
+            ):
+                stale_local_ids.append(local_id)
+        for local_id in stale_local_ids:
+            local_order = self._order_manager.orders.pop(local_id, None)
+            if local_order is None:
+                continue
+            client_oid = getattr(local_order, "client_order_id", None)
+            if client_oid:
+                self._order_manager.client_order_map.pop(client_oid, None)
+            exch_id = str(getattr(local_order, "exchange_order_id", "") or getattr(local_order, "order_id", "") or "")
+            self._order_manager.exchange_order_map.pop((getattr(local_order, "venue", None), exch_id), None)
+            self._order_manager.exchange_order_map.pop(("binance", exch_id), None)
+        if stale_local_ids:
+            result.actions_taken.append(f"removed {len(stale_local_ids)} stale local open orders")
         # exchange_order_map is keyed by (venue, exchange_order_id) — that's the
         # right namespace to dedup against (NOT order_manager.orders, which is
         # keyed by the bot's internal ord_<uuid> ids generated in place_order).
@@ -616,7 +657,7 @@ class StartupReconciler:
                             await self.event_bus.publish("ALERT_WARNING", {
                                 "type": "recon_sl_fallback_local",
                                 "symbol": symbol,
-                                "error": str(exc),
+                                "error": sanitize_exception(exc),
                                 "needs_ack": True,
                                 "exchange": "binance",
                                 "direction": pos.direction,
@@ -637,7 +678,7 @@ class StartupReconciler:
                             await self.event_bus.publish("ALERT_CRITICAL", {
                                 "type": "recon_sl_placement_failed",
                                 "symbol": symbol,
-                                "error": str(exc),
+                                "error": sanitize_exception(exc),
                                 "needs_ack": True,
                                 "exchange": "binance",
                                 "direction": pos.direction,
@@ -707,7 +748,7 @@ class PeriodicReconciler:
             result["mismatches"].append(f"fetch_positions_failed: {type(exc).__name__}: {exc}")
             return result
         ex_positions = {
-            p["symbol"]: float(p.get("contracts", 0.0) or 0.0)
+            _canonical_position_key(p.get("symbol", ""), "binance"): float(p.get("contracts", 0.0) or 0.0)
             for p in (ex_positions_raw or [])
             if abs(float(p.get("contracts", 0.0) or 0.0)) > 0
         }
@@ -715,7 +756,7 @@ class PeriodicReconciler:
         for sym, pos in (getattr(self.risk_manager, "positions", {}) or {}).items():
             qty = abs(float(getattr(pos, "size", 0.0) or 0.0))
             if qty > 0:
-                internal[sym] = qty
+                internal[_canonical_position_key(sym, "binance")] = qty
         result["exchange_position_count"] = len(ex_positions)
         result["internal_position_count"] = len(internal)
 
@@ -755,7 +796,8 @@ class PeriodicReconciler:
                         self.last_result["mismatches"][:5],
                     )
             except Exception as exc:
-                logger.exception("PeriodicReconciler iteration failed: {}", exc)
+                logger.error("PeriodicReconciler iteration failed: {}", sanitize_exception(exc))
+                logger.opt(exception=True).debug("PeriodicReconciler iteration stack trace")
             await asyncio.sleep(self._interval)
 
     def stop(self) -> None:

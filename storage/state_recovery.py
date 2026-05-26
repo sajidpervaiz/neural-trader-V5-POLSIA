@@ -19,6 +19,8 @@ from typing import Any
 
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from storage.audit_repository import AuditRepository
 
 
@@ -83,7 +85,7 @@ class StateRecovery:
             )
 
         except Exception as exc:
-            result.errors.append(str(exc))
+            result.errors.append(sanitize_exception(exc))
             logger.error("State recovery failed: {}", exc)
 
         return result

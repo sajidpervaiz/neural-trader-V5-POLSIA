@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>NeuralTrader Pro</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <script src="/static/js/lightweight-charts.standalone.production.js"></script>
 <script>if(typeof LightweightCharts==='undefined'){document.write('<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"><\/script>')}</script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -193,6 +194,16 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 .pp-pill.skip{color:var(--text3)}
 .pp-summary-bar{flex:1;height:4px;background:var(--bg0);border-radius:2px;margin-left:auto;max-width:240px}
 .pp-summary-bar>span{display:block;height:100%;background:var(--green);border-radius:2px}
+.pp-preflight{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;background:var(--bg0);border:1px solid var(--border);border-left:4px solid var(--border);border-radius:6px;padding:9px 11px;margin-bottom:12px;cursor:pointer}
+.pp-preflight:hover{border-color:var(--blue)}
+.pp-preflight.selected{box-shadow:0 0 0 2px var(--blue) inset}
+.pp-preflight.pass{border-left-color:var(--green)}
+.pp-preflight.soft{border-left-color:var(--orange)}
+.pp-preflight.fail{border-left-color:var(--red)}
+.pp-preflight.skip{border-left-color:var(--text3)}
+.pp-preflight .id{font:700 10px 'JetBrains Mono';color:var(--text3);letter-spacing:.06em}
+.pp-preflight .name{font:700 12px 'Inter';color:var(--text1)}
+.pp-preflight .detail{font:11px 'Inter';color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pp-grid{display:grid;grid-template-columns:repeat(3, minmax(0, 1fr));gap:10px}
 @media (max-width:900px){.pp-grid{grid-template-columns:repeat(2, minmax(0, 1fr))}}
 @media (max-width:600px){.pp-grid{grid-template-columns:1fr}}
@@ -518,6 +529,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
         <button class="tab" data-tab="heatmap">🔥 Heatmap <span class="btm-count" id="heatmapCount">0</span></button>
         <button class="tab" data-tab="alerts">🚨 Alerts <span class="btm-count" id="alertsCount">0</span></button>
         <button class="tab" data-tab="health">💚 Health <span class="btm-count" id="healthCount">0</span></button>
+        <button class="tab" data-tab="ops">Ops <span class="btm-count" id="opsCount">0</span></button>
         <button class="tab" data-tab="v6">🧠 V6</button>
         <button class="tab" data-tab="smc">🎯 SMC</button>
         <button class="tab" data-tab="estop">🛑 E-Stop</button>
@@ -622,6 +634,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg0);color:var(--text);fo
 
       <!-- Tab: Health -->
       <div class="tab-content" id="tc-health"><div class="panel-body" id="healthPanel" style="padding:14px"></div></div>
+
+      <!-- Tab: Operator parity / runtime surfaces -->
+      <div class="tab-content" id="tc-ops"><div class="panel-body" id="opsPanel" style="padding:14px"></div></div>
 
       <!-- Tab: V6 (Killzone + MasterScorer + ML retrain + Pair tiers) -->
       <div class="tab-content" id="tc-v6"><div class="panel-body" id="v6Panel" style="padding:14px"></div></div>
@@ -823,6 +838,7 @@ let streamSource = null;
 let lastSnap = 0;
 let isLiveMode = false;
 let isDemoMode = false;
+let isPaperMode = true;
 let activeVenue = 'paper';
 let isTestnetMode = false;
 let exchangePositions = [];
@@ -830,6 +846,47 @@ let exchangeBalance = null;
 let exchangeOrders = [];
 let exchangeCurrencies = [];
 let agentChatHistory = [{sender:'Assistant', msg:'Ask for status, risk, learning, or say retrain model.'}];
+
+/* ── Dashboard API auth ──
+   API auth is intentionally enabled even in paper mode. The static shell is
+   public, so all fetch() calls inject an operator-provided key from
+   localStorage instead of silently rendering zero/empty data after 401s. */
+const DASHBOARD_API_KEY_STORAGE = 'nt_api_key';
+function getStoredDashboardApiKey() {
+  try { return (localStorage.getItem(DASHBOARD_API_KEY_STORAGE) || '').trim(); }
+  catch (_) { return ''; }
+}
+(function installDashboardAuthFetch() {
+  try {
+    const hashParams = new URLSearchParams(String(window.location.hash || '').replace(/^#/, ''));
+    const hashKey = (hashParams.get('api_key') || hashParams.get('nt_api_key') || '').trim();
+    if (hashKey) {
+      localStorage.setItem(DASHBOARD_API_KEY_STORAGE, hashKey);
+      history.replaceState(null, document.title, window.location.pathname + window.location.search);
+    }
+  } catch (_) {}
+  const nativeFetch = window.fetch.bind(window);
+  let warnedMissingKey = false;
+  window.fetchWithDashboardAuth = function(resource, options) {
+    const opts = Object.assign({}, options || {});
+    const headers = new Headers(opts.headers || {});
+    try {
+      const key = (localStorage.getItem(DASHBOARD_API_KEY_STORAGE) || '').trim();
+      if (key && !headers.has('X-API-Key') && !headers.has('Authorization')) {
+        headers.set('X-API-Key', key);
+      }
+    } catch (_) {}
+    opts.headers = headers;
+    return nativeFetch(resource, opts).then(resp => {
+      if (resp.status === 401 && !warnedMissingKey) {
+        warnedMissingKey = true;
+        toast('error', 'Dashboard API key required. Open with #api_key=YOUR_KEY or set localStorage.nt_api_key.');
+      }
+      return resp;
+    });
+  };
+  window.fetch = window.fetchWithDashboardAuth;
+})();
 
 /* ── Helpers ── */
 function esc(v) { return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -957,6 +1014,7 @@ function bindTabs() {
     if (t.dataset.tab === 'heatmap') loadHeatmap();
     if (t.dataset.tab === 'alerts') loadAlerts();
     if (t.dataset.tab === 'health') loadHealth();
+    if (t.dataset.tab === 'ops') loadOps();
     if (t.dataset.tab === 'v6') loadV6();
     if (t.dataset.tab === 'smc') loadSMC();
     if (t.dataset.tab === 'estop') loadEStop();
@@ -1243,7 +1301,10 @@ function initPosResize() {
 /* ── SSE Stream ── */
 function startStream() {
   if (streamSource) streamSource.close();
-  streamSource = new EventSource('/api/realtime/stream?symbol=' + encodeURIComponent(symbol+'/USDT') + '&timeframe=' + encodeURIComponent(tf));
+  const streamParams = new URLSearchParams({symbol: symbol + '/USDT', timeframe: tf});
+  const streamKey = getStoredDashboardApiKey();
+  if (streamKey) streamParams.set('api_key', streamKey);
+  streamSource = new EventSource('/api/realtime/stream?' + streamParams.toString());
   $('connText').textContent = getConnectionLabel('CONNECTING');
   streamSource.addEventListener('snapshot', e => {
     try { applySnapshot(JSON.parse(e.data)); $('connDot').classList.remove('off'); $('connText').textContent=getConnectionLabel('STREAM'); lastSnap=Date.now(); } catch(_){}
@@ -1268,6 +1329,7 @@ function applySnapshot(s) {
     autoTrading=!!s.auto.enabled;
     isLiveMode = s.auto.mode === 'live';
     isDemoMode = s.auto.mode === 'demo';
+    isPaperMode = !!s.auto.paper_mode;
     activeVenue = String(s.auto.exchange || (isLiveMode || isDemoMode ? 'binance' : 'paper'));
     isTestnetMode = !!s.auto.testnet;
     $('autoBtn').classList.toggle('active',autoTrading);
@@ -1281,7 +1343,8 @@ function applySnapshot(s) {
 async function loadAll() {
   await Promise.all([loadStatus(), loadMarket(), loadFG(), loadOB(), loadTech(), loadCandles(), loadAutoStatus(), loadAgentStatus(), loadSession(), loadRegime(), loadGuardrails(), loadVariational()]);
   // Mode-specific loaders
-  if (isLiveMode || isDemoMode) {
+  const useExchangePortfolio = (isLiveMode || isDemoMode) && !isPaperMode;
+  if (useExchangePortfolio) {
     await Promise.all([loadExchangeBalance(), loadExchangePositions(), loadExchangeOrders(), loadTradeHistory()]);
   } else {
     await loadPaperTrades();
@@ -1291,7 +1354,8 @@ async function loadAll() {
 async function loadStatus() { try { applyStatus(await (await fetch('/api/status')).json()); } catch(_){} }
 function applyStatus(d) {
   const rawEquity = d.equity||0;
-  const equity = (exchangeBalance && (isDemoMode || isLiveMode) && exchangeBalance.equity_usd) ? exchangeBalance.equity_usd : rawEquity;
+  const useExchangePortfolio = (isLiveMode || isDemoMode) && !isPaperMode;
+  const equity = (exchangeBalance && useExchangePortfolio && exchangeBalance.equity_usd) ? exchangeBalance.equity_usd : rawEquity;
   const upnl = d.unrealized_pnl||0, dd = d.drawdown_pct||0;
   $('hEquity').textContent = fmt$(equity);
   $('hPnl').textContent = (upnl>=0?'+':'')+fmt$(upnl); $('hPnl').style.color = upnl>=0?'var(--green)':'var(--red)';
@@ -1306,7 +1370,7 @@ function applyStatus(d) {
     // asset (USDT first, USDC fallback). In PAPER we estimate from portfolio_heat
     // because the engine doesn't surface used_margin directly.
     let avail;
-    if ((isDemoMode || isLiveMode) && exchangeBalance && Array.isArray(exchangeBalance.balances)) {
+    if (useExchangePortfolio && exchangeBalance && Array.isArray(exchangeBalance.balances)) {
       const stables = exchangeBalance.balances.filter(b => b.asset === 'USDT' || b.asset === 'USDC');
       avail = stables.reduce((s, b) => s + Number(b.free || 0), 0);
     } else {
@@ -1326,8 +1390,10 @@ function applyStatus(d) {
   // Exchange-style positions table
   const el = $('positionsBody');
   if (!el) return;
-  // In live or demo mode, prefer real exchange positions (testnet/mainnet) over the paper ledger.
-  const positions = ((isLiveMode || isDemoMode) && exchangePositions.length) ? exchangePositions : (d.positions||[]);
+  // In exchange-backed demo/live mode, prefer real exchange positions (testnet/mainnet)
+  // over the paper ledger. In paper-backed demo mode, render the paper ledger so
+  // manual paper dogfood cannot be masked by stale testnet/exchange positions.
+  const positions = (useExchangePortfolio && exchangePositions.length) ? exchangePositions : (d.positions||[]);
   const posN2 = positions.length;
   $('posCount').textContent = posN2;
   if (!posN2) {
@@ -1966,7 +2032,10 @@ function _riskMonitorPanel(snap){
   if(!snap) return _armsPanel('🛡','Risk Monitor', _armsPill('info','N/A'), '<div class="arms2-unavailable">Unavailable</div>');
   const ddPhase = snap.drawdown_phase||'normal';
   const ddCol = ddPhase==='normal'?'ok':(ddPhase==='caution'?'warn':'danger');
+  const tradingState = String(snap.trading_state || 'ACTIVE').toUpperCase();
+  const tradingCol = tradingState === 'ACTIVE' ? 'ok' : (tradingState === 'REDUCING' ? 'warn' : 'danger');
   const rows = [
+    ['Trading State', tradingState, tradingCol],
     ['Circuit Breaker', snap.circuit_breaker_tripped?'TRIPPED':'CLOSED', snap.circuit_breaker_tripped?'danger':'ok'],
     ['Kill Switch', snap.kill_switch_active?'ACTIVE':'Disengaged', snap.kill_switch_active?'danger':'ok'],
     ['Drawdown', _fmtPct(snap.current_drawdown_pct,1), ddCol],
@@ -1979,8 +2048,8 @@ function _riskMonitorPanel(snap){
     ['Exchange Latency', (snap.exchange_latency_ms||0)+'ms', 'ok'],
   ];
   const body = rows.map(r=>'<div class="arms2-row"><div class="lbl"><span class="dot '+(r[2]==='danger'?'danger':r[2]==='warn'?'warn':'')+'"></span>'+esc(r[0])+'</div><div class="val '+(r[2]||'')+'">'+esc(String(r[1]))+'</div></div>').join('');
-  const pillKind = snap.kill_switch_active||snap.circuit_breaker_tripped?'danger':(ddPhase!=='normal'?'warn':'ok');
-  const pillLabel = snap.kill_switch_active?'ALERT':snap.circuit_breaker_tripped?'TRIPPED':(ddPhase!=='normal'?ddPhase.toUpperCase():'NORMAL');
+  const pillKind = snap.kill_switch_active||snap.circuit_breaker_tripped||tradingState==='HALTED'?'danger':(tradingState==='REDUCING'||ddPhase!=='normal'?'warn':'ok');
+  const pillLabel = snap.kill_switch_active?'ALERT':snap.circuit_breaker_tripped?'TRIPPED':(tradingState!=='ACTIVE'?tradingState:(ddPhase!=='normal'?ddPhase.toUpperCase():'NORMAL'));
   return _armsPanel('🛡','Risk Monitor', _armsPill(pillKind,pillLabel), body);
 }
 
@@ -2004,12 +2073,28 @@ function _guardrailsPanel(guard){
 
 function _latencyPanel(prewarm,lat){
   const p = prewarm||{};
+  const m = lat || {};
   const avg = p.order_exec_avg_ms || 0;
   const status = p.status || 'normal';
+  let orderP95 = 0, decisionP95 = 0, pipelineP95 = 0;
+  for(const key of Object.keys(m.order_latency || {})){
+    const v = Number((m.order_latency[key] || {}).p95_ms || 0);
+    if(v > orderP95) orderP95 = v;
+  }
+  for(const key of Object.keys(m.decision_latency || {})){
+    const v = Number((m.decision_latency[key] || {}).p95_ms || 0);
+    if(v > decisionP95) decisionP95 = v;
+  }
+  for(const key of Object.keys(m.pipeline_latency || {})){
+    const v = Number((m.pipeline_latency[key] || {}).p95_ms || 0);
+    if(v > pipelineP95) pipelineP95 = v;
+  }
   const rows = [
     ['WS Feed Lag', (p.ws_feed_lag_ms||0)+'ms'],
+    ['Pipeline (p95)', pipelineP95.toFixed(pipelineP95 < 10 ? 1 : 0)+'ms'],
     ['Order Exec (avg)', avg+'ms'],
-    ['Order Exec (p95)', (p.order_exec_p95_ms||0)+'ms'],
+    ['Order Exec (p95)', Math.max(Number(p.order_exec_p95_ms||0), orderP95).toFixed(0)+'ms'],
+    ['AI Decision (p95)', decisionP95.toFixed(decisionP95 < 10 ? 1 : 0)+'ms'],
     ['Last Order', (p.last_order_ms||0)+'ms'],
     ['Cache Hit Rate', _fmtPct(p.cache_hit_rate||0,0)],
     ['Cache Age', (p.cache_age_sec||0).toFixed(1)+'s'],
@@ -2186,9 +2271,9 @@ async function loadPipeline() {
     renderPipeline(ctx.raw || {layers: ctx.layers}, ctx.quality, ctx.session, ctx.geo);
     // If drawer was open, refresh its body with the latest snapshot.
     if (window.__pipelineSelectedId && $('layerDrawer') && $('layerDrawer').classList.contains('open')) {
-      const layer = (ctx.layers||[]).find(l => l.id === window.__pipelineSelectedId);
+      const layer = (window.__pipelineSelectedId === 'preflight') ? ctx.preflight : (ctx.layers||[]).find(l => l.id === window.__pipelineSelectedId);
       if (layer) $('layerDrawerBody').innerHTML = renderLayerDetail(layer, ctx);
-      const card = document.querySelector('.pp-card[data-layer-id="'+window.__pipelineSelectedId+'"]');
+      const card = document.querySelector('[data-layer-id="'+window.__pipelineSelectedId+'"]');
       if (card) card.classList.add('selected');
     }
   } catch(e) { console.error('loadPipeline failed:', e); $('pipelinePanel').innerHTML='<div style="color:var(--text3)">Pipeline data unavailable</div>'; }
@@ -2241,11 +2326,19 @@ function _srsRibbonHtml(ctx) {
   const reconAge = periodic.ts ? _srsTimeAgo(periodic.ts) : '—';
   const reconMismatch = (periodic.mismatches || []).length;
   // Latency
-  const lat = (ctx && ctx.latency) || {feed_lag:{}, order_latency:{}};
-  let p95 = 0;
+  const lat = (ctx && ctx.latency) || {feed_lag:{}, order_latency:{}, decision_latency:{}, pipeline_latency:{}};
+  let p95 = 0, aiP95 = 0, pipeP95 = 0;
   for (const ex of Object.keys(lat.feed_lag || {})) {
     const m = Number((lat.feed_lag[ex] || {}).p95_ms || 0);
     if (m > p95) p95 = m;
+  }
+  for (const key of Object.keys(lat.decision_latency || {})) {
+    const m = Number((lat.decision_latency[key] || {}).p95_ms || 0);
+    if (m > aiP95) aiP95 = m;
+  }
+  for (const key of Object.keys(lat.pipeline_latency || {})) {
+    const m = Number((lat.pipeline_latency[key] || {}).p95_ms || 0);
+    if (m > pipeP95) pipeP95 = m;
   }
   // Warmup pill
   const warmup = !!q.warmup || !!q.partial || !!q.preview;
@@ -2280,14 +2373,229 @@ function _srsRibbonHtml(ctx) {
   }
   h += '<span style="color:var(--text2);margin-left:auto">recon '+(reconMismatch>0?'⚠ '+reconMismatch+' mismatch':'OK')+' · '+esc(reconAge)+' ago</span>';
   h += '<span style="color:var(--text2)">p95 '+p95.toFixed(0)+'ms</span>';
+  h += '<span style="color:var(--text2)">pipe '+pipeP95.toFixed(pipeP95 < 10 ? 1 : 0)+'ms</span>';
+  h += '<span style="color:var(--text2)">AI '+aiP95.toFixed(aiP95 < 10 ? 1 : 0)+'ms</span>';
   h += '</div>';
   return h;
+}
+function _readinessKind(st) {
+  const s = String(st || '').toUpperCase();
+  if (s === 'PASS' || s === 'READY' || s === 'OK') return 'pass';
+  if (s === 'WARN' || s === 'WARNING' || s === 'WARMING' || s === 'DEGRADED') return 'soft';
+  if (s === 'BLOCK' || s === 'BLOCKED' || s === 'FAIL' || s === 'FAILED' || s === 'ERROR') return 'fail';
+  return 'skip';
+}
+function _readinessColor(kind) {
+  if (kind === 'pass') return 'var(--green)';
+  if (kind === 'soft') return 'var(--yellow)';
+  if (kind === 'fail') return 'var(--red)';
+  return 'var(--text3)';
+}
+function _pipelineReadinessHtml(readiness) {
+  const r = readiness || {};
+  const available = r.available !== false;
+  const status = String(r.status || (available ? 'UNKNOWN' : 'UNAVAILABLE')).toUpperCase();
+  const kind = _readinessKind(status);
+  const col = _readinessColor(kind);
+  const summary = r.summary || {};
+  const stages = Array.isArray(r.stages) ? r.stages : [];
+  const mode = String(r.mode || 'paper').toUpperCase();
+  const paperOk = !!r.can_trade_paper;
+  const liveOk = !!r.can_trade_live;
+  const entryOk = !!r.entry_allowed_now;
+  const entryBlockers = Array.isArray(r.entry_blockers) ? r.entry_blockers : [];
+  let h = '<div style="margin-bottom:10px;border:1px solid var(--border);border-radius:6px;background:var(--bg2);padding:10px">';
+  h += '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">';
+  h += '<div style="font:800 12px Inter;color:var(--text)">Pipeline Readiness</div>';
+  h += '<span style="border:1px solid '+col+';color:'+col+';border-radius:3px;padding:2px 7px;font:800 11px JetBrains Mono">'+esc(status)+'</span>';
+  h += '<span style="color:var(--text3);font:11px JetBrains Mono">MODE '+esc(mode)+'</span>';
+  h += '<span style="color:'+(paperOk?'var(--green)':'var(--red)')+';font:11px JetBrains Mono">PAPER '+(paperOk?'OK':'BLOCK')+'</span>';
+  h += '<span style="color:'+(liveOk?'var(--green)':'var(--text3)')+';font:11px JetBrains Mono">LIVE '+(liveOk?'OK':'LOCKED')+'</span>';
+  h += '<span title="'+esc(entryBlockers.slice(0,6).join(', ') || 'entry gate clear')+'" style="color:'+(entryOk?'var(--green)':'var(--yellow)')+';font:11px JetBrains Mono">ENTRY '+(entryOk?'ALLOW':'WAIT')+'</span>';
+  h += '<button onclick="runPipelineProbe()" title="Run paper-only dry-run pipeline probe" style="border:1px solid var(--border);background:var(--bg);color:var(--text2);border-radius:4px;padding:3px 7px;font:800 10px Inter;cursor:pointer">PROBE</button>';
+  h += '<button onclick="runPipelineFillProbe()" title="Run paper-only fill and close lifecycle probe" style="border:1px solid var(--border);background:var(--bg);color:var(--text2);border-radius:4px;padding:3px 7px;font:800 10px Inter;cursor:pointer">FILL</button>';
+  h += '<button onclick="runPipelineRecoveryProbe()" title="Run paper-only SQLite restart recovery drill" style="border:1px solid var(--border);background:var(--bg);color:var(--text2);border-radius:4px;padding:3px 7px;font:800 10px Inter;cursor:pointer">RECOVER</button>';
+  h += '<span id="pipelineProbeStatus" style="color:var(--text3);font:10px JetBrains Mono"></span>';
+  h += '<span style="margin-left:auto;color:var(--text3);font:11px JetBrains Mono">PASS '+(summary.pass||0)+' / WARN '+(summary.warn||0)+' / BLOCK '+(summary.block||0)+'</span>';
+  h += '</div>';
+  if (!available) {
+    h += '<div style="color:var(--text3);font-size:12px">readiness endpoint unavailable</div></div>';
+    return h;
+  }
+  if (Array.isArray(r.blockers) && r.blockers.length) {
+    h += '<div style="color:var(--red);font:11px JetBrains Mono;margin-bottom:8px">BLOCKERS '+esc(r.blockers.join(', '))+'</div>';
+  } else if (Array.isArray(r.warnings) && r.warnings.length) {
+    h += '<div style="color:var(--yellow);font:11px JetBrains Mono;margin-bottom:8px">WARN '+esc(r.warnings.slice(0, 8).join(', '))+'</div>';
+  }
+  h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:6px">';
+  stages.forEach(stage => {
+    const st = String(stage.status || 'UNKNOWN').toUpperCase();
+    const sk = _readinessKind(st);
+    const sc = _readinessColor(sk);
+    const critical = stage.critical !== false;
+    h += '<div title="'+esc(stage.detail || '')+'" style="border:1px solid '+(sk==='fail'?'var(--red)':'var(--border)')+';border-radius:6px;padding:7px 8px;background:rgba(255,255,255,.02);min-width:0">';
+    h += '<div style="display:flex;align-items:center;gap:6px;min-width:0">';
+    h += '<span style="width:7px;height:7px;border-radius:50%;background:'+sc+';display:inline-block;flex:0 0 auto"></span>';
+    h += '<span style="font:700 11px Inter;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(stage.name || stage.id || 'Stage')+'</span>';
+    h += '<span style="margin-left:auto;color:'+sc+';font:800 10px JetBrains Mono">'+esc(st)+'</span>';
+    h += '</div>';
+    h += '<div style="margin-top:4px;color:var(--text3);font-size:11px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(stage.detail || '')+'</div>';
+    if (!critical) h += '<div style="margin-top:3px;color:var(--text3);font:10px JetBrains Mono">ADVISORY</div>';
+    h += '</div>';
+  });
+  h += '</div></div>';
+  return h;
+}
+function _recoveryLedgerHtml(ledger) {
+  const l = ledger || {};
+  if (l.available === false) return '';
+  const dup = Number(l.duplicate_count || 0);
+  const orphan = Number(l.orphan_count || 0);
+  const phantom = Number(l.phantom_count || 0);
+  const warn = dup || orphan || phantom;
+  const col = warn ? 'var(--yellow)' : 'var(--green)';
+  let h = '<div style="margin-bottom:10px;border:1px solid '+(warn?'var(--yellow)':'var(--border)')+';border-radius:6px;background:var(--bg2);padding:10px">';
+  h += '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">';
+  h += '<div style="font:800 12px Inter;color:var(--text)">Recovery Ledger</div>';
+  h += '<span style="border:1px solid '+col+';color:'+col+';border-radius:3px;padding:2px 7px;font:800 11px JetBrains Mono">'+(warn?'WARN':'PASS')+'</span>';
+  h += '<span style="color:var(--text3);font:11px JetBrains Mono">DB '+Number(l.open_rows||0)+' / MEM '+Number(l.in_memory_open_positions||0)+'</span>';
+  h += '<span style="color:'+(dup?'var(--yellow)':'var(--text3)')+';font:11px JetBrains Mono">DUP '+dup+'</span>';
+  h += '<span style="color:'+(orphan?'var(--yellow)':'var(--text3)')+';font:11px JetBrains Mono">ORPHAN '+orphan+'</span>';
+  h += '<span style="color:'+(phantom?'var(--yellow)':'var(--text3)')+';font:11px JetBrains Mono">PHANTOM '+phantom+'</span>';
+  if (dup > 0) h += '<button onclick="archiveRecoveryDuplicates()" title="Archive duplicate paper ledger rows" style="border:1px solid var(--yellow);background:var(--bg);color:var(--yellow);border-radius:4px;padding:3px 7px;font:800 10px Inter;cursor:pointer">ARCHIVE DUPES</button>';
+  h += '<span id="ledgerCleanupStatus" style="color:var(--text3);font:10px JetBrains Mono"></span>';
+  h += '</div>';
+  const groups = Array.isArray(l.duplicate_groups) ? l.duplicate_groups : [];
+  if (groups.length) {
+    h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:6px;margin-top:8px">';
+    groups.slice(0, 4).forEach(g => {
+      h += '<div style="border:1px solid var(--border);border-radius:6px;padding:7px 8px;background:rgba(255,255,255,.02);min-width:0">';
+      h += '<div style="display:flex;align-items:center;gap:6px"><span style="font:700 11px Inter;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(g.symbol||'')+'</span>';
+      h += '<span style="margin-left:auto;color:var(--yellow);font:800 10px JetBrains Mono">'+((g.rows||[]).length)+' ROWS</span></div>';
+      h += '<div style="margin-top:4px;color:var(--text3);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">keep #'+esc(g.canonical_id||'')+' archive '+esc((g.duplicate_ids||[]).join(','))+'</div>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+  h += '</div>';
+  return h;
+}
+async function runPipelineProbe() {
+  const el = document.getElementById('pipelineProbeStatus');
+  if (el) el.textContent = 'RUNNING';
+  try {
+    const res = await fetch('/api/pipeline/probe', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dry_run:true})
+    });
+    const d = await res.json();
+    const ok = !!d.success;
+    const msg = (ok ? 'PASS ' : 'BLOCK ') + (d.latency_ms !== undefined ? d.latency_ms + 'ms' : (d.error || d.risk_reason || ''));
+    if (el) {
+      el.textContent = msg;
+      el.style.color = ok ? 'var(--green)' : 'var(--red)';
+    }
+    if (typeof toast === 'function') toast(ok ? 'success' : 'error', 'Pipeline probe ' + msg);
+    await loadFlowCtx();
+    if (typeof loadPipeline === 'function') loadPipeline();
+  } catch (err) {
+    if (el) {
+      el.textContent = 'ERROR';
+      el.style.color = 'var(--red)';
+    }
+    if (typeof toast === 'function') toast('error', 'Pipeline probe failed');
+  }
+}
+async function runPipelineFillProbe() {
+  const el = document.getElementById('pipelineProbeStatus');
+  if (el) el.textContent = 'FILL RUNNING';
+  try {
+    const res = await fetch('/api/pipeline/probe/fill', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({confirm:'PAPER_FILL_PROBE'})
+    });
+    const d = await res.json();
+    const ok = !!d.success;
+    const msg = (ok ? 'FILL PASS ' : 'FILL BLOCK ') + (d.latency_ms !== undefined ? d.latency_ms + 'ms' : (d.error || ''));
+    if (el) {
+      el.textContent = msg;
+      el.style.color = ok ? 'var(--green)' : 'var(--red)';
+    }
+    if (typeof toast === 'function') toast(ok ? 'success' : 'error', 'Lifecycle probe ' + msg);
+    await loadFlowCtx();
+    if (typeof loadPipeline === 'function') loadPipeline();
+    if (typeof loadStatus === 'function') loadStatus();
+  } catch (err) {
+    if (el) {
+      el.textContent = 'FILL ERROR';
+      el.style.color = 'var(--red)';
+    }
+    if (typeof toast === 'function') toast('error', 'Lifecycle probe failed');
+  }
+}
+async function runPipelineRecoveryProbe() {
+  const el = document.getElementById('pipelineProbeStatus');
+  if (el) el.textContent = 'RECOVERY RUNNING';
+  try {
+    const res = await fetch('/api/pipeline/probe/recovery', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({confirm:'PAPER_RECOVERY_PROBE'})
+    });
+    const d = await res.json();
+    const ok = !!d.success;
+    const msg = (ok ? 'RECOVERY PASS ' : 'RECOVERY BLOCK ') + (d.latency_ms !== undefined ? d.latency_ms + 'ms' : (d.error || ''));
+    if (el) {
+      el.textContent = msg;
+      el.style.color = ok ? 'var(--green)' : 'var(--red)';
+    }
+    if (typeof toast === 'function') toast(ok ? 'success' : 'error', 'Recovery probe ' + msg);
+    await loadFlowCtx();
+    if (typeof loadPipeline === 'function') loadPipeline();
+    if (typeof loadStatus === 'function') loadStatus();
+  } catch (err) {
+    if (el) {
+      el.textContent = 'RECOVERY ERROR';
+      el.style.color = 'var(--red)';
+    }
+    if (typeof toast === 'function') toast('error', 'Recovery probe failed');
+  }
+}
+async function archiveRecoveryDuplicates() {
+  const el = document.getElementById('ledgerCleanupStatus');
+  if (el) el.textContent = 'ARCHIVING';
+  try {
+    const res = await fetch('/api/recovery/ledger/archive-duplicates', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({reason:'dashboard_duplicate_cleanup'})
+    });
+    const d = await res.json();
+    const ok = !!d.success;
+    const msg = (ok ? 'ARCHIVED ' : 'BLOCK ') + (d.archived !== undefined ? d.archived : (d.error || ''));
+    if (el) {
+      el.textContent = msg;
+      el.style.color = ok ? 'var(--green)' : 'var(--red)';
+    }
+    if (typeof toast === 'function') toast(ok ? 'success' : 'error', 'Ledger cleanup ' + msg);
+    await loadFlowCtx();
+    if (typeof loadPipeline === 'function') loadPipeline();
+    if (typeof loadStatus === 'function') loadStatus();
+  } catch (err) {
+    if (el) {
+      el.textContent = 'ERROR';
+      el.style.color = 'var(--red)';
+    }
+    if (typeof toast === 'function') toast('error', 'Ledger cleanup failed');
+  }
 }
 function _ppKind(st) {
   const s = String(st||'').toUpperCase();
   if (s==='PASS') return 'pass';
   if (s==='WEAK' || s==='SOFT' || s==='WARN') return 'soft';
-  if (s==='FAIL' || s==='BLOCKED') return 'fail';
+  if (s==='FAIL' || s==='BLOCK' || s==='BLOCKED') return 'fail';
   return 'skip'; // PENDING / UNKNOWN / SKIP
 }
 function _ppIcon(kind) {
@@ -2299,8 +2607,32 @@ function _ppFmtNum(v, digits) {
   if (Math.abs(n) >= 100 || Number.isInteger(n)) return String(Math.round(n));
   return n.toFixed(digits==null?2:digits);
 }
+function _defaultPreflight() {
+  return {
+    id: 'preflight',
+    layer_index: 'PRE',
+    name: 'Preflight',
+    description: 'Runtime guards before L1-L10',
+    status: 'PENDING',
+    score: null,
+    threshold: 1,
+    detail: 'awaiting preflight',
+  };
+}
+function _ppPreflightHtml(preflight) {
+  const pf = preflight || _defaultPreflight();
+  const stRaw = String(pf.status || 'PENDING').toUpperCase();
+  const kind = _ppKind(stRaw);
+  return '<div class="pp-preflight '+kind+'" data-layer-id="preflight" onclick="openLayerDrawer(\'preflight\')">'
+    + '<span class="id">'+esc(pf.layer_index || 'PRE')+'</span>'
+    + '<div><div class="name">'+esc(pf.name || 'Preflight')+'</div>'
+    + '<div class="detail">'+esc(pf.detail || pf.description || '')+'</div></div>'
+    + '<span class="flow-node-pill '+kind+'">'+esc(stRaw)+'</span>'
+    + '</div>';
+}
 function renderPipeline(layers, quality, session, geo) {
   const list = (layers.layers || []).slice();
+  const preflight = layers.preflight || _defaultPreflight();
   // ── Synthesise Layer 10 (Geopolitical) from /api/geopolitical when available ──
   if (geo && geo.available !== false) {
     const syms = geo.symbols || {};
@@ -2346,6 +2678,8 @@ function renderPipeline(layers, quality, session, geo) {
   // last-reconciliation clock, latency p95, and warmup pill.
   const ctx = window.__flowCtx || {};
   html += _srsRibbonHtml(ctx);
+  html += _pipelineReadinessHtml(ctx.readiness);
+  html += _recoveryLedgerHtml(ctx.ledger);
 
   html += '<div class="pp-wrap">';
 
@@ -2356,6 +2690,7 @@ function renderPipeline(layers, quality, session, geo) {
   html += '<div class="pp-head-title">❖ ' + total + '-Layer Pipeline</div>';
   html += '<div class="pp-head-right">' + (counts.pass||0) + '/' + total + ' PASS<span class="big">' + passPct + '%</span></div>';
   html += '</div>';
+  html += _ppPreflightHtml(preflight);
   // Summary chips + global bar
   html += '<div class="pp-summary">';
   html += '<span class="pp-pill pass">PASS<span class="n">' + (counts.pass||0) + '</span></span>';
@@ -2369,7 +2704,7 @@ function renderPipeline(layers, quality, session, geo) {
   list.forEach(l => {
     const stRaw = String(l.status || 'SKIP').toUpperCase();
     const kind = _ppKind(stRaw);
-    const idx = l.layer_index || ('L' + ((l.id||1) - 1));
+    const idx = l.layer_index || ('L' + (l.id || 1));
     const score = (l.score !== null && l.score !== undefined) ? Number(l.score) : null;
     const thr   = (l.threshold !== null && l.threshold !== undefined) ? Number(l.threshold) : null;
     // Delta vs previous snapshot
@@ -2592,6 +2927,187 @@ async function loadHealth() {
     html += '</div>';
     $('healthPanel').innerHTML = html;
   } catch (e) { console.error('loadHealth failed:', e); $('healthPanel').innerHTML = '<div style="color:var(--text3)">Health data unavailable</div>'; }
+}
+
+/* Operator parity tab: backend surfaces not covered by the trading workspace */
+window.__opsTab = window.__opsTab || 'runtime';
+async function _opsJson(url, fallback) {
+  try {
+    const r = await fetch(url);
+    let d = {};
+    try { d = await r.json(); } catch (_) { d = {}; }
+    if (!r.ok) {
+      const detail = d.detail || d.error || r.statusText || r.status;
+      return Object.assign({available:false, status:r.status, error: typeof detail === 'string' ? detail : JSON.stringify(detail)}, fallback || {});
+    }
+    return d;
+  } catch (e) {
+    return Object.assign({available:false, error:e.message || 'unavailable'}, fallback || {});
+  }
+}
+function _opsSubtabs() {
+  const tabs = [['runtime','Runtime'],['signals','Signals'],['risk','Risk'],['config','Config']];
+  return '<div class="arms2-subs" style="margin-bottom:12px">' + tabs.map(([id,label]) =>
+    '<div class="arms2-sub '+(window.__opsTab===id?'active':'')+'" onclick="window.__opsTab=\''+id+'\';loadOps()">'+esc(label)+'</div>'
+  ).join('') + '</div>';
+}
+function _opsVal(v) {
+  if (v === null || v === undefined || v === '') return '-';
+  if (typeof v === 'boolean') return v ? 'YES' : 'NO';
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) return '-';
+    return Math.abs(v) > 100 ? v.toLocaleString(undefined,{maximumFractionDigits:1}) : Number(v).toFixed(Number.isInteger(v) ? 0 : 4).replace(/\.?0+$/,'');
+  }
+  if (Array.isArray(v)) return v.length ? v.map(_opsVal).join(', ') : '-';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+function _opsRows(rows) {
+  if (!rows || !rows.length) return '<div style="color:var(--text3);font-size:11px">No data</div>';
+  return '<div style="border:1px solid var(--border);border-radius:6px;overflow:hidden">' + rows.map(r =>
+    '<div style="display:grid;grid-template-columns:minmax(120px,220px) 1fr;gap:10px;padding:7px 10px;border-bottom:1px solid var(--border);font-size:10px">'
+    + '<div style="color:var(--text3);font-weight:600;text-transform:uppercase">'+esc(r[0])+'</div>'
+    + '<div style="font-family:\'JetBrains Mono\';color:var(--text)">'+esc(_opsVal(r[1]))+'</div></div>'
+  ).join('') + '</div>';
+}
+function _opsObjectRows(obj, limit) {
+  const entries = Object.entries(obj || {}).slice(0, limit || 30);
+  return _opsRows(entries.map(([k,v]) => [k.replace(/_/g,' '), v]));
+}
+function _opsSection(title, body) {
+  return '<div style="margin-top:14px"><div style="font:700 10px \'Inter\';color:var(--text2);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">'+esc(title)+'</div>'+body+'</div>';
+}
+function _opsStatus(name, d) {
+  if (!d) return armCard(name, 'NO DATA', '', 'warn');
+  if (d.error) return armCard(name, 'ERROR', String(d.error).slice(0,80), 'danger');
+  if (d.available === false) return armCard(name, 'OFFLINE', d.reason || '', 'warn');
+  return armCard(name, 'OK', '', 'ok');
+}
+function _opsUpdateCount(items) {
+  const list = items || [];
+  const ok = list.filter(x => x && !x.error).length;
+  if ($('opsCount')) $('opsCount').textContent = ok + '/' + list.length;
+}
+async function loadOps() {
+  const panel = $('opsPanel');
+  if (!panel) return;
+  panel.innerHTML = _opsSubtabs() + '<div style="color:var(--text3)">Loading...</div>';
+  try {
+    if (window.__opsTab === 'signals') return await loadOpsSignals();
+    if (window.__opsTab === 'risk') return await loadOpsRisk();
+    if (window.__opsTab === 'config') return await loadOpsConfig();
+    return await loadOpsRuntime();
+  } catch (e) {
+    panel.innerHTML = _opsSubtabs() + '<div style="color:var(--red)">Ops data unavailable: '+esc(e.message)+'</div>';
+  }
+}
+async function loadOpsRuntime() {
+  const [ready, sources, recon, ustream, state, uptime, eventbus, clientkey, sys, cfg] = await Promise.all([
+    _opsJson('/api/live/readiness'), _opsJson('/api/system/data-sources'), _opsJson('/api/reconciliation/status'),
+    _opsJson('/api/user-stream/status'), _opsJson('/api/state'), _opsJson('/api/uptime'), _opsJson('/api/eventbus/stats'),
+    _opsJson('/api/clientkey'), _opsJson('/system/stats'), _opsJson('/config/summary'),
+  ]);
+  _opsUpdateCount([ready,sources,recon,ustream,state,uptime,eventbus,clientkey,sys,cfg]);
+  const blockers = ready.blockers || [];
+  const checks = ready.checks || {};
+  let html = _opsSubtabs();
+  html += '<div class="arms-grid">';
+  html += armCard('Live Ready', ready.ready_for_live ? 'YES' : 'NO', blockers.join(', ') || '', ready.ready_for_live ? 'ok' : 'warn');
+  html += armCard('Mode', (cfg.paper_mode || (checks.mode||{}).value === 'paper') ? 'PAPER' : 'LIVE', '', cfg.paper_mode ? 'warn' : 'danger');
+  html += armCard('Dashboard Auth', clientkey.auth_required ? (clientkey.configured ? 'CONFIGURED' : 'MISSING') : 'OPEN LOCAL', '', clientkey.auth_required && !clientkey.configured ? 'danger' : 'ok');
+  html += armCard('Database', sys.db_connected ? 'CONNECTED' : 'OFFLINE', '', sys.db_connected ? 'ok' : 'warn');
+  html += armCard('Event Bus', eventbus.available === false ? 'OFFLINE' : (eventbus.queue_pct || 0) + '% QUEUE', (eventbus.dropped_count || 0) + ' dropped', eventbus.dropped_count ? 'danger' : 'ok');
+  html += armCard('User Stream', ustream.connected ? 'CONNECTED' : 'DISABLED', (ustream.messages_received || 0) + ' messages', ustream.connected ? 'ok' : 'warn');
+  html += '</div>';
+  html += _opsSection('Live Readiness', _opsRows(Object.entries(checks).map(([k,v]) => [k, (v.ok ? 'OK' : 'BLOCKED') + ' - ' + (v.message || v.value || '')])));
+  html += _opsSection('Runtime State', _opsRows([
+    ['FSM', state.current || state.reason || (state.available === false ? 'unavailable' : '-')],
+    ['Uptime', uptime.uptime_seconds !== undefined ? uptime.uptime_seconds + 's' : (sys.uptime_seconds || '-') + 's'],
+    ['Feeds connected', sys.feeds_connected || 0],
+    ['WebSockets active', sys.websockets_active || 0],
+    ['Cache connected', sys.cache_connected || false],
+  ]));
+  html += _opsSection('Data Sources', _opsObjectRows(sources, 20));
+  html += _opsSection('Reconciliation', _opsObjectRows(recon, 20));
+  html += _opsSection('Event Bus', _opsObjectRows(eventbus, 20));
+  $('opsPanel').innerHTML = html;
+}
+async function loadOpsSignals() {
+  const [ml, retrain, recent, weights, slip, quality, regime, session] = await Promise.all([
+    _opsJson('/api/ml/status'), _opsJson('/api/ml/retrain/status'), _opsJson('/api/signals/recent'),
+    _opsJson('/api/signals/weights'), _opsJson('/api/slippage'), _opsJson('/api/quality'),
+    _opsJson('/api/regime'), _opsJson('/api/session'),
+  ]);
+  _opsUpdateCount([ml,retrain,recent,weights,slip,quality,regime,session]);
+  let html = _opsSubtabs();
+  html += '<div class="arms-grid">';
+  html += armCard('ML Model', ml.loaded ? 'LOADED' : 'MISSING', (ml.model_type || '-') + ' / ' + (ml.feature_count || 0) + ' features', ml.loaded ? 'ok' : 'danger');
+  html += armCard('Retrainer', retrain.enabled === false ? 'OFF' : 'ON', (retrain.retrain_count || 0) + ' retrains', retrain.enabled === false ? 'warn' : 'ok');
+  html += armCard('Recent Signals', recent.total_today || 0, recent.win_rate === null ? 'win rate n/a' : recent.win_rate);
+  html += armCard('Quality', (quality.total || 0) + '/100', quality.band || '', (quality.total || 0) >= (quality.threshold || 65) ? 'ok' : 'warn');
+  html += armCard('Slippage', slip.available === false ? 'NO BOOK' : 'READY', slip.reason || slip.symbol || '', slip.available === false ? 'warn' : 'ok');
+  html += armCard('Session', session.active_session ? String(session.active_session.name || '').toUpperCase() : 'NONE', session.in_killzone ? 'killzone' : '');
+  html += '</div>';
+  html += _opsSection('Signal Weights', _opsObjectRows((weights && weights.weights) || {}, 20));
+  html += _opsSection('ML Status', _opsObjectRows(ml, 20));
+  html += _opsSection('Retrainer', _opsObjectRows(retrain, 20));
+  const sigs = recent.signals || [];
+  html += _opsSection('Recent Signals', sigs.length ? _opsRows(sigs.slice(0,20).map(s => [s.symbol || '-', (s.direction || '-') + ' score=' + _opsVal(s.score) + ' conf=' + _opsVal(s.confidence)])) : '<div style="color:var(--text3);font-size:11px">No signals yet</div>');
+  html += _opsSection('Regime Map', _opsObjectRows((regime && regime.regimes) || {}, 20));
+  $('opsPanel').innerHTML = html;
+}
+async function loadOpsRisk() {
+  const [limits, margin, exposure, cb, groups, blackout, twap, iceberg, shadow] = await Promise.all([
+    _opsJson('/api/risk/limits'), _opsJson('/api/risk/margin'), _opsJson('/api/risk/exposure'),
+    _opsJson('/api/risk/circuit-breaker'), _opsJson('/api/risk/arms/group-exposure'), _opsJson('/api/risk/arms/blackout'),
+    _opsJson('/api/orders/twap-status'), _opsJson('/api/orders/iceberg-status'), _opsJson('/api/orders/shadow-sl'),
+  ]);
+  _opsUpdateCount([limits,margin,exposure,cb,groups,blackout,twap,iceberg,shadow]);
+  let html = _opsSubtabs();
+  html += '<div class="arms-grid">';
+  html += armCard('Circuit Breaker', cb.overall_status || 'UNKNOWN', '', cb.overall_status === 'HEALTHY' ? 'ok' : 'danger');
+  html += armCard('Margin Health', _opsVal(margin.health_score), '$' + _opsVal(margin.margin_available) + ' available', (margin.health_score || 0) >= 0.8 ? 'ok' : 'warn');
+  html += armCard('Exposure', '$' + _opsVal(exposure.total_exposure || 0), 'long ' + _opsVal((exposure.by_side || {}).long || 0) + ' / short ' + _opsVal((exposure.by_side || {}).short || 0));
+  html += armCard('Blackout', blackout.blackout_active ? 'ACTIVE' : 'CLEAR', blackout.reason || '', blackout.blackout_active ? 'danger' : 'ok');
+  html += armCard('TWAP', twap.active_count || 0, 'active');
+  html += armCard('Iceberg', iceberg.active_count || 0, iceberg.error || 'active', iceberg.error ? 'warn' : 'ok');
+  html += '</div>';
+  html += _opsSection('Risk Limits', _opsObjectRows(limits, 20));
+  html += _opsSection('Margin', _opsObjectRows(margin, 20));
+  html += _opsSection('Exposure', _opsObjectRows(exposure, 20));
+  html += _opsSection('Circuit Breakers', _opsObjectRows((cb && cb.venues) || cb, 20));
+  html += _opsSection('Correlation Groups', _opsObjectRows((groups && groups.groups) || {}, 20));
+  html += _opsSection('Order Splitting', _opsRows([
+    ['TWAP active', twap.active_count || 0],
+    ['Iceberg active', iceberg.active_count || 0],
+    ['Shadow stops', shadow.total_stops || 0],
+    ['Shadow active', shadow.shadow_active || 0],
+  ]));
+  $('opsPanel').innerHTML = html;
+}
+async function loadOpsConfig() {
+  const [features, perf, summary, history, cfg, clientkey, backtest] = await Promise.all([
+    _opsJson('/features'), _opsJson('/performance'), _opsJson('/config/summary'), _opsJson('/api/config/history'),
+    _opsJson('/api/config'), _opsJson('/api/clientkey'), _opsJson('/api/backtest/summary'),
+  ]);
+  _opsUpdateCount([features,perf,summary,history,cfg,clientkey,backtest]);
+  let html = _opsSubtabs();
+  html += '<div class="arms-grid">';
+  html += armCard('Paper Mode', summary.paper_mode ? 'ON' : 'OFF', '', summary.paper_mode ? 'warn' : 'danger');
+  html += armCard('Enabled CEX', (summary.enabled_exchanges || []).length, (summary.enabled_exchanges || []).join(', ') || '-');
+  html += armCard('DEX', summary.dex_enabled ? 'ON' : 'OFF', '', summary.dex_enabled ? 'ok' : 'warn');
+  html += armCard('Changes', history.total_changes || 0, 'config history');
+  html += armCard('Performance', '$' + _opsVal(perf.pnl_total || 0), (perf.trades_total || 0) + ' trades');
+  html += armCard('API Auth', clientkey.auth_required ? (clientkey.configured ? 'ON' : 'MISSING') : 'OFF', '', clientkey.auth_required && !clientkey.configured ? 'danger' : 'ok');
+  html += '</div>';
+  html += _opsSection('Feature Flags', _opsObjectRows((features && features.enabled) || {}, 30));
+  html += _opsSection('Config Summary', _opsObjectRows(summary, 20));
+  html += _opsSection('Performance', _opsObjectRows(perf, 20));
+  html += _opsSection('Backtest', _opsObjectRows(backtest, 20));
+  const changes = history.recent_changes || [];
+  html += _opsSection('Config History', changes.length ? _opsRows(changes.slice(0,20).map(c => [c.ts || c.timestamp || '-', (c.path || c.key || '-') + ' -> ' + _opsVal(c.value)])) : '<div style="color:var(--text3);font-size:11px">No config changes</div>');
+  html += _opsSection('Masked Runtime Config', _opsObjectRows(cfg, 30));
+  $('opsPanel').innerHTML = html;
 }
 
 /* ── V6 Tab: Killzone + MasterScorer + ML Retrain + Pair Tiers ── */
@@ -3249,7 +3765,13 @@ async function executeTrade(side) {
   // Auto-normalize symbol for futures (also covers DEMO — testnet positions are perpetuals).
   if((isLiveMode || isDemoMode) && sym.includes('/') && !sym.includes(':USDT') && sym.endsWith('USDT')) sym += ':USDT';
   try{
-    const d=await(await fetch('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,side,size,order_type:type,price,stop_loss_pct:sl,take_profit_pct:tp,leverage:lev,venue:'binance'})})).json();
+    let confirmation = '';
+    if(isLiveMode && !isDemoMode){
+      confirmation = 'PLACE ' + side + ' ' + sym;
+      const typed = prompt('LIVE REAL MONEY order. Type exactly: ' + confirmation);
+      if(typed !== confirmation) return toast('error','Live order cancelled: confirmation mismatch');
+    }
+    const d=await(await fetch('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,side,size,order_type:type,price,stop_loss_pct:sl,take_profit_pct:tp,leverage:lev,venue:'binance',confirmation})})).json();
     if(d.success){
       const msg = d.paper ? side+' paper order placed' : side+' '+d.status+' @ $'+(d.price||0).toFixed(2)+' qty='+(d.filled||size);
       toast('success', msg);
@@ -3430,19 +3952,21 @@ async function loadFlowCtx() {
   const sym = (typeof symbol !== 'undefined' && symbol) ? symbol : 'BTC';
   const baseSymForApi = (sym + '/USDT:USDT').replace(/\//g, '%2F').replace(/:/g, '%3A');
   const tfForApi = (typeof tf !== 'undefined' && tf) ? tf : '1m';
-  const [layers, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, levels, patterns] = await Promise.all([
+  const [layers, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, levels, patterns, readiness, ledger] = await Promise.all([
     fetch('/api/layers').then(r=>r.json()).catch(()=>({layers:[]})),
     fetch('/api/quality').then(r=>r.json()).catch(()=>({})),
     fetch('/api/session').then(r=>r.json()).catch(()=>({})),
     fetch('/api/geopolitical').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/status').then(r=>r.json()).catch(()=>({})),
     fetch('/api/reconciliation/status').then(r=>r.json()).catch(()=>({available:false})),
-    fetch('/api/latency/percentiles').then(r=>r.json()).catch(()=>({feed_lag:{},order_latency:{}})),
+    fetch('/api/latency/percentiles').then(r=>r.json()).catch(()=>({feed_lag:{},order_latency:{},decision_latency:{},pipeline_latency:{}})),
     fetch('/api/state').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/uptime').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/eventbus/stats').then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/levels/' + baseSymForApi + '/' + tfForApi).then(r=>r.json()).catch(()=>({available:false})),
     fetch('/api/patterns/' + baseSymForApi + '/' + tfForApi + '?lookback=50').then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/pipeline/readiness').then(r=>r.json()).catch(()=>({available:false})),
+    fetch('/api/recovery/ledger').then(r=>r.json()).catch(()=>({available:false})),
   ]);
   // Synthesize the L10 (Geopolitical) layer entry the same way the Pipeline tab does.
   const list = (layers.layers || []).slice();
@@ -3464,13 +3988,13 @@ async function loadFlowCtx() {
       description:'RSS-driven per-symbol news factor',
       status:st, score: topAbs>=0?topAbs*100:0, threshold:50, detail});
   }
-  window.__flowCtx = {layers:list, quality, session, geo, status, recon, latency, fsm, uptime, ebstats, levels, patterns, raw:layers};
+  window.__flowCtx = {layers:list, preflight:(layers.preflight || _defaultPreflight()), quality, session, geo, status, recon, latency, fsm, uptime, ebstats, levels, patterns, readiness, ledger, raw:layers};
   return window.__flowCtx;
 }
 
 function renderLayerDetail(layer, ctx) {
   if (!layer) return '<div style="color:var(--text3)">Select a layer to inspect.</div>';
-  const idx = layer.layer_index || ('L'+((layer.id||1)-1));
+  const idx = layer.layer_index || ('L'+(layer.id||1));
   const stRaw = String(layer.status||'SKIP').toUpperCase();
   const kind = _ppKind(stRaw);
   const score = (layer.score!==null && layer.score!==undefined) ? Number(layer.score) : null;
@@ -3644,12 +4168,14 @@ function renderLayerDetail(layer, ctx) {
 function renderFlowSummary(ctx) {
   if (!ctx) return '<div class="flow-summary">Loading…</div>';
   const list = ctx.layers || [];
+  const preflight = ctx.preflight || _defaultPreflight();
+  const preflightKind = _ppKind(String(preflight.status||'PENDING').toUpperCase());
   let pass=0, soft=0, fail=0, skip=0;
   list.forEach(l => { const k=_ppKind(String(l.status||'SKIP').toUpperCase()); if(k==='pass')pass++;else if(k==='soft')soft++;else if(k==='fail')fail++;else skip++; });
-  const rejected = list.find(l => _ppKind(String(l.status||'SKIP').toUpperCase()) === 'fail');
+  const rejected = preflightKind === 'fail' ? preflight : list.find(l => _ppKind(String(l.status||'SKIP').toUpperCase()) === 'fail');
   const passGate = !rejected;
   const qTotal = Number((ctx.quality||{}).total || 0);
-  const banner = passGate ? '✓ PIPELINE OK' : '✕ REJECTED at '+(rejected.layer_index || ('L'+((rejected.id||1)-1)));
+  const banner = passGate ? '✓ PIPELINE OK' : '✕ REJECTED at '+(rejected.id === 'preflight' ? 'Preflight' : (rejected.layer_index || ('L'+(rejected.id||1))));
   const col = passGate ? 'var(--green)' : 'var(--red)';
   let h = '<div class="flow-summary">';
   h += '<div class="meta">CURRENT STATE</div>';
@@ -3657,6 +4183,7 @@ function renderFlowSummary(ctx) {
   if (rejected) h += '<div class="desc">Reason: '+esc(rejected.detail || rejected.name)+'</div>';
   h += '<div class="kv">';
   h += '<span class="k">Layers</span><span class="v">'+pass+' pass · '+soft+' soft · '+fail+' fail · '+skip+' skip</span>';
+  h += '<span class="k">Preflight</span><span class="v">'+esc(String(preflight.status||'PENDING').toUpperCase())+'</span>';
   h += '<span class="k">Quality</span><span class="v">'+qTotal+'/100</span>';
   h += '<span class="k">Mode</span><span class="v">'+((ctx.raw||{}).paper_mode===false?'LIVE':'PAPER')+'</span>';
   h += '</div>';
@@ -3704,18 +4231,31 @@ function _flowArrowSvg() {
 function renderFlow() {
   const ctx = window.__flowCtx; if (!ctx) return;
   const list = ctx.layers || [];
-  const rejectIdx = list.findIndex(l => _ppKind(String(l.status||'SKIP').toUpperCase()) === 'fail');
-  const passGate = rejectIdx < 0;
+  const preflight = ctx.preflight || _defaultPreflight();
+  const preflightStatus = String(preflight.status||'PENDING').toUpperCase();
+  const preflightKind = _ppKind(preflightStatus);
+  const preflightFail = preflightKind === 'fail';
+  const rejectIdx = preflightFail ? -1 : list.findIndex(l => _ppKind(String(l.status||'SKIP').toUpperCase()) === 'fail');
+  const passGate = !preflightFail && rejectIdx < 0;
   // Pre-build chain HTML
   let chain = '<div class="flow-chain">';
   // Entry node
   chain += '<div class="flow-node terminal pass" style="cursor:default"><span class="flow-node-id">►</span><span class="flow-node-name">Market Tick</span></div>';
   chain += '<div class="flow-arrow pass">'+_flowArrowSvg()+'</div>';
+  const preflightSel = (window.__flowSelectedId === 'preflight') ? ' selected' : '';
+  const preflightScore = (preflight.score!==null && preflight.score!==undefined) ? Number(preflight.score) : null;
+  chain += '<div class="flow-node '+preflightKind+preflightSel+'" data-layer-id="preflight" onclick="flowSelect(\'preflight\')">';
+  chain += '<span class="flow-node-id">'+esc(preflight.layer_index || 'PRE')+'</span>';
+  chain += '<span class="flow-node-name">'+esc(preflight.name || 'Preflight')+'</span>';
+  chain += '<span class="flow-node-score">'+(preflightScore===null?'—':_ppFmtNum(preflightScore,1))+'</span>';
+  chain += '<span class="flow-node-pill '+preflightKind+'">'+esc(preflightStatus)+'</span>';
+  chain += '</div>';
+  chain += '<div class="flow-arrow '+(preflightFail?'dim':preflightKind)+'">'+_flowArrowSvg()+'</div>';
   list.forEach((l, i) => {
     const stRaw = String(l.status||'SKIP').toUpperCase();
     const kind = _ppKind(stRaw);
-    const idx = l.layer_index || ('L'+((l.id||1)-1));
-    const dim = (rejectIdx >= 0 && i > rejectIdx) ? ' dim' : '';
+    const idx = l.layer_index || ('L'+(l.id||1));
+    const dim = (preflightFail || (rejectIdx >= 0 && i > rejectIdx)) ? ' dim' : '';
     const sel = (window.__flowSelectedId === l.id) ? ' selected' : '';
     const score = (l.score!==null && l.score!==undefined) ? Number(l.score) : null;
     chain += '<div class="flow-node '+kind+dim+sel+'" data-layer-id="'+l.id+'" onclick="flowSelect('+l.id+')">';
@@ -3726,7 +4266,7 @@ function renderFlow() {
     chain += '</div>';
     // Arrow to next node
     if (i < list.length - 1) {
-      const arrowKind = (rejectIdx >= 0 && i >= rejectIdx) ? 'dim' : kind;
+      const arrowKind = (preflightFail || (rejectIdx >= 0 && i >= rejectIdx)) ? 'dim' : kind;
       chain += '<div class="flow-arrow '+arrowKind+'">'+_flowArrowSvg()+'</div>';
     }
   });
@@ -3735,13 +4275,14 @@ function renderFlow() {
   if (passGate) {
     chain += '<div class="flow-node terminal pass" style="cursor:default"><span class="flow-node-id">✓</span><span class="flow-node-name">Signal Emitted</span></div>';
   } else {
-    const rj = list[rejectIdx];
-    chain += '<div class="flow-node terminal fail" style="cursor:default"><span class="flow-node-id">✕</span><span class="flow-node-name">Rejected at '+(rj.layer_index||('L'+((rj.id||1)-1)))+'</span></div>';
+    const rj = preflightFail ? preflight : list[rejectIdx];
+    const rjIdx = rj.id === 'preflight' ? 'Preflight' : (rj.layer_index||('L'+(rj.id||1)));
+    chain += '<div class="flow-node terminal fail" style="cursor:default"><span class="flow-node-id">✕</span><span class="flow-node-name">Rejected at '+rjIdx+'</span></div>';
   }
   chain += '</div>';
 
   // Right pane
-  const sel = list.find(l => l.id === window.__flowSelectedId);
+  const sel = window.__flowSelectedId === 'preflight' ? preflight : list.find(l => l.id === window.__flowSelectedId);
   const pane = sel ? renderLayerDetail(sel, ctx) : renderFlowSummary(ctx);
 
   let html = '<div class="flow-wrap">';
@@ -3770,20 +4311,20 @@ function openLayerDrawer(id) {
   window.__pipelineSelectedId = id;
   const ctx = window.__flowCtx;
   if (!ctx) { loadFlowCtx().then(() => openLayerDrawer(id)); return; }
-  const layer = (ctx.layers||[]).find(l => l.id === id);
+  const layer = (id === 'preflight') ? ctx.preflight : (ctx.layers||[]).find(l => l.id === id);
   $('layerDrawerBody').innerHTML = renderLayerDetail(layer, ctx);
   $('layerDrawer').classList.add('open');
   $('layerDrawerBd').classList.add('open');
   // Highlight selected card
-  document.querySelectorAll('.pp-card.selected').forEach(c => c.classList.remove('selected'));
-  const card = document.querySelector('.pp-card[data-layer-id="'+id+'"]');
+  document.querySelectorAll('.pp-card.selected,.pp-preflight.selected').forEach(c => c.classList.remove('selected'));
+  const card = document.querySelector('[data-layer-id="'+id+'"]');
   if (card) card.classList.add('selected');
 }
 function closeLayerDrawer() {
   if ($('layerDrawer')) $('layerDrawer').classList.remove('open');
   if ($('layerDrawerBd')) $('layerDrawerBd').classList.remove('open');
   window.__pipelineSelectedId = null;
-  document.querySelectorAll('.pp-card.selected').forEach(c => c.classList.remove('selected'));
+  document.querySelectorAll('.pp-card.selected,.pp-preflight.selected').forEach(c => c.classList.remove('selected'));
 }
 </script>
 </body>

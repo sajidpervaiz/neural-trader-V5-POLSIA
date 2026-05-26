@@ -23,6 +23,8 @@ import orjson
 import websockets
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 
@@ -509,7 +511,8 @@ class UserDataStream:
                 except (websockets.ConnectionClosed, ConnectionError, OSError) as exc:
                     logger.warning("User data stream disconnected: {} — retry in {}s", exc, reconnect_delay)
                 except Exception as exc:
-                    logger.exception("User data stream error: {}", exc)
+                    logger.error("User data stream error: {}", sanitize_exception(exc))
+                    logger.opt(exception=True).debug("User data stream stack trace")
 
                 # Mark disconnected
                 self._connected = False

@@ -137,6 +137,8 @@ class DataManager:
             candle = agg.add_tick(tick)
             if candle is not None:
                 candle.timeframe = timeframe  # Normalize "900s" → "15m" etc.
+                candle.receive_time_us = getattr(tick, "receive_time_us", 0)
+                candle.source_tick_timestamp_us = getattr(tick, "timestamp_us", 0)
                 self._store_candle(tick.exchange, tick.symbol, timeframe, candle)
                 await self.event_bus.publish("CANDLE", candle)
 

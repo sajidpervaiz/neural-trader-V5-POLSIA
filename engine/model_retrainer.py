@@ -20,6 +20,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 if TYPE_CHECKING:
     pass
 
@@ -240,7 +242,7 @@ def _retrain_sync(
 
     except Exception as exc:
         logger.error("ModelRetrainer: retrain failed: {}", exc)
-        return RetrainResult(False, reason=str(exc), duration_s=time.time() - t0)
+        return RetrainResult(False, reason=sanitize_exception(exc), duration_s=time.time() - t0)
 
 
 # ── Async service ─────────────────────────────────────────────────────────────
@@ -389,7 +391,7 @@ class ModelRetrainer:
             )
         except Exception as exc:
             logger.error("AdaptiveMLScorer retrain failed: {}", exc)
-            return RetrainResult(False, reason=str(exc), duration_s=_time.time() - t0)
+            return RetrainResult(False, reason=sanitize_exception(exc), duration_s=_time.time() - t0)
 
     def _hot_reload(self) -> None:
         """Hot-reload the scorer without restarting.

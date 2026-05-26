@@ -8,8 +8,11 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 from loguru import logger
-from execution.binance_executor import BinanceExecutor, OrderSide, OrderType
+
+from core.error_handling import sanitize_exception
+from execution.binance_executor import BinanceExecutor
 from execution.bybit_executor import BybitExecutor
+from execution.legacy_cex_common import OrderSide, OrderType
 from execution.okx_executor import OKXExecutor
 
 
@@ -267,7 +270,7 @@ class SmartOrderRouter:
                     "route": route,
                     "result": None,
                     "status": "error",
-                    "error": str(e),
+                    "error": sanitize_exception(e),
                 })
 
         return results

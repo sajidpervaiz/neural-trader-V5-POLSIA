@@ -231,6 +231,58 @@ class SQLiteStore:
             )
             self._conn.commit()
 
+    def archive_paper_open_position(self, pos_id: int, reason: str = "manual_ledger_cleanup") -> dict[str, Any]:
+        """Mark a paper-only open ledger row closed without deleting audit data."""
+        with self._lock:
+            assert self._conn is not None
+            self._conn.row_factory = sqlite3.Row
+            cur = self._conn.execute("SELECT * FROM positions WHERE id=?", (int(pos_id),))
+            row_obj = cur.fetchone()
+            self._conn.row_factory = None
+            if row_obj is None:
+                return {"success": False, "id": int(pos_id), "reason": "position_not_found"}
+
+            row = dict(row_obj)
+            if row.get("close_time_ns") is not None:
+                return {"success": False, "id": int(pos_id), "reason": "position_already_closed"}
+            if int(row.get("is_paper", 0) or 0) != 1:
+                return {"success": False, "id": int(pos_id), "reason": "live_row_refused"}
+
+            now_ns = self._now_ns()
+            exit_price = float(row.get("entry_price", 0.0) or 0.0)
+            self._conn.execute(
+                "UPDATE positions SET exit_price=?, pnl=?, pnl_pct=?, close_time_ns=? "
+                "WHERE id=? AND is_paper=1 AND close_time_ns IS NULL",
+                (exit_price, 0.0, 0.0, now_ns, int(pos_id)),
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO risk_state(key, value, updated_ns) VALUES(?, ?, ?)",
+                (
+                    f"ledger_cleanup:{int(pos_id)}:{now_ns}",
+                    json.dumps({
+                        "action": "archive_paper_open_position",
+                        "reason": reason,
+                        "position_id": int(pos_id),
+                        "exchange": row.get("exchange"),
+                        "symbol": row.get("symbol"),
+                        "direction": row.get("direction"),
+                        "entry_price": exit_price,
+                    }),
+                    now_ns,
+                ),
+            )
+            self._conn.commit()
+            return {
+                "success": True,
+                "id": int(pos_id),
+                "reason": reason,
+                "exchange": row.get("exchange"),
+                "symbol": row.get("symbol"),
+                "direction": row.get("direction"),
+                "exit_price": exit_price,
+                "close_time_ns": now_ns,
+            }
+
     # ── Equity curve ──────────────────────────────────────────────────────
     def record_equity(self, equity: float, drawdown: float = 0.0, daily_pnl: float = 0.0) -> None:
         with self._lock:
@@ -409,3 +461,7 @@ class SQLiteStore:
     @property
     def available(self) -> bool:
         return self._conn is not None
+
+    @property
+    def path(self) -> str:
+        return str(self._path)

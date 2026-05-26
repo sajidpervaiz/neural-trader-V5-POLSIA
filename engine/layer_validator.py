@@ -2,7 +2,7 @@
 7-Layer Signal Confirmation System — V6 Specification §10
 
 Hard Gates (reject immediately on failure):
-  L0 — Sentiment Gate       (news/social)
+  Preflight — Sentiment Gate (news/social)
   L1 — Regime Classification (ADX / ATR / BB-width)
   L2 — Structure Confirmation (BOS/CHoCH + Fib 50-62%)
   L6 — Multi-Timeframe Alignment (weighted score ≥ 6.0/7.0)
@@ -59,9 +59,9 @@ class ValidationResult:
     size_boost: bool = False          # True if total_score ≥ 90
 
 
-# ── Layer 0: Sentiment Gate (Hard Gate) ───────────────────────────────────────
+# ── Preflight: Sentiment Gate (Hard Gate) ─────────────────────────────────────
 
-def layer0_sentiment_gate(
+def preflight_sentiment_gate(
     sentiment_score: float,
     has_high_impact_news: bool = False,
     social_volume_ratio: float = 1.0,
@@ -647,11 +647,11 @@ def validate_signal_7layers(
     """
     results: list[LayerResult] = []
 
-    # ── L0: Sentiment (Hard Gate) ──────────────────────────────────────────
-    l0 = layer0_sentiment_gate(sentiment_score, has_high_impact_news, social_volume_ratio)
-    results.append(l0)
-    if not l0.passed:
-        return ValidationResult(False, 0, l0.reason, layer_results=results)
+    # ── Preflight: Sentiment (Hard Gate) ───────────────────────────────────
+    preflight = preflight_sentiment_gate(sentiment_score, has_high_impact_news, social_volume_ratio)
+    results.append(preflight)
+    if not preflight.passed:
+        return ValidationResult(False, 0, preflight.reason, layer_results=results)
 
     # ── L1: Regime (Hard Gate) ────────────────────────────────────────────
     l1 = layer1_regime_gate(df)

@@ -5,75 +5,22 @@ Imbalance Detection, and Advanced Order Management.
 
 import asyncio
 import time
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
-from enum import Enum
+from typing import Optional
 import ccxt.async_support as ccxt
 from loguru import logger
-from core.circuit_breaker import CircuitBreaker, CircuitState
-from core.idempotency import IdempotencyManager
-from core.retry import RetryPolicy, with_retry
+from execution.legacy_cex_common import (
+    AlgoOrder,
+    ImbalanceSignal,
+    L2DepthLevel,
+    LegacyCEXExecutorBase,
+    OrderSide,
+    OrderType,
+    OrderbookSnapshot,
+    TimeInForce,
+)
 
 
-class OrderSide(Enum):
-    BUY = "buy"
-    SELL = "sell"
-
-
-class OrderType(Enum):
-    MARKET = "market"
-    LIMIT = "limit"
-    STOP = "stop"
-    STOP_LIMIT = "stop_limit"
-
-
-class TimeInForce(Enum):
-    GTC = "GTC"
-    IOC = "IOC"
-    FOK = "FOK"
-
-
-@dataclass
-class L2DepthLevel:
-    price: float
-    quantity: float
-    orders_count: int = 0
-
-
-@dataclass
-class OrderbookSnapshot:
-    symbol: str
-    timestamp_ms: int
-    bids: List[L2DepthLevel]
-    asks: List[L2DepthLevel]
-    sequence: int = 0
-
-
-@dataclass
-class AlgoOrder:
-    order_id: str
-    symbol: str
-    side: OrderSide
-    total_quantity: float
-    filled_quantity: float = 0.0
-    algo_type: str = "TWAP"
-    duration_seconds: int = 60
-    slices: int = 12
-    status: str = "PENDING"
-    child_orders: List[str] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-
-
-@dataclass
-class ImbalanceSignal:
-    bid_volume: float
-    ask_volume: float
-    imbalance_ratio: float
-    direction: str
-    confidence: float
-
-
-class BinanceExecutor:
+class BinanceExecutor(LegacyCEXExecutorBase):
     """
     Production-grade Binance executor with advanced features:
     - L2 orderbook reconstruction
@@ -82,6 +29,8 @@ class BinanceExecutor:
     - Smart order routing
     - Idempotency and circuit breaking
     """
+
+    exchange_label = "Binance"
 
     def __init__(
         self,
@@ -116,166 +65,7 @@ class BinanceExecutor:
                 except Exception:
                     pass
 
-        self.paper_trading = enable_paper_trading
-
-        self.circuit_breaker = CircuitBreaker(
-            failure_threshold=5,
-            recovery_timeout=60,
-            expected_exception=Exception,
-        )
-
-        self.idempotency = IdempotencyManager(ttl=3600)
-
-        self.retry_policy = RetryPolicy(
-            max_attempts=3,
-            base_delay=1.0,
-            max_delay=10.0,
-            exponential_backoff=True,
-        )
-
-        self.orderbook_cache: Dict[str, OrderbookSnapshot] = {}
-        self.algo_orders: Dict[str, AlgoOrder] = {}
-        self.balance_cache: Dict[str, float] = {}
-        self.position_cache: Dict[str, Dict] = {}
-
-        self._running = False
-
-    async def initialize(self) -> None:
-        """Initialize the executor with connectivity checks."""
-        try:
-            await self.exchange.load_markets()
-            logger.info("Binance executor initialized successfully")
-
-            if self.paper_trading:
-                logger.info("Running in PAPER TRADING mode - no real orders will be placed")
-        except Exception as e:
-            logger.error(f"Failed to initialize Binance executor: {e}")
-            raise
-
-    @with_retry()
-    async def place_order(
-        self,
-        symbol: str,
-        side: OrderSide,
-        order_type: OrderType,
-        quantity: float,
-        price: Optional[float] = None,
-        time_in_force: TimeInForce = TimeInForce.GTC,
-        idempotency_key: Optional[str] = None,
-    ) -> Dict:
-        """
-        Place an order with idempotency, circuit breaking, and retry logic.
-
-        Args:
-            symbol: Trading pair symbol (e.g., 'BTC/USDT')
-            side: Order side (buy/sell)
-            order_type: Order type (market/limit/stop)
-            quantity: Order quantity
-            price: Order price (required for limit orders)
-            time_in_force: Time in force (GTC/IOC/FOK)
-            idempotency_key: Unique key for idempotency
-
-        Returns:
-            Order response dictionary
-        """
-        if self.circuit_breaker.state == CircuitState.OPEN:
-            raise Exception("Circuit breaker is open - rejecting order placement")
-
-        if idempotency_key and self.idempotency.check_and_set(idempotency_key):
-            logger.info(f"Duplicate order detected: {idempotency_key}")
-            return {"status": "DUPLICATE", "idempotency_key": idempotency_key}
-
-        if self.paper_trading:
-            logger.info(f"[PAPER] Placing {side.value} {quantity} {symbol} @ {order_type.value}")
-            return {
-                "id": f"paper_{int(time.time() * 1000)}",
-                "symbol": symbol,
-                "side": side.value,
-                "type": order_type.value,
-                "amount": quantity,
-                "price": price,
-                "status": "closed",
-                "filled": quantity,
-                "remaining": 0.0,
-            }
-
-        try:
-            params = {}
-            if time_in_force:
-                params['timeInForce'] = time_in_force.value
-
-            order = await self.exchange.create_order(
-                symbol=symbol,
-                type=order_type.value,
-                side=side.value,
-                amount=quantity,
-                price=price,
-                params=params,
-            )
-
-            self.circuit_breaker.record_success()
-            logger.info(f"Order placed successfully: {order['id']}")
-            return order
-
-        except Exception as e:
-            self.circuit_breaker.record_failure()
-            logger.error(f"Failed to place order: {e}")
-            raise
-
-    async def cancel_order(self, order_id: str, symbol: str) -> bool:
-        """Cancel an existing order."""
-        if self.paper_trading:
-            logger.info(f"[PAPER] Cancelled order {order_id}")
-            return True
-
-        try:
-            await self.exchange.cancel_order(order_id, symbol)
-            logger.info(f"Order cancelled: {order_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
-            return False
-
-    async def get_orderbook_snapshot(
-        self,
-        symbol: str,
-        depth: int = 20,
-    ) -> OrderbookSnapshot:
-        """Fetch and cache L2 orderbook snapshot."""
-        if self.circuit_breaker.state == CircuitState.OPEN:
-            raise Exception("Circuit breaker is open")
-
-        try:
-            orderbook = await self.exchange.fetch_order_book(symbol, limit=depth)
-
-            bids = [
-                L2DepthLevel(price=b[0], quantity=b[1])
-                for b in orderbook['bids'][:depth]
-            ]
-            asks = [
-                L2DepthLevel(price=a[0], quantity=a[1])
-                for a in orderbook['asks'][:depth]
-            ]
-
-            snapshot = OrderbookSnapshot(
-                symbol=symbol,
-                timestamp_ms=int(time.time() * 1000),
-                bids=bids,
-                asks=asks,
-                sequence=orderbook.get('timestamp', 0),
-            )
-
-            self.orderbook_cache[symbol] = snapshot
-            return snapshot
-
-        except Exception as e:
-            self.circuit_breaker.record_failure()
-            logger.error(f"Failed to fetch orderbook for {symbol}: {e}")
-            raise
-
-    async def get_orderbook_from_cache(self, symbol: str) -> Optional[OrderbookSnapshot]:
-        """Get cached orderbook snapshot."""
-        return self.orderbook_cache.get(symbol)
+        self._init_common_state(enable_paper_trading)
 
     def calculate_order_flow_imbalance(
         self,
@@ -502,16 +292,3 @@ class BinanceExecutor:
 
         algo_order.status = "CANCELLED"
         return True
-
-    async def close(self) -> None:
-        """Clean up resources."""
-        self._running = False
-        await self.exchange.close()
-        logger.info("Binance executor closed")
-
-    async def __aenter__(self):
-        await self.initialize()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.close()

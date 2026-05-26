@@ -5,6 +5,8 @@ from typing import Any
 
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 from engine.signal_generator import TradingSignal
@@ -62,12 +64,14 @@ class KrakenExecutor(CEXExecutor):
                 logger.error("Invalid amount calculated for {}", signal.symbol)
                 return None
 
+            submit_started = time.perf_counter()
             order = await self._client.create_market_order(
                 symbol=kraken_symbol,
                 side=side,
                 amount=amount,
                 params={},
             )
+            self._publish_pipeline_latency(signal, "order_submit_ack", time.perf_counter() - submit_started)
 
             fill_price = float(order.get("average", signal.price))
             filled_qty = float(order.get("filled", amount))
@@ -87,13 +91,13 @@ class KrakenExecutor(CEXExecutor):
             )
             # Use reserved position from atomic approval flow when present.
             if reserved_pos is not None:
-                reserved_pos.current_price = fill_price
-                reserved_pos.size = filled_qty
+                self._apply_fill_to_position(reserved_pos, signal, fill_price, filled_qty)
             else:
                 await self.risk_manager.open_position(signal, filled_notional)
 
             # Place protective SL/TP via parent class order placer
-            if self._order_placer and hasattr(signal, "sl") and signal.sl:
+            stop_loss = getattr(signal, "stop_loss", 0.0)
+            if self._order_placer and stop_loss:
                 try:
                     sl_side = "sell" if signal.is_long else "buy"
                     await self._client.create_order(
@@ -101,7 +105,7 @@ class KrakenExecutor(CEXExecutor):
                         type="stop-loss",
                         side=sl_side,
                         amount=filled_qty,
-                        price=signal.sl,
+                        price=stop_loss,
                     )
                 except Exception as sl_exc:
                     logger.warning("Kraken SL placement failed: {}", sl_exc)
@@ -109,5 +113,6 @@ class KrakenExecutor(CEXExecutor):
             await self.event_bus.publish("ORDER_FILLED", result)
             return result
         except Exception as exc:
-            logger.exception("Kraken live order failed: {}", exc)
+            logger.error("Kraken live order failed: {}", sanitize_exception(exc))
+            logger.opt(exception=True).debug("Kraken live order stack trace")
             return None

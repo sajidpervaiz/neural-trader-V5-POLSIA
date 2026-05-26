@@ -26,7 +26,11 @@ class DEXRPCFeed:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
+                timeout=aiohttp.ClientTimeout(total=10),
+                # Avoid aiohttp/aiodns "exception in shielded future" stderr
+                # tracebacks when public DNS is flaky; socket resolver failures
+                # are caught and logged by the feed instead of leaking noise.
+                connector=aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver()),
             )
         return self._session
 
@@ -85,16 +89,23 @@ class DEXRPCFeed:
                 await asyncio.sleep(10)
             return
 
-        logger.info("DEX RPC feed started")
-        interval = 5.0
+        interval = float(dex_cfg.get("poll_interval_seconds", 30.0))
+        max_interval = float(dex_cfg.get("max_backoff_seconds", 300.0))
+        backoff = interval
+        logger.info("DEX RPC feed started (interval={}s, max_backoff={}s)", interval, max_interval)
         while self._running:
             try:
                 ticks = await self._query_uniswap_v3_prices()
+                if ticks:
+                    backoff = interval
+                else:
+                    backoff = min(max_interval, max(interval, backoff * 2))
                 for tick in ticks:
                     await self.event_bus.publish("TICK", tick)
             except Exception as exc:
+                backoff = min(max_interval, max(interval, backoff * 2))
                 logger.warning("DEX RPC feed error: {}", exc)
-            await asyncio.sleep(interval)
+            await asyncio.sleep(backoff)
 
     async def stop(self) -> None:
         self._running = False

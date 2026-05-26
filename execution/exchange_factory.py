@@ -9,7 +9,9 @@ from execution.order_manager import OrderManager
 from execution.cex_executor import CEXExecutor
 from execution.kraken_executor import KrakenExecutor
 from execution.hyperliquid_executor import HyperliquidExecutor
+from execution.executor_contract import TradingExecutorContract
 from execution.risk_manager import RiskManager
+from execution.simulated_exchange import SimulatedExchangeExecutor
 from execution.variational_executor import VariationalExecutor
 
 
@@ -22,13 +24,38 @@ _EXECUTOR_MAP: dict[str, type[CEXExecutor]] = {
 }
 
 
+def _is_paper_mode(config: Config) -> bool:
+    if hasattr(config, "paper_mode"):
+        try:
+            return bool(getattr(config, "paper_mode"))
+        except Exception:
+            pass
+    try:
+        return bool(config.get_value("system", "paper_mode", default=False))
+    except Exception:
+        return False
+
+
+def _simulated_exchange_enabled(config: Config) -> bool:
+    try:
+        exec_cfg = config.get_value("execution", default={}) or {}
+    except Exception:
+        exec_cfg = {}
+    if not isinstance(exec_cfg, dict):
+        return True
+    sim_cfg = exec_cfg.get("simulated_exchange", {}) or {}
+    if not isinstance(sim_cfg, dict):
+        return True
+    return bool(sim_cfg.get("enabled", True))
+
+
 def create_executor(
     exchange_id: str,
     config: Config,
     event_bus: EventBus,
     risk_manager: RiskManager,
     order_manager: OrderManager | None = None,
-) -> CEXExecutor | None:
+) -> TradingExecutorContract | None:
     normalized_exchange = exchange_id.lower()
     cls = _EXECUTOR_MAP.get(normalized_exchange)
     if cls is None:
@@ -43,6 +70,17 @@ def create_executor(
     if not cfg.get("enabled", False):
         logger.debug("Exchange '{}' is disabled — skipping executor creation", exchange_id)
         return None
+
+    if _is_paper_mode(config) and _simulated_exchange_enabled(config):
+        executor = SimulatedExchangeExecutor(
+            config,
+            event_bus,
+            risk_manager,
+            exchange_id=normalized_exchange,
+            order_manager=order_manager,
+        )
+        logger.info("Created simulated paper executor for '{}'", exchange_id)
+        return executor
 
     if normalized_exchange in {"binance", "bybit", "okx"}:
         executor = CEXExecutor(
@@ -68,7 +106,7 @@ def create_all_executors(
     event_bus: EventBus,
     risk_manager: RiskManager,
     order_manager: OrderManager | None = None,
-) -> list[CEXExecutor]:
+) -> list[TradingExecutorContract]:
     exchanges_cfg = config.get_value("exchanges") or {}
     executors = []
     for exchange_id in exchanges_cfg:
@@ -81,7 +119,7 @@ def create_all_executors(
         )
         if executor is not None:
             executors.append(executor)
-    logger.info("Created {} CEX executor(s)", len(executors))
+    logger.info("Created {} exchange executor(s)", len(executors))
     return executors
 
 

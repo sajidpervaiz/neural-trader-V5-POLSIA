@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import httpx
@@ -48,6 +49,7 @@ class PaperFeed:
         timeframes: list[str] | None = None,
         poll_interval: float = 30.0,
         data_manager: Any = None,
+        market_data_integrity: Any = None,
         use_websocket: bool = True,
     ) -> None:
         self.event_bus = event_bus
@@ -55,6 +57,7 @@ class PaperFeed:
         self.timeframes = timeframes or ["1m", "15m", "1h", "4h"]
         self.poll_interval = poll_interval
         self._data_manager = data_manager
+        self._market_data_integrity = market_data_integrity
         self._use_websocket = use_websocket and _WS_AVAILABLE
         self._running = False
         self._seeding_complete = False
@@ -99,7 +102,12 @@ class PaperFeed:
 
         candles = []
         internal_sym = self._internal_symbol(self._binance_symbol(symbol))
+        receive_time_us = time.time_ns() // 1000
+        now_ms = int(time.time() * 1000)
         for k in data:
+            close_time_ms = int(k[6]) if len(k) > 6 else int(k[0])
+            if close_time_ms > now_ms:
+                continue
             candles.append(Candle(
                 exchange="binance",
                 symbol=internal_sym,
@@ -111,6 +119,8 @@ class PaperFeed:
                 close=float(k[4]),
                 volume=float(k[5]),
                 num_trades=int(k[8]) if len(k) > 8 else 0,
+                receive_time_us=receive_time_us,
+                source_tick_timestamp_us=close_time_ms * 1000,
             ))
         return candles
 
@@ -132,6 +142,19 @@ class PaperFeed:
                     self._last_candle_time[key] = candles[-1].timestamp
         return emitted
 
+    async def _poll_loop(self) -> None:
+        """REST watchdog used both as fallback and WebSocket gap filler."""
+        while self._running:
+            await asyncio.sleep(self.poll_interval)
+            try:
+                count = await self._poll_once()
+                if count > 0:
+                    logger.debug("PaperFeed: emitted {} new REST candle(s)", count)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("PaperFeed REST watchdog error: {}", exc)
+
     async def seed_history(self) -> None:
         """Seed DataManager with historical candles on startup.
         
@@ -148,6 +171,11 @@ class PaperFeed:
                     # Direct inject — bypasses EventBus queue, skip indicator compute per-candle
                     for c in candles:
                         self._data_manager._store_candle(c.exchange, c.symbol, c.timeframe, c, compute=False)
+                        if (
+                            self._market_data_integrity is not None
+                            and hasattr(self._market_data_integrity, "observe_candle")
+                        ):
+                            self._market_data_integrity.observe_candle(c)
                         total += 1
                 else:
                     for c in candles:
@@ -192,6 +220,7 @@ class PaperFeed:
         # Map binance interval back to internal timeframe
         binance_tf = kline.get("i", "")
         tf = next((k for k, v in TF_MAP.items() if v[0] == binance_tf), binance_tf)
+        receive_time_us = time.time_ns() // 1000
         return Candle(
             exchange="binance",
             symbol=self._internal_symbol(binance_sym),
@@ -203,6 +232,8 @@ class PaperFeed:
             close=float(kline.get("c", 0)),
             volume=float(kline.get("v", 0)),
             num_trades=int(kline.get("n", 0)),
+            receive_time_us=receive_time_us,
+            source_tick_timestamp_us=int(kline.get("T", kline.get("t", 0)) or 0) * 1000,
         )
 
     async def _ws_loop(self) -> None:
@@ -250,15 +281,12 @@ class PaperFeed:
             if self._use_websocket:
                 logger.info("PaperFeed started — WebSocket streaming for {} symbols × {} timeframes",
                             len(self.symbols), len(self.timeframes))
-                await self._ws_loop()
+                logger.info("PaperFeed REST watchdog active every {}s", self.poll_interval)
+                await asyncio.gather(self._ws_loop(), self._poll_loop())
             else:
                 logger.info("PaperFeed started — REST polling every {}s for {}",
                             self.poll_interval, self.symbols)
-                while self._running:
-                    await asyncio.sleep(self.poll_interval)
-                    count = await self._poll_once()
-                    if count > 0:
-                        logger.debug("PaperFeed: emitted {} new candles", count)
+                await self._poll_loop()
         except asyncio.CancelledError:
             pass
         finally:

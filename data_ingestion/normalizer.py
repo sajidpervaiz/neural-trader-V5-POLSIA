@@ -16,6 +16,8 @@ class Tick:
     side: str = ""
     trade_id: str = ""
     receive_time_us: int = 0
+    sequence: int = 0
+    sequence_gap: int = 0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Tick":
@@ -38,6 +40,9 @@ class Tick:
             "volume": self.volume,
             "side": self.side,
             "trade_id": self.trade_id,
+            "receive_time_us": self.receive_time_us,
+            "sequence": self.sequence,
+            "sequence_gap": self.sequence_gap,
         }
 
 
@@ -53,6 +58,8 @@ class Candle:
     close: float
     volume: float
     num_trades: int = 0
+    receive_time_us: int = 0
+    source_tick_timestamp_us: int = 0
 
 
 @dataclass

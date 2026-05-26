@@ -5,6 +5,8 @@ from typing import Any
 
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 
@@ -109,7 +111,7 @@ class Dispatcher:
                         try:
                             self.event_bus.publish_nowait("COMPONENT_ERROR", {
                                 "component": task.get_name(),
-                                "error": repr(exc)[:500],
+                                "error": sanitize_exception(exc),
                                 "error_type": type(exc).__name__,
                             })
                         except Exception:

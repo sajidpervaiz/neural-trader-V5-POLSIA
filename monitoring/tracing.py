@@ -13,9 +13,11 @@ from opentelemetry.instrumentation.redis import RedisInstrumentor
 from contextvars import ContextVar
 from typing import Optional, Dict
 import inspect
-import uuid
+import secrets
 import time
 from loguru import logger
+
+from core.error_handling import sanitize_exception
 
 # Context for correlation ID
 correlation_id_context: ContextVar[Optional[str]] = ContextVar('correlation_id', default=None)
@@ -25,7 +27,7 @@ def get_correlation_id() -> str:
     """Get or generate correlation ID for the current request."""
     cid = correlation_id_context.get()
     if not cid:
-        cid = str(uuid.uuid4())
+        cid = secrets.token_hex(16)
         correlation_id_context.set(cid)
     return cid
 
@@ -172,7 +174,7 @@ class DistributedTracer:
                         span.set_status(
                             trace.Status(
                                 code=trace.StatusCode.ERROR,
-                                description=str(e)
+                                description=sanitize_exception(e)
                             )
                         )
                         span.record_exception(e)
@@ -210,7 +212,7 @@ class DistributedTracer:
                         span.set_status(
                             trace.Status(
                                 code=trace.StatusCode.ERROR,
-                                description=str(e)
+                                description=sanitize_exception(e)
                             )
                         )
                         span.record_exception(e)

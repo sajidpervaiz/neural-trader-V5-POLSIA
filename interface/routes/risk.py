@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 from enum import Enum
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from engine.signal_generator import TradingSignal
 from execution.risk_manager import RiskManager
 
@@ -61,6 +63,33 @@ def _require_risk_manager() -> RiskManager:
     return _RISK_MANAGER
 
 
+@router.get("/trading-state")
+async def get_trading_state():
+    """Return the effective trading state gate."""
+    try:
+        manager = _require_risk_manager()
+        return manager.get_trading_state()
+    except Exception as e:
+        logger.error(f"Error fetching trading state: {e}")
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
+
+
+@router.post("/trading-state")
+async def set_trading_state(payload: dict = Body(...)):
+    """Set ACTIVE, REDUCING, or HALTED for operator-controlled risk gating."""
+    try:
+        manager = _require_risk_manager()
+        state = str(payload.get("state", "") or "")
+        reason = str(payload.get("reason", "operator_request") or "operator_request")
+        operator = str(payload.get("operator", "dashboard") or "dashboard")
+        return manager.set_trading_state(state, reason=reason, operator=operator)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=sanitize_exception(e))
+    except Exception as e:
+        logger.error(f"Error setting trading state: {e}")
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
+
+
 @router.get("/limits", response_model=RiskLimits)
 async def get_risk_limits():
     """Get current risk limits."""
@@ -79,7 +108,7 @@ async def get_risk_limits():
 
     except Exception as e:
         logger.error(f"Error fetching risk limits: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/limits", response_model=dict)
@@ -102,7 +131,7 @@ async def set_risk_limits(
 
     except Exception as e:
         logger.error(f"Error setting risk limits: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/margin", response_model=MarginInfo)
@@ -129,7 +158,7 @@ async def get_margin_info(
 
     except Exception as e:
         logger.error(f"Error fetching margin info: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/check", response_model=RiskCheck)
@@ -186,7 +215,7 @@ async def check_risk(
 
     except Exception as e:
         logger.error(f"Error checking risk: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/exposure")
@@ -216,7 +245,7 @@ async def get_exposure_breakdown(
 
     except Exception as e:
         logger.error(f"Error fetching exposure breakdown: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/circuit-breaker")
@@ -240,7 +269,7 @@ async def get_circuit_breaker_status():
 
     except Exception as e:
         logger.error(f"Error fetching circuit breaker status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/circuit-breaker/reset")
@@ -256,7 +285,7 @@ async def reset_circuit_breaker(venue: str = Query(...)):
 
     except Exception as e:
         logger.error(f"Error resetting circuit breaker: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/stress-test")
@@ -286,7 +315,7 @@ async def run_stress_test(
 
     except Exception as e:
         logger.error(f"Error running stress test: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -350,7 +379,7 @@ async def arms_snapshot():
 
     except Exception as e:
         logger.error(f"ARMS snapshot error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/arms/tier-risk")
@@ -363,7 +392,7 @@ async def get_tier_risk():
             "default_risk_per_trade": float(getattr(manager, "_risk_per_trade", 0.01)),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/arms/group-exposure")
@@ -386,7 +415,7 @@ async def get_group_exposure():
             }
         return {"groups": groups}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/arms/blackout")
@@ -402,7 +431,7 @@ async def get_blackout_status():
             "upcoming_events": events,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/arms/dynamic-leverage")
@@ -421,7 +450,7 @@ async def get_dynamic_leverage(
             "max_leverage": float(getattr(manager, "_leverage", 1.0)),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/arms/margin-modes")
@@ -437,7 +466,7 @@ async def get_margin_modes():
             }
         return {"positions": modes}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/arms/liq-check")
@@ -448,7 +477,7 @@ async def trigger_liq_check():
         actions = manager.run_periodic_liq_check()
         return {"actions": actions, "checked_positions": len(manager.positions)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/arms/funding-recheck")
@@ -459,4 +488,4 @@ async def trigger_funding_recheck():
         actions = manager.check_funding_existing_positions()
         return {"actions": actions, "checked_positions": len(manager.positions)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))

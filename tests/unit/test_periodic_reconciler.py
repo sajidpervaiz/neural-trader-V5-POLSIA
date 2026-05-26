@@ -41,6 +41,17 @@ async def test_no_mismatch_when_internal_matches_exchange() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exchange_symbol_matches_internal_exchange_prefixed_symbol() -> None:
+    rm = _make_risk_manager({"binance:BTC/USDT:USDT": 0.5})
+    client = _make_async_client([{"symbol": "BTC/USDT:USDT", "contracts": 0.5}])
+    pr = PeriodicReconciler(Config(), rm, client, interval_seconds=60.0)
+    result = await pr._check_once()
+    assert result["mismatches"] == []
+    assert result["safe_mode_triggered"] is False
+    assert not rm.safe_mode.is_active
+
+
+@pytest.mark.asyncio
 async def test_quantity_mismatch_trips_safe_mode() -> None:
     rm = _make_risk_manager({"BTC/USDT:USDT": 0.5})
     client = _make_async_client([{"symbol": "BTC/USDT:USDT", "contracts": 0.7}])

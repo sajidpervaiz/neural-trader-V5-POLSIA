@@ -162,7 +162,14 @@ class TestConfigRuntimePersistence:
             "testnet": True,
         })
 
+        monkeypatch.setenv("BINANCE_API_KEY", "demo-key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "demo-secret")
+
         cfg.persist_runtime_overrides()
+
+        raw_override = override_path.read_text()
+        assert "demo-key" not in raw_override
+        assert "demo-secret" not in raw_override
 
         reloaded = Config(path=cfg_path)
         assert reloaded.paper_mode is False

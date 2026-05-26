@@ -1321,6 +1321,31 @@ class TestLiveModeGate:
         import os
         assert os.getenv("LIVE_TRADING_CONFIRMED", "").lower() != "true"
 
+    def test_live_mode_aborts_when_postgres_audit_db_unavailable(self):
+        """Live mode must fail closed when PostgreSQL audit persistence is unavailable."""
+        from main import _enforce_live_audit_db_available
+
+        config = MagicMock(spec=Config)
+        config.paper_mode = False
+        db = MagicMock()
+        db.available = False
+
+        with pytest.raises(SystemExit) as exc:
+            _enforce_live_audit_db_available(config, db)
+
+        assert exc.value.code == 1
+
+    def test_paper_mode_can_continue_without_postgres_audit_db(self):
+        """Paper mode may continue with DB offline because no real-money orders can be placed."""
+        from main import _enforce_live_audit_db_available
+
+        config = MagicMock(spec=Config)
+        config.paper_mode = True
+        db = MagicMock()
+        db.available = False
+
+        _enforce_live_audit_db_available(config, db)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Module imports sanity check
@@ -1362,6 +1387,27 @@ class TestModuleImports:
 
 class TestDeepAuditFixes:
     """Tests for bugs found during line-by-line audit."""
+
+    def test_db_handler_uses_configured_password_in_real_dsn(self):
+        """DBHandler must only mask passwords in logs, never in the actual asyncpg DSN."""
+        from storage.db_handler import DBHandler
+
+        config = MagicMock(spec=Config)
+        config.get_value.return_value = {
+            "host": "db.local",
+            "port": 5433,
+            "database": "nt",
+            "user": "operator",
+            "password": "real-secret-password",
+            "pool_size": 3,
+            "timescaledb": False,
+        }
+
+        db = DBHandler(config)
+
+        assert "real-secret-password" in db._dsn
+        assert "***" not in db._dsn
+        assert db._redacted_dsn == "postgresql://operator:***@db.local:5433/nt"
 
     @pytest.mark.asyncio
     async def test_db_connect_guard_prevents_double_pool(self):
@@ -1563,3 +1609,85 @@ class TestDeepAuditFixes:
         await executor._handle_user_order_update(payload)
         # If it tried to process, it would hit close_position or other logic
         # No assertion needed beyond no exception — the filter check is in place
+
+
+@pytest.mark.asyncio
+async def test_live_execute_keeps_reservation_when_unfilled_order_cancel_fails():
+    from execution.cex_executor import CEXExecutor
+    from engine.signal_generator import TradingSignal
+
+    config = Config(config_path=CONFIG_PATH)
+    config.paper_mode = False
+    event_bus = EventBus()
+    risk_mgr = MagicMock()
+    risk_mgr._circuit_breaker.trip = MagicMock()
+    executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="binance")
+    executor._rate_limiter.acquire = AsyncMock()
+    executor._client = AsyncMock()
+    executor._client.create_limit_order = AsyncMock(return_value={"id": "entry-uncertain", "status": "open", "filled": 0, "price": 50000.0})
+    executor._client.cancel_order = AsyncMock(side_effect=RuntimeError("cancel timeout"))
+    executor._wait_for_fill = AsyncMock(return_value={"id": "entry-uncertain", "status": "open", "filled": 0, "price": 50000.0})
+    captured: list[dict] = []
+
+    async def capture(payload):
+        captured.append(payload)
+
+    event_bus.subscribe("ALERT_CRITICAL", capture)
+    signal = TradingSignal(
+        exchange="binance", symbol="BTC/USDT:USDT", direction="long",
+        score=0.85, technical_score=0.8, ml_score=0.7, sentiment_score=0.6,
+        macro_score=0.5, news_score=0.5, orderbook_score=0.5,
+        regime="trending", regime_confidence=0.8,
+        price=50000.0, stop_loss=49000.0, take_profit=52000.0,
+        atr=500.0, timestamp=int(time.time()),
+    )
+
+    result = await executor._live_execute(signal, 500.0, reserved_pos=object())
+    await _drain_event_bus(event_bus)
+
+    assert result is not None
+    assert result.status == "open"
+    risk_mgr._circuit_breaker.trip.assert_called_once()
+    assert any(evt.get("type") == "untracked_open_order_cancel_failed" for evt in captured)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_fill_does_not_market_fallback_after_uncertain_cancel():
+    from execution.cex_executor import CEXExecutor
+    from execution.risk_manager import RiskManager
+    from engine.signal_generator import TradingSignal
+
+    config = Config(config_path=CONFIG_PATH)
+    config.paper_mode = False
+    event_bus = EventBus()
+    risk_mgr = RiskManager(config, event_bus)
+    executor = CEXExecutor(config, event_bus, risk_mgr, exchange_id="binance")
+    executor._rate_limiter.acquire = AsyncMock()
+    executor._fill_market_on_timeout = True
+    executor._client = AsyncMock()
+    executor._client.fetch_order = AsyncMock(return_value={"id": "limit-1", "status": "open", "filled": 0, "price": 50000.0})
+    executor._client.cancel_order = AsyncMock(side_effect=RuntimeError("cancel timeout"))
+    executor._client.create_market_order = AsyncMock(return_value={"id": "market-dup", "status": "closed", "filled": 0.01, "average": 50000.0})
+    captured: list[dict] = []
+
+    async def capture(payload):
+        captured.append(payload)
+
+    event_bus.subscribe("ALERT_CRITICAL", capture)
+    signal = TradingSignal(
+        exchange="binance", symbol="BTC/USDT:USDT", direction="long",
+        score=0.85, technical_score=0.8, ml_score=0.7, sentiment_score=0.6,
+        macro_score=0.5, news_score=0.5, orderbook_score=0.5,
+        regime="trending", regime_confidence=0.8,
+        price=50000.0, stop_loss=49000.0, take_profit=52000.0,
+        atr=500.0, timestamp=int(time.time()),
+    )
+
+    result = await executor._wait_for_fill(signal, {"id": "limit-1", "status": "open", "filled": 0, "price": 50000.0}, 0.01, max_retries=0, wait_sec=0)
+    await _drain_event_bus(event_bus)
+
+    assert result["id"] == "limit-1"
+    executor._client.create_market_order.assert_not_called()
+    assert risk_mgr._circuit_breaker._tripped is True
+    assert "cancel_uncertain" in risk_mgr._circuit_breaker._trip_reason
+    assert any(evt.get("type") == "entry_cancel_uncertain_no_market_fallback" for evt in captured)

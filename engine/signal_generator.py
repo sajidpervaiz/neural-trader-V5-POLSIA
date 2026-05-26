@@ -13,13 +13,17 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from core.config import Config
 from core.event_bus import EventBus
 from analysis.data_manager import DataManager
 from analysis.regime import MarketRegime, RegimeState
 from analysis.smart_money import SmartMoneyAnalyzer, SMCState
 from analysis.volume_profile import VolumeProfileAnalyzer, VolumeFlowState
-from engine.ai_agent import TradingAIAgent
+from engine.ai_agent import AgentDecision, TradingAIAgent
+from engine.decision_provider import AIAgentDecisionProvider, TradingDecisionProvider
+from engine.entry_eligibility import EntryEligibilityGate, TradeDecisionReceipt
 from engine.model_trainer import ModelTrainer
 from engine.strategy_modules import StrategySelector, StrategySignal
 
@@ -811,9 +815,14 @@ class SignalGenerator:
         self._min_orderbook_depth_usd = float(
             risk_cfg.get("min_orderbook_depth_usd", risk_cfg.get("min_liquidity_usd", 0.0)) or 0.0
         )
+        self._market_data_integrity: Any = None
 
         # ── Pipeline status tracking for dashboard API ────────────────────
         self._last_layer_status: dict[str, str] = {
+            "market_data_integrity": "PENDING",
+            "market_data_integrity_detail": "waiting for first market-data heartbeat",
+            "preflight": "PENDING",
+            "preflight_detail": "waiting for first evaluation",
             "session_filter": "PENDING",
             "session_filter_detail": "waiting for first evaluation",
             "htf_trend": "PENDING",
@@ -842,6 +851,8 @@ class SignalGenerator:
                 "sentiment_alignment": 0, "onchain_health": 0,
             },
         }
+        self._entry_gate = EntryEligibilityGate()
+        self._last_entry_receipt: dict[str, Any] = {}
         self._ml_training_summary: dict[str, Any] = {
             "trained": bool(self._ml_scorer._model_loaded),
             "model_path": self._ml_model_path,
@@ -854,7 +865,7 @@ class SignalGenerator:
         ai_cfg = config.get_value("ai_agent") or {}
         self._ai_agent = TradingAIAgent(
             enabled=bool(ai_cfg.get("enabled", True)),
-            mode=str(ai_cfg.get("mode", "full")),
+            mode=str(ai_cfg.get("mode", "advisory")),
             min_confidence=float(ai_cfg.get("min_confidence", 0.55)),
             min_quality_score=int(ai_cfg.get("min_quality_score", self._get_quality_threshold())),
             min_risk_reward=float(ai_cfg.get("min_risk_reward", 1.0)),
@@ -864,27 +875,42 @@ class SignalGenerator:
             timeout_seconds=float(ai_cfg.get("timeout_seconds", 8.0)),
             remote_weight=float(ai_cfg.get("remote_weight", 0.35)),
         )
+        self._decision_provider: TradingDecisionProvider | None = AIAgentDecisionProvider(self._ai_agent)
+        self._decision_latency_samples: deque[dict[str, Any]] = deque(maxlen=500)
+        self._last_decision_latency: dict[str, Any] = {
+            "provider": "ai_agent",
+            "action": "pending",
+            "approved": True,
+            "last_ms": 0.0,
+            "p50_ms": 0.0,
+            "p95_ms": 0.0,
+            "p99_ms": 0.0,
+            "max_ms": 0.0,
+            "count": 0,
+        }
 
     # ── Advanced helpers ──────────────────────────────────────────────────
 
     def _update_layer_status(self, **kwargs: int | str) -> None:
         """Update pipeline layer status dict for dashboard display.
 
-        Maps pipeline layer scores (l0-l7) to dashboard layer names.
-        Spec: L1=Session, L2=HTF Trend, L3=Technical, L4=SMC, L5=Volume, L6=Regime, L7=ML, L8=Quality, L9=Risk
-        Dashboard: 1=Session, 2=HTF Trend, 3=Technical, 4=SMC, 5=Volume, 6=Regime, 7=ML, 8=Quality, 9=Risk
+        Maps preflight and pipeline layer scores to dashboard layer names.
+        Spec: Preflight + L1=Session, L2=HTF Trend, L3=Technical, L4=SMC,
+        L5=Volume, L6=Regime, L7=ML, L8=Quality, L9=Risk.
         """
-        # Pipeline layer → dashboard key mapping (spec-compliant numbering)
+        # Pipeline layer to dashboard key mapping (spec-compliant numbering).
         mapping = {
-            "l0": "session_filter",       # L1 Session → Dashboard "Session Filter"
-            "l1": "htf_trend",            # L2 HTF Trend → Dashboard "HTF Trend"
-            "l2": "technical_confluence", # L3 Technical → Dashboard "Technical Confluence"
-            "l3": "smart_money_concepts", # L4 SMC → Dashboard "Smart Money Concepts"
-            "l4": "volume_flow",          # L5 Volume → Dashboard "Volume Flow"
-            "l5": "regime_detection",     # L6 Regime → Dashboard "Regime Detection"
-            "l6": "ml_ensemble",          # L7 ML → Dashboard "ML Ensemble"
-            "l7": "signal_quality",       # L8 Quality → Dashboard "Signal Quality"
-            "risk_gate": "risk_gate",     # L9 Risk gate → Dashboard "Risk Gate"
+            "l0": "market_data_integrity",
+            "preflight": "preflight",
+            "l1": "session_filter",
+            "l2": "htf_trend",
+            "l3": "technical_confluence",
+            "l4": "smart_money_concepts",
+            "l5": "volume_flow",
+            "l6": "regime_detection",
+            "l7": "ml_ensemble",
+            "l8": "signal_quality",
+            "risk_gate": "risk_gate",
         }
         for key, dashboard_name in mapping.items():
             if key in kwargs:
@@ -899,6 +925,48 @@ class SignalGenerator:
                 else:
                     self._last_layer_status[dashboard_name] = str(val)
                 self._last_layer_status[f"{dashboard_name}_detail"] = f"score={val}"
+
+    def set_market_data_integrity(self, monitor: Any) -> None:
+        """Wire the L0 market-data integrity monitor into signal gating."""
+        self._market_data_integrity = monitor
+        logger.debug("SignalGenerator: market-data integrity monitor wired")
+
+    def get_l0_status(self) -> dict[str, Any]:
+        monitor = self._market_data_integrity
+        if monitor is not None and hasattr(monitor, "snapshot"):
+            try:
+                return monitor.snapshot()
+            except Exception as exc:
+                return {"enabled": False, "status": "ERROR", "reason": sanitize_exception(exc)}
+        return {
+            "enabled": False,
+            "status": "UNAVAILABLE",
+            "reason": "market_data_integrity_monitor_not_wired",
+            "feeds": [],
+        }
+
+    def _check_l0_market_data(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        receive_time_us: int = 0,
+        source_tick_timestamp_us: int = 0,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        monitor = self._market_data_integrity
+        if monitor is None or not hasattr(monitor, "check_signal_allowed"):
+            if receive_time_us > 0:
+                age_s = max(0.0, time.time() - (receive_time_us / 1_000_000.0))
+                return True, f"fresh_event_no_monitor age={age_s:.3f}s", {}
+            return True, "market_data_integrity_monitor_not_wired", {}
+        return monitor.check_signal_allowed(
+            exchange,
+            symbol,
+            timeframe=timeframe,
+            receive_time_us=receive_time_us,
+            source_tick_timestamp_us=source_tick_timestamp_us,
+        )
 
     def _is_paper_mode(self) -> bool:
         """Return whether the current runtime is in paper/demo mode."""
@@ -963,6 +1031,188 @@ class SignalGenerator:
         """Return the minimum SMC confluence for the active mode."""
         return 10 if self._is_paper_mode() else 20
 
+    def _entry_thresholds(self) -> dict[str, Any]:
+        """Return active entry thresholds used by the signal gate and dashboard."""
+        return {
+            "quality": self._get_quality_threshold(),
+            "technical": self._get_technical_threshold(),
+            "volume": self._get_volume_threshold(),
+            "smc": self._get_smc_threshold(),
+            "master_score_bands": self._master_score_bands(),
+        }
+
+    def _risk_snapshot_for_entry(self) -> dict[str, Any]:
+        rm = getattr(self, "_risk_manager", None)
+        if rm is None:
+            return {}
+        try:
+            snap: dict[str, Any] = {}
+            if hasattr(rm, "get_risk_snapshot"):
+                raw = rm.get_risk_snapshot()
+                if isinstance(raw, dict):
+                    snap = dict(raw)
+            safe_mode = getattr(rm, "safe_mode", None)
+            circuit = getattr(rm, "_circuit_breaker", None)
+            snap.setdefault("available", True)
+            snap.setdefault("kill_switch_active", bool(getattr(rm, "kill_switch_active", False) or getattr(rm, "_killed", False)))
+            snap.setdefault("safe_mode_active", bool(getattr(safe_mode, "is_active", False)) if safe_mode is not None else False)
+            snap.setdefault("circuit_breaker_tripped", bool(getattr(circuit, "tripped", False)) if circuit is not None else False)
+            snap.setdefault("trading_state", str(snap.get("trading_state", "ACTIVE") or "ACTIVE"))
+            snap.setdefault("can_open_new_positions", bool(snap.get("can_open_new_positions", True)))
+            return snap
+        except Exception as exc:
+            return {
+                "available": False,
+                "trading_state": "ERROR",
+                "can_open_new_positions": False,
+                "error": sanitize_exception(exc),
+            }
+
+    def _entry_ai_payload(self, ai_decision: AgentDecision | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if ai_decision is not None:
+            payload = ai_decision.to_dict()
+            payload["approved"] = bool(ai_decision.approved)
+        else:
+            provider = getattr(self, "_decision_provider", None)
+            if provider is not None and hasattr(provider, "get_status"):
+                try:
+                    payload = dict(provider.get_status())
+                except Exception as exc:
+                    payload = {"available": False, "error": sanitize_exception(exc)}
+        requested_mode = str(payload.get("requested_mode", payload.get("mode", getattr(self._ai_agent, "mode", "advisory"))) or "advisory")
+        payload["requested_mode"] = requested_mode
+        payload["effective_mode"] = "direct" if self._ai_direct_allowed(requested_mode) else "advisory"
+        payload["direct_mode_allowed"] = bool(self._ai_direct_allowed(requested_mode))
+        payload["direct_mode_reason"] = self._ai_direct_reason(requested_mode)
+        return payload
+
+    @staticmethod
+    def _entry_status_from_score(score: Any, threshold: float, *, weak_floor: float = 40.0) -> str:
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            return "PENDING"
+        if value >= float(threshold):
+            return "PASS"
+        if value >= float(weak_floor):
+            return "WEAK"
+        return "FAIL"
+
+    def _entry_layers_from_preview(self, preview: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Build entry-layer statuses from the same preview snapshot used by /api/layers."""
+        layers = dict(self._last_layer_status)
+        preview = preview or {}
+        components = dict(preview.get("components", {}) or {})
+
+        l0 = self.get_l0_status()
+        l0_status = str(l0.get("status", "UNKNOWN") or "UNKNOWN").upper()
+        l0_ok = bool(l0.get("healthy", False)) or l0_status in {"OK", "READY", "HEALTHY", "PASS"}
+        layers["market_data_integrity"] = "PASS" if l0_ok else ("FAIL" if l0_status in {"FAIL", "ERROR", "BLOCKED"} else "PENDING")
+        layers["market_data_integrity_detail"] = str(l0.get("reason") or f"status={l0_status}")
+
+        for pre_layer in ("preflight", "session_filter"):
+            current = str(layers.get(pre_layer, "PENDING") or "PENDING").upper()
+            if current not in {"FAIL", "BLOCK", "BLOCKED", "ERROR"}:
+                layers[pre_layer] = "PASS"
+                layers[f"{pre_layer}_detail"] = "preview runtime guard passed"
+
+        layers["htf_trend"] = self._entry_status_from_score(components.get("htf_trend"), 50)
+        layers["htf_trend_detail"] = f"preview_score={components.get('htf_trend', 0)}"
+        layers["technical_confluence"] = self._entry_status_from_score(
+            components.get("technical_confluence"),
+            self._get_technical_threshold(),
+        )
+        layers["technical_confluence_detail"] = f"preview_score={components.get('technical_confluence', 0)}"
+        layers["smart_money_concepts"] = self._entry_status_from_score(
+            components.get("smc_confluence"),
+            self._get_smc_threshold(),
+        )
+        layers["smart_money_concepts_detail"] = f"preview_score={components.get('smc_confluence', 0)}"
+        layers["volume_flow"] = self._entry_status_from_score(
+            components.get("volume_flow"),
+            self._get_volume_threshold(),
+        )
+        layers["volume_flow_detail"] = f"preview_score={components.get('volume_flow', 0)}"
+        layers["regime_detection"] = self._entry_status_from_score(components.get("regime"), 1)
+        layers["regime_detection_detail"] = f"preview_score={components.get('regime', 0)}"
+        layers["ml_ensemble"] = self._entry_status_from_score(components.get("ml_confidence"), 50)
+        layers["ml_ensemble_detail"] = f"preview_score={components.get('ml_confidence', 0)}"
+        total = preview.get("total", self._last_quality_breakdown.get("total", 0))
+        layers["signal_quality"] = self._entry_status_from_score(total, self._get_quality_threshold())
+        layers["signal_quality_detail"] = f"preview_total={total}"
+        return layers
+
+    def _build_entry_receipt(
+        self,
+        *,
+        signal: TradingSignal | None = None,
+        ai_decision: AgentDecision | None = None,
+        symbol: str | None = None,
+        exchange: str | None = None,
+        direction: str | None = None,
+        layers_override: dict[str, Any] | None = None,
+        quality_override: dict[str, Any] | None = None,
+        risk_pending: bool = False,
+        strict_layers: bool = True,
+        source: str = "signal_generator",
+        remember: bool = True,
+    ) -> TradeDecisionReceipt:
+        layers = dict(layers_override or self._last_layer_status)
+        if risk_pending:
+            layers["risk_gate"] = "PENDING"
+            layers["risk_gate_detail"] = "pending risk manager/order manager approval"
+        latency: dict[str, Any] = {}
+        if signal is not None:
+            metadata = getattr(signal, "metadata", {}) or {}
+            latency = dict(metadata.get("latency_trace", {}) or {})
+        receipt = self._entry_gate.evaluate(
+            mode="paper" if self._is_paper_mode() else "live",
+            symbol=symbol,
+            exchange=exchange,
+            direction=direction,
+            layers=layers,
+            quality=dict(quality_override or self._last_quality_breakdown),
+            thresholds=self._entry_thresholds(),
+            signal=signal,
+            ai=self._entry_ai_payload(ai_decision),
+            risk=self._risk_snapshot_for_entry(),
+            latency=latency,
+            provenance={"source": source, "last_signal_receipt": bool(self._last_entry_receipt)},
+            strict_layers=strict_layers,
+        )
+        payload = receipt.to_dict()
+        payload["available"] = True
+        if remember:
+            self._last_entry_receipt = payload
+        return receipt
+
+    def get_entry_eligibility(self, symbol: str | None = None, exchange: str | None = None) -> dict[str, Any]:
+        """Return the current no-trade/entry-allowed decision for dashboard readiness."""
+        preview: dict[str, Any] | None = None
+        try:
+            preview = self.get_quality_preview(symbol=symbol)
+        except Exception as exc:
+            preview = {
+                "total": self._last_quality_breakdown.get("total", 0),
+                "components": dict(self._last_quality_breakdown.get("components", {}) or {}),
+                "reason": sanitize_exception(exc),
+            }
+        receipt = self._build_entry_receipt(
+            symbol=symbol,
+            exchange=exchange,
+            layers_override=self._entry_layers_from_preview(preview),
+            quality_override=preview,
+            strict_layers=True,
+            source="dashboard",
+            remember=False,
+        )
+        payload = receipt.to_dict()
+        payload["available"] = True
+        if self._last_entry_receipt:
+            payload["last_candidate_receipt"] = dict(self._last_entry_receipt)
+        return payload
+
     def get_ml_status(self) -> dict[str, Any]:
         """Return current ML model status and latest training summary."""
         return {
@@ -976,11 +1226,174 @@ class SignalGenerator:
 
     def get_agent_status(self) -> dict[str, Any]:
         """Return status for the attached supervisory AI agent."""
-        if self._ai_agent is None:
+        provider = self._decision_provider
+        if provider is None:
             return {"attached": False, "enabled": False, "mode": "off"}
-        status = self._ai_agent.get_status()
+        status = provider.get_status()
         status["auto_trading_enabled"] = bool(self._auto_trading_enabled)
+        status["decision_latency"] = dict(self._last_decision_latency)
+        requested_mode = str(status.get("mode", "advisory") or "advisory")
+        status["requested_mode"] = requested_mode
+        status["effective_mode"] = "direct" if self._ai_direct_allowed(requested_mode) else "advisory"
+        status["direct_mode_allowed"] = bool(self._ai_direct_allowed(requested_mode))
+        status["direct_mode_reason"] = self._ai_direct_reason(requested_mode)
         return status
+
+    def _ai_direct_allowed(self, requested_mode: str | None = None) -> bool:
+        mode = str(requested_mode or getattr(self._ai_agent, "mode", "advisory") or "advisory").lower()
+        if mode not in {"direct", "full"}:
+            return False
+        if not self._is_paper_mode():
+            return False
+        rm = getattr(self, "_risk_manager", None)
+        if rm is None:
+            return False
+        if bool(getattr(rm, "kill_switch_active", False) or getattr(rm, "_killed", False)):
+            return False
+        cb = getattr(rm, "_circuit_breaker", None)
+        if cb is not None and bool(getattr(cb, "tripped", False)):
+            return False
+        safe_mode = getattr(rm, "safe_mode", None)
+        if safe_mode is not None and bool(getattr(safe_mode, "is_active", False)):
+            return False
+        return True
+
+    def _ai_direct_reason(self, requested_mode: str | None = None) -> str:
+        mode = str(requested_mode or getattr(self._ai_agent, "mode", "advisory") or "advisory").lower()
+        if mode not in {"direct", "full"}:
+            return "AI is advisory; decisions are recorded but not enforced."
+        if not self._is_paper_mode():
+            return "AI direct mode is blocked outside paper mode."
+        rm = getattr(self, "_risk_manager", None)
+        if rm is None:
+            return "AI direct mode requires a wired risk manager."
+        if bool(getattr(rm, "kill_switch_active", False) or getattr(rm, "_killed", False)):
+            return "AI direct mode blocked by kill switch."
+        cb = getattr(rm, "_circuit_breaker", None)
+        if cb is not None and bool(getattr(cb, "tripped", False)):
+            return "AI direct mode blocked by circuit breaker."
+        safe_mode = getattr(rm, "safe_mode", None)
+        if safe_mode is not None and bool(getattr(safe_mode, "is_active", False)):
+            return "AI direct mode blocked by safe mode."
+        return "AI direct mode is enabled in risk-gated paper mode."
+
+    @staticmethod
+    def _latency_percentile_ms(values: list[float], pct: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return round(values[0] * 1000.0, 2)
+        sorted_values = sorted(values)
+        idx = min(len(sorted_values) - 1, max(0, int(round(pct / 100.0 * (len(sorted_values) - 1)))))
+        return round(sorted_values[idx] * 1000.0, 2)
+
+    def _remember_decision_latency(
+        self,
+        *,
+        provider: str,
+        action: str,
+        approved: bool,
+        latency_s: float,
+        signal: TradingSignal,
+    ) -> dict[str, Any]:
+        sample = {
+            "provider": provider,
+            "action": action,
+            "approved": bool(approved),
+            "latency_s": max(0.0, float(latency_s)),
+            "exchange": signal.exchange,
+            "symbol": signal.symbol,
+            "direction": signal.direction,
+            "timestamp": time.time(),
+        }
+        self._decision_latency_samples.append(sample)
+        values = [float(item.get("latency_s", 0.0) or 0.0) for item in self._decision_latency_samples]
+        self._last_decision_latency = {
+            "provider": provider,
+            "action": action,
+            "approved": bool(approved),
+            "last_ms": round(sample["latency_s"] * 1000.0, 2),
+            "p50_ms": self._latency_percentile_ms(values, 50),
+            "p95_ms": self._latency_percentile_ms(values, 95),
+            "p99_ms": self._latency_percentile_ms(values, 99),
+            "max_ms": round(max(values) * 1000.0, 2) if values else 0.0,
+            "count": len(values),
+        }
+        payload = dict(sample)
+        payload.update(self._last_decision_latency)
+        return payload
+
+    def _publish_decision_latency(self, payload: dict[str, Any]) -> None:
+        try:
+            publish_nowait = getattr(self.event_bus, "publish_nowait", None)
+            if callable(publish_nowait):
+                publish_nowait("DECISION_LATENCY", payload)
+            else:
+                asyncio.create_task(self.event_bus.publish("DECISION_LATENCY", payload))
+        except Exception as exc:
+            logger.debug("decision latency telemetry publish failed: {}", sanitize_exception(exc))
+
+    def _publish_pipeline_latency(
+        self,
+        stage: str,
+        latency_s: float,
+        *,
+        signal: TradingSignal | None = None,
+        candle: Any | None = None,
+    ) -> None:
+        src = signal if signal is not None else candle
+        try:
+            payload = {
+                "stage": str(stage),
+                "exchange": str(getattr(src, "exchange", "unknown") or "unknown"),
+                "symbol": str(getattr(src, "symbol", "unknown") or "unknown"),
+                "latency_s": max(0.0, float(latency_s)),
+                "ts": time.time(),
+            }
+            publish_nowait = getattr(self.event_bus, "publish_nowait", None)
+            if callable(publish_nowait):
+                publish_nowait("PIPELINE_LATENCY", payload)
+            else:
+                asyncio.create_task(self.event_bus.publish("PIPELINE_LATENCY", payload))
+        except Exception as exc:
+            logger.debug("pipeline latency telemetry publish failed: {}", sanitize_exception(exc))
+
+    async def _review_signal_with_decision_provider(self, signal: TradingSignal) -> AgentDecision | None:
+        provider = self._decision_provider
+        if provider is None:
+            return None
+
+        provider_name = str(getattr(provider, "name", provider.__class__.__name__))
+        started = time.perf_counter()
+        decision: AgentDecision | None = None
+        try:
+            decision = await provider.review_signal(signal)
+            return decision
+        except Exception as exc:
+            logger.error("Decision provider '{}' failed closed: {}", provider_name, sanitize_exception(exc))
+            decision = AgentDecision(
+                approved=False,
+                action="reject",
+                confidence=0.0,
+                size_multiplier=0.0,
+                reason="decision_provider_error",
+                summary="Decision provider failed; signal rejected fail-closed.",
+            )
+            return decision
+        finally:
+            latency_s = time.perf_counter() - started
+            action = decision.action if decision is not None else "error"
+            approved = bool(decision.approved) if decision is not None else False
+            payload = self._remember_decision_latency(
+                provider=provider_name,
+                action=action,
+                approved=approved,
+                latency_s=latency_s,
+                signal=signal,
+            )
+            signal.metadata["decision_provider"] = provider_name
+            signal.metadata["decision_latency_ms"] = payload["last_ms"]
+            self._publish_decision_latency(payload)
 
     def get_efficiency_status(self) -> dict[str, Any]:
         """Return efficiency-pass runtime state for the Efficiency dashboard tab."""
@@ -1147,9 +1560,9 @@ class SignalGenerator:
     def configure_agent(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Update AI agent runtime settings and return the new status."""
         payload = payload or {}
-        if self._ai_agent is None:
+        if self._decision_provider is None:
             return {"attached": False, "enabled": False, "mode": "off"}
-        self._ai_agent.configure(
+        self._decision_provider.configure(
             enabled=payload.get("enabled"),
             mode=payload.get("mode"),
             min_confidence=payload.get("min_confidence"),
@@ -1162,6 +1575,20 @@ class SignalGenerator:
             remote_weight=payload.get("remote_weight"),
         )
         return self.get_agent_status()
+
+    async def test_agent_connection(self) -> dict[str, Any]:
+        """Test the active agent/provider without exposing provider internals to the API."""
+        if self._ai_agent is not None and hasattr(self._ai_agent, "test_connection"):
+            return await self._ai_agent.test_connection()
+        provider = self._decision_provider
+        if provider is None:
+            return {"success": False, "reason": "agent_unavailable", "message": "Decision provider is not attached."}
+        return {
+            "success": True,
+            "provider": str(getattr(provider, "name", provider.__class__.__name__)),
+            "reason": "provider_attached",
+            "message": "Decision provider is attached.",
+        }
 
     def get_strategy_suggestion(self, symbol: str | None = None) -> dict[str, Any]:
         """Return a simple strategy recommendation from the current pipeline state."""
@@ -1478,7 +1905,7 @@ class SignalGenerator:
                 "rows": rows,
                 "feature_count": 0,
                 "symbols": used_symbols,
-                "reason": str(exc),
+                "reason": sanitize_exception(exc),
                 "last_train_ts": float(self._last_ml_train_ts),
             }
             self._ml_training_summary = result
@@ -1994,6 +2421,7 @@ class SignalGenerator:
         Layer numbering (matches the implementation, the dashboard panel
         names, and the _compute_quality_score weight comments at line ~1916):
 
+        L0  Market Data Integrity (freshness, clock drift, sequence gaps)
         L1  Session / Killzone (time-of-day filter, weekend halt, no-trade hours)
         L2  HTF Trend (multi-timeframe weighted agreement; HARD GATE)
         L3  Technical Confluence (15-indicator matrix; HARD GATE ≥ threshold)
@@ -2006,7 +2434,7 @@ class SignalGenerator:
 
         L10 (additive) Geopolitical alignment bonus — gated by config weight.
 
-        N.B. older drafts of this docstring listed L0..L7 with different
+        N.B. older drafts of this docstring used different numbering and
         contents; that numbering is obsolete. The implementation uses L1..L9
         as above; the V6 master_scorer.py composite uses (L3, L4, L5, ML,
         ExecLiquidity) with different weights and is computed alongside L8
@@ -2021,7 +2449,27 @@ class SignalGenerator:
             return
 
         key = f"{candle.exchange}:{candle.symbol}"
-        now = time.time()
+        pipeline_started = time.perf_counter()
+        pipeline_wall_start = time.time()
+        source_receive_us = int(getattr(candle, "receive_time_us", 0) or 0)
+        source_tick_ts_us = int(getattr(candle, "source_tick_timestamp_us", 0) or 0)
+        now = pipeline_wall_start
+
+        l0_ok, l0_detail, _l0_health = self._check_l0_market_data(
+            exchange=candle.exchange,
+            symbol=candle.symbol,
+            timeframe=candle.timeframe,
+            receive_time_us=source_receive_us,
+            source_tick_timestamp_us=source_tick_ts_us,
+        )
+        self._last_layer_status["market_data_integrity"] = "PASS" if l0_ok else "FAIL"
+        self._last_layer_status["market_data_integrity_detail"] = l0_detail
+        if not l0_ok:
+            logger.info("DIAG {}: L0 Market Data Integrity FAIL: {}", key, l0_detail)
+            self._update_layer_status(preflight="BLOCKED")
+            self._last_layer_status["preflight_detail"] = f"L0:{l0_detail}"
+            return
+
         if now - self._last_signal_time.get(key, 0) < self._min_signal_interval:
             logger.debug("DIAG {}: throttled (interval)", key)
             return
@@ -2029,8 +2477,8 @@ class SignalGenerator:
         # E-Stop gate — block all new signals when emergency stop is active
         if self._estop is not None and self._estop.is_active:
             logger.debug("DIAG {}: ESTOP active ({})", key, self._estop.reason)
-            self._update_layer_status(l0="BLOCKED")
-            self._last_layer_status["session_filter_detail"] = f"ESTOP:{self._estop.reason}"
+            self._update_layer_status(preflight="BLOCKED")
+            self._last_layer_status["preflight_detail"] = f"ESTOP:{self._estop.reason}"
             return
 
         # PairRegistry tier gate — skip Tier 4 pairs
@@ -2040,7 +2488,8 @@ class SignalGenerator:
                     self._pair_registry.register(candle.symbol, daily_volume_usd=1_000_000_000)
                 if not self._pair_registry.is_tradeable(candle.symbol):
                     logger.debug("DIAG {}: pair tier excluded", key)
-                    self._update_layer_status(l0="BLOCKED")
+                    self._update_layer_status(preflight="BLOCKED")
+                    self._last_layer_status["preflight_detail"] = "pair tier excluded"
                     return
             except Exception:
                 pass
@@ -2051,7 +2500,10 @@ class SignalGenerator:
             return
 
         # ═══════════════════════════════════════════════════════════════════
-        # L0-PRE: SESSION & KILLZONE RULES (§5)
+        self._update_layer_status(preflight="PASS")
+        self._last_layer_status["preflight_detail"] = "runtime guards passed"
+
+        # PREFLIGHT COMPLETE: SESSION & KILLZONE RULES (§5)
         # ═══════════════════════════════════════════════════════════════════
         session_rule = self._get_session_rule()
         is_killzone = self._is_ict_killzone()
@@ -2060,17 +2512,19 @@ class SignalGenerator:
         utc_now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         if utc_now.weekday() >= 5:  # 5=Saturday, 6=Sunday
             logger.debug("DIAG {}: weekend — no trade", key)
-            self._update_layer_status(l0="BLOCKED")
+            self._update_layer_status(l1="BLOCKED")
+            self._last_layer_status["session_filter_detail"] = "weekend halt"
             return
 
         # No-trade sessions (12-13 UTC, 22-00 UTC)
         if session_rule and session_rule.no_trade:
             logger.debug("DIAG {}: session {} — no trade", key, session_rule.name)
-            self._update_layer_status(l0="BLOCKED")
+            self._update_layer_status(l1="BLOCKED")
+            self._last_layer_status["session_filter_detail"] = f"{session_rule.name} no-trade session"
             return
 
         # ═══════════════════════════════════════════════════════════════════
-        # L0: SENTIMENT PRE-FILTER
+        # PREFLIGHT CONTEXT: SENTIMENT / NEWS / GEO
         # ═══════════════════════════════════════════════════════════════════
         sentiment = self._sentiment_score if (now - self._sentiment_ts) < self._score_ttl else 0.0
         news_score = self._news_scorer.score()
@@ -2197,8 +2651,8 @@ class SignalGenerator:
         if not htf_ok:
             logger.info("DIAG {}: L2 HTF HARD GATE FAIL: {} (score={})", key, htf_reason, l2_htf_score)
             self._update_layer_status(
-                l0=l1_session_score, l1=l2_htf_score, l2=0, l3=0,
-                l4=0, l5=0, l6=0, l7=0,
+                preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=0,
+                l4=0, l5=0, l6=0, l7=0, l8=0,
             )
             self._last_layer_status["htf_trend"] = "FAIL"
             self._last_layer_status["htf_trend_detail"] = htf_reason
@@ -2349,8 +2803,8 @@ class SignalGenerator:
                         "(trend={:.0f} mom={:.0f} vol={:.0f})",
                         key, l3_tech_score, technical_threshold, trend_avg, momentum_avg, volatility_avg)
             self._update_layer_status(
-                l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=0,
-                l4=0, l5=0, l6=0, l7=0,
+                preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=l3_tech_score,
+                l4=0, l5=0, l6=0, l7=0, l8=0,
             )
             self._last_layer_status["technical_confluence"] = "FAIL"
             self._last_layer_status["technical_confluence_detail"] = f"score={l3_tech_score}<{technical_threshold}"
@@ -2465,8 +2919,8 @@ class SignalGenerator:
                 self._last_layer_status["smart_money_concepts_detail"] = f"points={l4_smc_points:.0f}<{smc_threshold:.0f}"
             else:
                 self._update_layer_status(
-                    l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
-                    l4=0, l5=0, l6=0, l7=0,
+                    preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=l3_tech_score,
+                    l4=l4_smc_score, l5=0, l6=0, l7=0, l8=0,
                 )
                 self._last_layer_status["smart_money_concepts"] = "FAIL"
                 self._last_layer_status["smart_money_concepts_detail"] = f"points={l4_smc_points:.0f}<{smc_threshold:.0f}"
@@ -2528,8 +2982,8 @@ class SignalGenerator:
                         vol_flow.vwap_slope, cmf, vol_flow.obv_divergence,
                         len(vol_flow.lvn_levels))
             self._update_layer_status(
-                l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
-                l4=l5_vol_score, l5=0, l6=0, l7=0,
+                preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=l3_tech_score,
+                l4=l4_smc_score, l5=l5_vol_score, l6=0, l7=0, l8=0,
             )
             self._last_layer_status["volume_flow"] = "FAIL"
             self._last_layer_status["volume_flow_detail"] = f"points={l5_vol_points:.0f}<{volume_threshold:.0f}"
@@ -2580,8 +3034,8 @@ class SignalGenerator:
                             "(ADX={:.1f} ATR_exp={:.2f} BB={:.4f})",
                             key, adx_val, atr_expansion, bb_width)
                 self._update_layer_status(
-                    l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
-                    l4=l5_vol_score, l5=l6_regime_score, l6=0, l7=0,
+                    preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=l3_tech_score,
+                    l4=l4_smc_score, l5=l5_vol_score, l6=l6_regime_score, l7=0, l8=0,
                 )
                 self._last_layer_status["regime_detection"] = "BLOCKED"
                 self._last_quality_breakdown = {
@@ -2606,8 +3060,8 @@ class SignalGenerator:
                         key, signal_type.value, regime_class,
                         [t.value for t in regime_allowed_types])
             self._update_layer_status(
-                l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
-                l4=l5_vol_score, l5=l6_regime_score, l6=0, l7=0,
+                preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=l3_tech_score,
+                l4=l4_smc_score, l5=l5_vol_score, l6=l6_regime_score, l7=0, l8=0,
             )
             self._last_layer_status["regime_detection"] = "FAIL"
             self._last_layer_status["regime_detection_detail"] = f"{signal_type.value} blocked in {regime_class}"
@@ -2709,8 +3163,9 @@ class SignalGenerator:
 
         # Update all layer statuses for dashboard
         self._update_layer_status(
-            l0=l1_session_score, l1=l2_htf_score, l2=l3_tech_score, l3=l4_smc_score,
-            l4=l5_vol_score, l5=l6_regime_score, l6=l7_ml_score, l7=quality_score,
+            preflight="PASS", l1=l1_session_score, l2=l2_htf_score, l3=l3_tech_score,
+            l4=l4_smc_score, l5=l5_vol_score, l6=l6_regime_score, l7=l7_ml_score,
+            l8=quality_score,
         )
 
         self._last_quality_breakdown = {
@@ -3094,13 +3549,35 @@ class SignalGenerator:
                 "l6_regime": l6_regime_score,
                 "l7_ml": l7_ml_score,
                 "l8_quality": quality_score,
+                "latency_trace": {
+                    "pipeline_start_ts": pipeline_wall_start,
+                    "source_receive_time_us": source_receive_us,
+                    "source_tick_timestamp_us": source_tick_ts_us,
+                },
             },
         )
 
-        agent_decision = await self._ai_agent.review_signal(signal) if self._ai_agent is not None else None
+        signal_ready_perf = time.perf_counter()
+        signal_ready_ts = time.time()
+        indicators_to_signal_s = signal_ready_perf - pipeline_started
+        latency_trace = signal.metadata.setdefault("latency_trace", {})
+        latency_trace["signal_ready_ts"] = signal_ready_ts
+        latency_trace["indicators_to_signal_ms"] = round(indicators_to_signal_s * 1000.0, 3)
+        self._publish_pipeline_latency("indicators_to_signal", indicators_to_signal_s, signal=signal)
+        if source_receive_us > 0:
+            tick_to_signal_s = max(0.0, signal_ready_ts - (source_receive_us / 1_000_000.0))
+            latency_trace["tick_receive_to_signal_ms"] = round(tick_to_signal_s * 1000.0, 3)
+            self._publish_pipeline_latency("tick_receive_to_signal", tick_to_signal_s, signal=signal)
+
+        agent_decision = await self._review_signal_with_decision_provider(signal)
         if agent_decision is not None:
             signal.metadata["ai_agent"] = agent_decision.to_dict()
-            if not agent_decision.approved:
+            ai_requested_mode = str(getattr(self._ai_agent, "mode", "advisory") or "advisory")
+            ai_direct_allowed = self._ai_direct_allowed(ai_requested_mode)
+            signal.metadata["ai_requested_mode"] = ai_requested_mode
+            signal.metadata["ai_effective_mode"] = "direct" if ai_direct_allowed else "advisory"
+            signal.metadata["ai_direct_reason"] = self._ai_direct_reason(ai_requested_mode)
+            if not agent_decision.approved and ai_direct_allowed:
                 self._last_layer_status["risk_gate"] = "FAIL"
                 self._last_layer_status["risk_gate_detail"] = (
                     f"AI rejected {candle.symbol}: {agent_decision.reason} conf={agent_decision.confidence:.2f}"
@@ -3114,17 +3591,60 @@ class SignalGenerator:
                     agent_decision.reason,
                 )
                 return
-            if agent_decision.size_multiplier and agent_decision.size_multiplier != 1.0:
+            if not agent_decision.approved:
+                logger.info(
+                    "AI_AGENT advisory reject recorded for {}/{} {} conf={:.2f} reason={} (not enforced)",
+                    candle.exchange,
+                    candle.symbol,
+                    direction.upper(),
+                    agent_decision.confidence,
+                    agent_decision.reason,
+                )
+            if ai_direct_allowed and agent_decision.size_multiplier and agent_decision.size_multiplier != 1.0:
                 signal.size_multiplier = max(0.10, signal.size_multiplier * agent_decision.size_multiplier)
                 signal.metadata["effective_size_mult"] = signal.size_multiplier
                 signal.metadata["ai_adjusted_size_mult"] = agent_decision.size_multiplier
+            elif agent_decision.size_multiplier and agent_decision.size_multiplier != 1.0:
+                signal.metadata["ai_suggested_size_mult"] = agent_decision.size_multiplier
+
+        entry_receipt = self._build_entry_receipt(
+            signal=signal,
+            ai_decision=agent_decision,
+            risk_pending=True,
+            strict_layers=False,
+            source="signal_candidate",
+        )
+        signal.metadata["trade_decision_receipt"] = entry_receipt.to_dict()
+        if not entry_receipt.allowed:
+            self._last_layer_status["risk_gate"] = "FAIL"
+            self._last_layer_status["risk_gate_detail"] = entry_receipt.reason
+            logger.info(
+                "ENTRY_GATE blocked {}/{} {} reason={} blockers={}",
+                signal.exchange,
+                signal.symbol,
+                signal.direction.upper(),
+                entry_receipt.reason,
+                ",".join(entry_receipt.blockers[:5]),
+            )
+            return
 
         self._last_signal_time[key] = now
         self._open_directions[candle.symbol] = direction
         # Update risk gate status (signal passed all gates)
         self._last_layer_status["risk_gate"] = "PASS"
         self._last_layer_status["risk_gate_detail"] = f"Q={quality_score} type={signal_type.value} regime={regime_class}"
+        pre_publish_perf = time.perf_counter()
+        signal.metadata.setdefault("latency_trace", {})["pre_publish_ts"] = time.time()
+        self._publish_pipeline_latency(
+            "signal_ready_to_publish",
+            pre_publish_perf - signal_ready_perf,
+            signal=signal,
+        )
         await self.event_bus.publish("SIGNAL", signal)
+        signal.metadata.setdefault("latency_trace", {})["signal_publish_ms"] = round(
+            (time.perf_counter() - pre_publish_perf) * 1000.0,
+            3,
+        )
         logger.info(
             "SIGNAL: {}/{} {} type={} Q={}/100 price={:.2f} sl={:.2f} "
             "tp1={:.2f} tp2={:.2f} R:R=1:{:.1f} regime_class={} risk={:.1%} session={} "

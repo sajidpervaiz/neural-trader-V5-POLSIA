@@ -8,15 +8,51 @@ from typing import List, Optional
 from pydantic import BaseModel
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 from execution.risk_manager import RiskManager, Position
 
 router = APIRouter(prefix="/positions", tags=["positions"])
 _RISK_MANAGER: Optional[RiskManager] = None
+_CONFIG = None
+_DB_HANDLER = None
 
 
-def configure_positions_routes(risk_manager: Optional[RiskManager]) -> None:
-    global _RISK_MANAGER
+def configure_positions_routes(risk_manager: Optional[RiskManager], *, config=None, db_handler=None) -> None:
+    global _RISK_MANAGER, _CONFIG, _DB_HANDLER
     _RISK_MANAGER = risk_manager
+    _CONFIG = config
+    _DB_HANDLER = db_handler
+
+
+def _paper_mode() -> bool:
+    return bool(getattr(_CONFIG, "paper_mode", True))
+
+
+def _risk_kill_switch_active() -> bool:
+    if _RISK_MANAGER is None:
+        return True
+    for attr in ("kill_switch_active", "killed"):
+        value = getattr(_RISK_MANAGER, attr, None)
+        if isinstance(value, bool):
+            return value
+    try:
+        snap = _RISK_MANAGER.get_risk_snapshot()
+        if isinstance(snap, dict):
+            return bool(snap.get("kill_switch_active", False))
+    except Exception:
+        return True
+    return False
+
+
+def _require_legacy_position_mutation_allowed() -> None:
+    if _paper_mode():
+        return
+    if not bool(getattr(_DB_HANDLER, "available", False)):
+        raise HTTPException(status_code=503, detail="live_position_routes_require_audit_db")
+    if _risk_kill_switch_active():
+        raise HTTPException(status_code=423, detail="live_position_routes_blocked_by_kill_switch")
+    raise HTTPException(status_code=403, detail="legacy position mutation routes disabled in live mode; use exchange-close API with typed confirmation")
 
 
 class PositionResponse(BaseModel):
@@ -80,7 +116,7 @@ async def get_positions(
 
     except Exception as e:
         logger.error(f"Error fetching positions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/summary", response_model=PositionSummary)
@@ -109,7 +145,7 @@ async def get_position_summary(
 
     except Exception as e:
         logger.error(f"Error fetching position summary: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.get("/{symbol}", response_model=PositionResponse)
@@ -133,7 +169,7 @@ async def get_position(
 
     except Exception as e:
         logger.error(f"Error fetching position {symbol} on {venue}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/{symbol}/close")
@@ -147,6 +183,7 @@ async def close_position(
     Close position for specific symbol.
     """
     try:
+        _require_legacy_position_mutation_allowed()
         manager = _require_risk_manager()
         key = f"{venue}:{symbol}"
         pos = manager.positions.get(key)
@@ -175,7 +212,7 @@ async def close_position(
 
     except Exception as e:
         logger.error(f"Error closing position {symbol}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))
 
 
 @router.post("/close-all")
@@ -186,6 +223,7 @@ async def close_all_positions(
     Close all positions, optionally filtered by venue.
     """
     try:
+        _require_legacy_position_mutation_allowed()
         manager = _require_risk_manager()
         positions = list(manager.positions.values())
         if venue:
@@ -207,6 +245,8 @@ async def close_all_positions(
             "closed_at": int(time.time()),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error closing all positions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=sanitize_exception(e))

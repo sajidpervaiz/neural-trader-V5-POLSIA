@@ -9,6 +9,8 @@ from typing import Any
 import httpx
 from loguru import logger
 
+from core.error_handling import sanitize_exception
+
 
 @dataclass
 class AgentDecision:
@@ -24,18 +26,18 @@ class AgentDecision:
 
 
 class TradingAIAgent:
-    """Supervisory AI layer for autonomous trade approval.
+    """Supervisory AI layer for trade review.
 
-    The existing risk engine remains the final authority. This agent can use a
-    local ruleset and, when configured, an external Claude review for an extra
-    supervisory pass before a trade is allowed through.
+    The existing risk engine remains the final authority. Advisory mode is the
+    default; direct/enforced decisions are gated by SignalGenerator so they can
+    only affect execution in risk-gated paper mode.
     """
 
     def __init__(
         self,
         *,
         enabled: bool = True,
-        mode: str = "full",
+        mode: str = "advisory",
         min_confidence: float = 0.55,
         min_quality_score: int = 60,
         min_risk_reward: float = 1.0,
@@ -78,7 +80,9 @@ class TradingAIAgent:
         raw = str(mode or "advisory").strip().lower().replace("-", "_")
         if raw in {"semi", "semi_auto"}:
             return "semi_auto"
-        if raw in {"full", "advisory", "semi_auto"}:
+        if raw in {"full", "direct", "ai_direct", "enforced"}:
+            return "direct"
+        if raw in {"advisory", "semi_auto", "direct"}:
             return raw
         return "advisory"
 
@@ -226,7 +230,7 @@ class TradingAIAgent:
         try:
             remote_decision = await self._review_with_remote(signal, local_decision)
         except Exception as exc:
-            self._last_error = str(exc)[:240]
+            self._last_error = sanitize_exception(exc)[:240]
             logger.warning("{} supervisory review failed — falling back to local agent: {}", self._provider_display_name(), exc)
 
         if remote_decision is None:
@@ -281,12 +285,12 @@ class TradingAIAgent:
             )
 
         if quality_score < self.min_quality_score or risk_reward < self.min_risk_reward or confidence < self.min_confidence:
-            action = "reduce_size" if self.mode == "full" else "approve"
+            action = "reduce_size" if self.mode == "direct" else "approve"
             return AgentDecision(
                 approved=True,
                 action=action,
                 confidence=confidence,
-                size_multiplier=0.5 if self.mode == "full" else 1.0,
+                size_multiplier=0.5 if self.mode == "direct" else 1.0,
                 reason="borderline_setup",
                 summary=f"Borderline but tradable: Q={quality_score:.0f}, RR={risk_reward:.2f}, conf={confidence:.2f}",
             )
@@ -369,7 +373,7 @@ class TradingAIAgent:
                 self._last_decision_source = f"{self.provider}_chat"
                 return {"success": True, "provider": self.provider, "reply": reply}
             except Exception as exc:
-                self._last_error = str(exc)[:240]
+                self._last_error = sanitize_exception(exc)[:240]
                 logger.warning("{} chat failed — falling back to local assistant: {}", self._provider_display_name(), exc)
 
         self._last_decision_source = "local"
@@ -387,7 +391,7 @@ class TradingAIAgent:
         try:
             reply = await self._chat_with_remote("Reply with the single word: OK.", {"healthcheck": True})
         except Exception as exc:
-            self._last_error = str(exc)[:240]
+            self._last_error = sanitize_exception(exc)[:240]
             return {"success": False, "provider": self.provider, "reason": "remote_error", "message": f"{provider_name} error: {exc}"[:240]}
         ok = bool(reply and "OK" in reply.upper())
         return {

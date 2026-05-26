@@ -4,12 +4,12 @@ Websocket manager for real-time data broadcasting to dashboard clients.
 
 import asyncio
 import json
+import secrets
 from typing import Dict, Set, Optional, Any
 from fastapi import WebSocket
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-import uuid
 from loguru import logger
 
 
@@ -71,7 +71,7 @@ class WebsocketManager:
             await websocket.close(code=1008, reason="Max connections exceeded")
             raise Exception("Max connections exceeded")
 
-        client_id = f"ws_{uuid.uuid4().hex[:12]}"
+        client_id = f"ws_{secrets.token_urlsafe(16)}"
 
         subscription = ClientSubscription(
             client_id=client_id,
